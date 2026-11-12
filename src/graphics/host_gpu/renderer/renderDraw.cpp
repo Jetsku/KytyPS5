@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
+#include "graphics/guest_gpu/drawShortcutCounters.h"
 
 #include "common/assert.h"
 #include "common/liveSwitch.h"
@@ -2607,6 +2608,7 @@ static bool DrawHasEmptyScreenScissor(const CommandBuffer& buffer, const DrawRen
 // The empty-screen-scissor skip's counter site (one call per skipped draw; a draw's MRT split second
 // pass is never reached for one).
 static void NoteEmptyScissorSkip() {
+	DrawShortcutCounters::Add(DrawShortcutCounters::g_empty_scissor_skips, 1);
 	PassCensus::Drop('d', 0, "skipped: empty screen scissor (KYTY_EMPTY_SCISSOR_SKIP)");
 }
 

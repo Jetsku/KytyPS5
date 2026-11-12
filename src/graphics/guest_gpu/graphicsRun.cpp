@@ -7,6 +7,7 @@
 #include "common/paceLog.h"
 #include "common/cpuPlacement.h"
 #include "common/debugCounters.h"
+#include "graphics/guest_gpu/drawShortcutCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
@@ -3460,11 +3461,21 @@ static const char* g_cp_op_outcome = nullptr;
 // The indirect-run counter site (KYTY_INDIRECT_RUNS): one call per executed run of `records` (at
 // least 2) DRAW_INDIRECT / DRAW_INDEX_INDIRECT packets, on the resolver (the CP thread), whichever
 // way the run is drawn (one native multi-draw or record by record).
-static void NoteIndirectRun([[maybe_unused]] uint32_t records) {}
+static void NoteIndirectRun(uint32_t records) {
+	DrawShortcutCounters::Add(DrawShortcutCounters::g_indirect_runs, 1);
+	DrawShortcutCounters::Add(DrawShortcutCounters::g_indirect_run_packets, records);
+}
+
+// A run drawn record by record re-enters ExecDrawIndirect per record: those calls are not packets.
+static thread_local bool t_indirect_run_replay = false;
 
 void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	// KYTY_INDIRECT_RUNS (CpOpDrawIndirect): `records` packets drawing consecutive records.
 	const uint32_t records = std::max(op.max_count_or_count, 1u);
+	// Packets executed: a prepared single draw counts in its inner unprepared call.
+	if (!t_indirect_run_replay && ((op.flags & CpSeq::IndirectFlagPrepared) == 0 || records > 1)) {
+		DrawShortcutCounters::Add(DrawShortcutCounters::g_indirect_packets, records);
+	}
 	// A run as one host multi-draw (the records' bytes, records * stride, are what the native path
 	// checks for GPU ownership, binds and reads). False: the native path declined (CPU-clean records,
 	// a mesh draw it converts one record at a time, no multi-draw support, ...).
@@ -3499,11 +3510,14 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	const auto run_records = [this](CpSeq::DrawIndirectOp run, uint32_t first, uint32_t end) {
 		run.flags &= ~(CpSeq::IndirectFlagSetInstances | CpSeq::IndirectFlagPrepared);
 		run.max_count_or_count = 0;
+		const bool replay      = t_indirect_run_replay;
+		t_indirect_run_replay  = true;
 		for (uint32_t i = first; i < end; i++) {
 			auto one        = run;
 			one.data_offset = run.data_offset + i * run.stride;
 			ExecDrawIndirect(one);
 		}
+		t_indirect_run_replay = replay;
 	};
 	if ((op.flags & CpSeq::IndirectFlagPrepared) != 0) {
 		// KYTY_DRAW_PREP_INDIRECT: the same execution, with the slot's preparation offered.
@@ -5066,6 +5080,35 @@ static void NoteLoopGuardHits(RenderContext& renderer) {
 	}
 }
 
+// KYTY_DRAW_SHORTCUT_LOG=1: the draw-shortcut counters (drawShortcutCounters.h) every 600 guest flips,
+// as per-flip averages over those flips plus the totals since boot.
+static void NoteDrawShortcutCounts() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_SHORTCUT_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	namespace C = DrawShortcutCounters;
+	static uint32_t flips = 0;
+	static uint64_t last[4] {};
+	if (++flips % 600u != 0u) {
+		return;
+	}
+	const uint64_t now[4] {C::g_empty_scissor_skips.load(std::memory_order_relaxed),
+	                       C::g_indirect_packets.load(std::memory_order_relaxed),
+	                       C::g_indirect_runs.load(std::memory_order_relaxed),
+	                       C::g_indirect_run_packets.load(std::memory_order_relaxed)};
+	const auto per_flip = [&](int i) { return static_cast<double>(now[i] - last[i]) / 600.0; };
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Draw shortcuts (600 flips to flip {}): empty-scissor skips {:.2f}/flip; indirect packets "
+	    "{:.2f}/flip, of them in multi-draw runs {:.2f}/flip ({:.2f} runs/flip); totals: skips {}, "
+	    "indirect packets {}, in runs {} ({} runs)\n",
+	    flips, per_flip(0), per_flip(1), per_flip(3), per_flip(2), now[0], now[1], now[3], now[2]));
+	std::copy(std::begin(now), std::end(now), std::begin(last));
+}
+
 // KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS (KYTY_RT_SOFTWARE): the invocations that exhausted the
 // BVH node budget and, with the statistics, how many node tests invocations ran, by power of two.
 // The mapped GDS words are read without waiting for the GPU (a diagnostic): the budget line when
@@ -5192,6 +5235,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 		case CpSeq::FlipVariant::Plain: {
 			NoteLoopGuardHits(m_renderer);
 			NoteRtNodeCounts(m_renderer);
+			NoteDrawShortcutCounts();
 			if (GraphicsRunDebugDumpEnabled()) {
 				LOGF("CommandProcessor::Flip()\n");
 			}
@@ -5208,6 +5252,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 		case CpSeq::FlipVariant::Label: {
 			NoteLoopGuardHits(m_renderer);
 			NoteRtNodeCounts(m_renderer);
+			NoteDrawShortcutCounts();
 			auto& command = CurrentBuffer();
 
 			if (GraphicsRunDebugDumpEnabled()) {
@@ -5237,6 +5282,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			const auto cache_action   = op.cache_action;
 			NoteLoopGuardHits(m_renderer);
 			NoteRtNodeCounts(m_renderer);
+			NoteDrawShortcutCounts();
 			auto& command = CurrentBuffer();
 
 			if (GraphicsRunDebugDumpEnabled()) {
