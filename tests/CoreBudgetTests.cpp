@@ -95,6 +95,12 @@ std::vector<CpuSetInfo> HybridTable() {
 	       a.cold_mask == b.cold_mask && a.description == b.description;
 }
 
+[[maybe_unused]] Common::ReserveRules Scaled() {
+	Common::ReserveRules rules;
+	rules.scaled = true;
+	return rules;
+}
+
 void TestBudget() {
 	using Common::ComputeCoreBudget;
 	{
@@ -225,11 +231,141 @@ void TestGate() {
 	std::puts("CoreBudgetTests: spin gate ok");
 }
 
+void TestPlacement() {
+	using Common::ComputeCpuLayout;
+	using Common::ComputeVCacheLayout;
+	using Common::DetectVCache;
+	const auto rules = Scaled();
+	// 1. The full 7950X3D decides exactly as before: every mode, every forced CP processor, with and
+	// without the V-cache tie preference, and the V-cache layout. Process Lasso's mask and the
+	// 8-core halves too in cp mode (the shipped preset); cp+recorder and stages need 9 and 10 cores
+	// with the rules, so on 8 cores they fall back to cp (tested below).
+	const auto topology = DetectVCache({{0, 0xFFFF, 96ull << 20u}, {0, 0xFFFF0000, 32ull << 20u}});
+	for (const uint64_t mask: {0xFFFFFFFFull, 0xFFFFull, 0xFFFF0000ull}) {
+		const auto sets = MachineTable(mask);
+		const bool full = mask == 0xFFFFFFFFull;
+		for (const auto mode: {CpuReserveMode::Cp, CpuReserveMode::CpRecorder, CpuReserveMode::Stages,
+		                       CpuReserveMode::Off}) {
+			if (!full && (mode == CpuReserveMode::CpRecorder || mode == CpuReserveMode::Stages)) {
+				continue;
+			}
+			for (int forced = -1; forced < 34; forced++) {
+				for (const uint64_t preferred: {uint64_t {0}, uint64_t {0xFFFF}}) {
+					const auto legacy = ComputeCpuLayout(sets, mode, forced, Common::kMinGeneralProcessors, preferred);
+					const auto scaled = ComputeCpuLayout(sets, mode, forced, Common::kMinGeneralProcessors, preferred, rules);
+					Check(SameDecision(legacy, scaled), "7950X3D: unchanged decision (ComputeCpuLayout)");
+				}
+				const auto legacy = ComputeVCacheLayout(sets, mode, forced, topology);
+				const auto scaled = ComputeVCacheLayout(sets, mode, forced, topology, Common::kMinGeneralProcessors, rules);
+				Check(SameDecision(legacy, scaled), "7950X3D: unchanged decision (ComputeVCacheLayout)");
+			}
+		}
+	}
+	{
+		const auto full = ComputeVCacheLayout(MachineTable(0xFFFFFFFF), CpuReserveMode::Cp, -1, topology,
+		                                      Common::kMinGeneralProcessors, rules);
+		Check(full.vcache && full.cp_mask == 0xC && full.cold_mask == 0xFFFF0000ull,
+		      "7950X3D full, rules on: CP on 2-3, cold 16-31 as today");
+	}
+	// 2. 6 cores / 12 threads (mask 0x0FFF0000): the CP gets one logical processor, its sibling
+	// stays general.
+	{
+		const auto sets   = MachineTable(0x0FFF0000);
+		const auto legacy = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1);
+		Check(legacy.reserved && legacy.cp_mask == 0xC0000ull, "6C legacy: whole core 18-19");
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(layout.reserved && layout.cp_mask == (1ull << 18u) && layout.cp_ids.size() == 1 &&
+		          layout.cp_core == 18 && std::popcount(layout.general_mask) == 11 &&
+		          (layout.general_mask & (1ull << 19u)) != 0,
+		      "6C rules: CP alone on logical 18, sibling 19 general, 11 general");
+		Check(Contains(layout.description, "one logical processor"), "6C: description");
+		const auto both = ComputeCpuLayout(sets, CpuReserveMode::CpRecorder, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(both.reserved && both.recorder_ids.empty() && std::popcount(both.cp_mask) == 1,
+		      "6C rules, cp+recorder: falls back to cp, one logical");
+		const auto forced = ComputeCpuLayout(sets, CpuReserveMode::Cp, 21, Common::kMinGeneralProcessors, 0, rules);
+		Check(forced.reserved && forced.cp_mask == (1ull << 21u), "6C rules: KYTY_CPU_RESERVE_CORE=21");
+		Check(!ComputeCpuLayout(sets, CpuReserveMode::Cp, 3, Common::kMinGeneralProcessors, 0, rules).reserved,
+		      "6C rules: a forced processor outside the mask reserves nothing");
+	}
+	// 3. 4 cores / 8 threads (0x00FF0000): one logical (legacy took a whole core, a quarter).
+	{
+		const auto sets   = MachineTable(0x00FF0000);
+		Check(std::popcount(ComputeCpuLayout(sets, CpuReserveMode::Cp, -1).cp_mask) == 2,
+		      "4C/8T legacy: a whole core");
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(layout.reserved && layout.cp_mask == (1ull << 18u) && std::popcount(layout.general_mask) == 7,
+		      "4C/8T rules: one logical, 7 general");
+	}
+	// 4. 6 cores without SMT (0x05550000): nothing.
+	{
+		const auto sets   = MachineTable(0x05550000);
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(!layout.reserved && layout.cp_ids.empty() && Contains(layout.description, "nothing reserved"),
+		      "6C/6T rules: nothing reserved");
+		const auto native = ComputeCpuLayout(NoSmtTable(6, {3, 5, 4, 1, 2, 0}), CpuReserveMode::Cp, -1,
+		                                     Common::kMinGeneralProcessors, 0, rules);
+		Check(!native.reserved, "a native 6-core part without SMT: nothing reserved");
+	}
+	// 5. 8 cores without SMT: a whole core (one logical), CPPC best core even if it holds logical 0.
+	{
+		const auto sets   = NoSmtTable(8, {9, 5, 7, 3, 2, 1, 4, 6});
+		const auto legacy = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, 6);
+		Check(legacy.reserved && legacy.cp_core == 2, "8C/8T legacy: core 0 avoided, core 2");
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, 6, 0, rules);
+		Check(layout.reserved && layout.cp_core == 0 && layout.cp_mask == 1 &&
+		          std::popcount(layout.general_mask) == 7,
+		      "8C/8T rules: the preferred core 0 (logical 0 only loses ties)");
+		auto tie       = NoSmtTable(8, {9, 5, 9, 3, 2, 1, 4, 6});
+		const auto tl  = ComputeCpuLayout(tie, CpuReserveMode::Cp, -1, 6, 0, rules);
+		Check(tl.cp_core == 2, "8C/8T rules, tie with core 0: core 2");
+	}
+	// 6. Core 0 most preferred on the Lasso mask: the CP moves there only with the rules on.
+	{
+		auto sets                = MachineTable(0xFFFF);
+		sets[0].scheduling_class = 15;
+		sets[1].scheduling_class = 15;
+		Check(ComputeCpuLayout(sets, CpuReserveMode::Cp, -1).cp_core == 2, "legacy: core 0 last");
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(layout.cp_core == 0 && layout.cp_mask == 0x3, "rules: the CPPC best core 0");
+		const auto rec = ComputeCpuLayout(sets, CpuReserveMode::CpRecorder, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(rec.reserved && rec.cp_core == 0 && rec.recorder_core == -1 && rec.recorder_ids.empty() &&
+		          Contains(rec.description, "CP core only"),
+		      "rules, cp+recorder on 8 cores: falls back to cp only");
+	}
+	// 7. Hybrid: never an E-core, even with a higher scheduling class.
+	{
+		const auto sets   = HybridTable();
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(layout.reserved && layout.cp_core == 6 && layout.cp_mask == 0xC0,
+		      "hybrid rules: the best P-core 6 (logical 6-7)");
+		Check(std::popcount(layout.general_mask) == 30, "hybrid rules: E-cores stay general");
+		auto p_only = sets;
+		for (auto& set: p_only) {
+			set.allowed = set.logical >= 16 || set.logical < 8; // 4 P-cores + 16 E-cores
+		}
+		const auto few = ComputeCpuLayout(p_only, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(few.reserved && (few.cp_mask & 0xFFFF0000ull) == 0, "hybrid rules: still a P-core");
+		const auto legacy = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1);
+		Check(legacy.reserved && (legacy.cp_mask & 0xFFFF0000ull) != 0,
+		      "hybrid legacy picks an E-core by scheduling class (the gap the rules close)");
+	}
+	// 8. An odd mask with no whole core: one logical processor.
+	{
+		const auto sets   = MachineTable(0x5555);
+		Check(!ComputeCpuLayout(sets, CpuReserveMode::Cp, -1).reserved, "legacy: no whole core, nothing");
+		const auto layout = ComputeCpuLayout(sets, CpuReserveMode::Cp, -1, Common::kMinGeneralProcessors, 0, rules);
+		Check(layout.reserved && layout.cp_mask == 0x4 && std::popcount(layout.general_mask) == 7,
+		      "odd mask 0x5555 (8 cores, 8 logical): one logical, logical 2");
+	}
+	std::puts("CoreBudgetTests: placement rules ok");
+}
+
 } // namespace
 
 int main() {
 	TestBudget();
 	TestGate();
+	TestPlacement();
 	std::puts("CoreBudgetTests: all ok");
 	return 0;
 }
