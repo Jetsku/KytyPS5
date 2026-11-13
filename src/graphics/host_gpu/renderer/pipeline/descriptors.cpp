@@ -1,6 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorEncode.h"
-#include "graphics/host_gpu/renderer/commandStreamLog.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 
@@ -6601,34 +6600,26 @@ DrawEncode::DescriptorEnv RenderExecutor::MakeDescriptorEnv(std::span<PreparedBi
 
 // The encode of a commit after its side effects (CommitBindingsSideEffects): the descriptor build,
 // then push constants, the descriptor push or set and the bindless set through `sink` and `shadow`.
-// real: the command buffer's own sink and shadow (counters, the audit and the set path run); else
-// a capture with a copy of the shadow (KYTY_ENC_BUILDER verify), which returns false where the set
-// path (allocation and reuse cache, commit-thread work) would have been needed.
 template <typename Sink>
-bool RenderExecutor::EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, CommandBuffer& buffer,
+void RenderExecutor::EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, CommandBuffer& buffer,
                                   vk::PipelineBindPoint point, const PipelineCache::Pipeline& pipeline,
                                   std::span<PreparedBindings* const> stages, bool partial,
-                                  DrawEncode::DescriptorScratch& scratch, DrawEncode::BuiltDescriptors& built,
-                                  bool real) {
+                                  DrawEncode::DescriptorScratch& scratch, DrawEncode::BuiltDescriptors& built) {
 	const auto flags = CommandBuffer::EncodeFlags();
 	const auto env   = MakeDescriptorEnv(stages);
-	if (real) {
-		CommitStats::StepMark(CommitStats::Step::CbHead);
-	}
+	CommitStats::StepMark(CommitStats::Step::CbHead);
 	DrawEncode::BuildDescriptors(stages, point, partial, env, scratch, built);
 	{
 		const CommitStats::SubScope push_scope(CommitStats::Sub::PushConst);
 		DrawEncode::EmitPushConstants(sink, shadow, flags, pipeline.pipeline_layout, built);
 	}
-	if (real) {
-		if (point == vk::PipelineBindPoint::eGraphics) {
-			CommitStats::AddItems(CommitStats::Item::DescWrites, scratch.writes.size());
-		}
-		CommitStats::StepMark(CommitStats::Step::CbPushConst);
+	if (point == vk::PipelineBindPoint::eGraphics) {
+		CommitStats::AddItems(CommitStats::Item::DescWrites, scratch.writes.size());
 	}
+	CommitStats::StepMark(CommitStats::Step::CbPushConst);
 	if (!scratch.writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
-		if (real && DescriptorOffsetAuditEnabled()) [[unlikely]] {
+		if (DescriptorOffsetAuditEnabled()) [[unlikely]] {
 			NoteDescriptorOffsetAudit(pipeline, scratch.writes);
 		}
 		if (pipeline.uses_push_descriptors) {
@@ -6638,13 +6629,8 @@ bool RenderExecutor::EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, Comman
 			const bool known_miss = PushShadowFreshSkipEnabled() && built.fresh;
 			const auto result = DrawEncode::EmitPushDescriptors(sink, shadow, flags, point, pipeline.pipeline_layout,
 			                                                    scratch, known_miss);
-			if (real) {
-				CountDescriptorPushMiss(result, scratch.writes);
-			}
+			CountDescriptorPushMiss(result, scratch.writes);
 		} else {
-			if (!real) {
-				return false;
-			}
 			EXIT_IF(&scratch != &m_descriptor_scratch);
 			const CommitStats::SubScope desc_scope(CommitStats::Sub::DescSet);
 			CommitDescriptorSet(buffer, point, pipeline, built.fresh);
@@ -6654,10 +6640,7 @@ bool RenderExecutor::EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, Comman
 		// (Created by CommitBindingsSideEffects.)
 		DrawEncode::EmitBindlessSet(sink, point, pipeline.pipeline_layout, m_context.GetBindlessTable().Set());
 	}
-	if (real) {
-		CommitStats::StepMark(CommitStats::Step::CbDescriptors);
-	}
-	return true;
+	CommitStats::StepMark(CommitStats::Step::CbDescriptors);
 }
 
 void RenderExecutor::NoteDescriptorOffsetAudit(const PipelineCache::Pipeline&          pipeline,
@@ -6684,125 +6667,6 @@ void RenderExecutor::NoteDescriptorOffsetAudit(const PipelineCache::Pipeline&   
 	}
 }
 
-// KYTY_ENC_BUILDER (live; TEMPORARY while the builder is proven): 0 = the commit's encode as it was
-// (CommitBindingsEncodeOld, default), 1 = the builder (EncodeCommit), verify (2) = the builder into a
-// capture with a copy of the shadow, then the old encode for real; the stream packets (as replayed
-// (op, argument hash) pairs), the built writes and the resulting shadow are compared per commit.
-static int64_t ParseEncBuilder(const char* value) {
-	if (value == nullptr || value[0] == '\0') {
-		return 0;
-	}
-	if (std::strcmp(value, "verify") == 0 || std::strcmp(value, "2") == 0) {
-		return 2;
-	}
-	return std::strcmp(value, "1") == 0 ? 1 : 0;
-}
-static Live::Switch g_enc_builder("KYTY_ENC_BUILDER", ParseEncBuilder);
-
-namespace {
-
-struct EncVerifyCounters {
-	std::atomic<uint64_t> commits {0};
-	std::atomic<uint64_t> stream_compared {0};
-	std::atomic<uint64_t> direct {0};   // the old encode recorded natively (no stream to compare)
-	std::atomic<uint64_t> set_path {0}; // descriptor sets: only the writes and push constants compared
-	std::atomic<uint64_t> packets {0};
-	// Mismatches by field.
-	std::atomic<uint64_t> writes {0};
-	std::atomic<uint64_t> stream {0};
-	std::atomic<uint64_t> pipelines {0};
-	std::atomic<uint64_t> epochs {0};
-	std::atomic<uint64_t> descriptor_state {0};
-	std::atomic<uint64_t> push_constants {0};
-};
-EncVerifyCounters g_enc_verify;
-
-bool SameInfos(const vk::WriteDescriptorSet& a, const vk::WriteDescriptorSet& b) {
-	if (a.dstBinding != b.dstBinding || a.dstArrayElement != b.dstArrayElement ||
-	    a.descriptorCount != b.descriptorCount || a.descriptorType != b.descriptorType ||
-	    (a.pBufferInfo == nullptr) != (b.pBufferInfo == nullptr) ||
-	    (a.pImageInfo == nullptr) != (b.pImageInfo == nullptr) || a.pNext != b.pNext ||
-	    a.pTexelBufferView != b.pTexelBufferView) {
-		return false;
-	}
-	for (uint32_t i = 0; i < a.descriptorCount; i++) {
-		if ((a.pBufferInfo != nullptr && !(a.pBufferInfo[i] == b.pBufferInfo[i])) ||
-		    (a.pImageInfo != nullptr && !(a.pImageInfo[i] == b.pImageInfo[i]))) {
-			return false;
-		}
-	}
-	return true;
-}
-
-bool SameWrites(const std::vector<vk::WriteDescriptorSet>& a, const std::vector<vk::WriteDescriptorSet>& b) {
-	if (a.size() != b.size()) {
-		return false;
-	}
-	for (size_t i = 0; i < a.size(); i++) {
-		if (!SameInfos(a[i], b[i])) {
-			return false;
-		}
-	}
-	return true;
-}
-
-// The shadow's push-descriptor copies keep no info pointers (only the fields).
-bool SameShadowWrites(const std::vector<vk::WriteDescriptorSet>& a, const std::vector<vk::WriteDescriptorSet>& b) {
-	if (a.size() != b.size()) {
-		return false;
-	}
-	for (size_t i = 0; i < a.size(); i++) {
-		if (a[i].dstBinding != b[i].dstBinding || a[i].dstArrayElement != b[i].dstArrayElement ||
-		    a[i].descriptorCount != b[i].descriptorCount || a[i].descriptorType != b[i].descriptorType) {
-			return false;
-		}
-	}
-	return true;
-}
-
-// Bit per field: 1 pipelines, 2 epochs, 4 descriptor state, 8 push constants.
-uint32_t CompareShadows(const DrawEncode::Shadow& a, const DrawEncode::Shadow& b, bool descriptors) {
-	uint32_t mask = 0;
-	if (a.bound_pipelines != b.bound_pipelines) {
-		mask |= 1u;
-	}
-	if (descriptors && a.descriptor_epochs != b.descriptor_epochs) {
-		mask |= 2u;
-	}
-	for (size_t i = 0; descriptors && i < 2; i++) {
-		const auto& x = a.descriptor_states[i];
-		const auto& y = b.descriptor_states[i];
-		if (x.layout != y.layout || x.bound_set != y.bound_set || !SameShadowWrites(x.writes, y.writes) ||
-		    x.buffers != y.buffers || x.images != y.images) {
-			mask |= 4u;
-		}
-	}
-	const auto& p = a.push_constants;
-	const auto& q = b.push_constants;
-	if (p.valid != q.valid ||
-	    (p.valid && (p.layout != q.layout || p.stages != q.stages || p.size != q.size ||
-	                 std::memcmp(p.dwords.data(), q.dwords.data(), std::min<size_t>(p.size, sizeof(p.dwords))) != 0))) {
-		mask |= 8u;
-	}
-	return mask;
-}
-
-void PrintEncVerify() {
-	auto& c = g_enc_verify;
-	std::printf("EncBuilder verify: commits %" PRIu64 " stream-compared %" PRIu64 " (packets %" PRIu64
-	            ") direct %" PRIu64 " set-path %" PRIu64 "; mismatches writes=%" PRIu64 " stream=%" PRIu64
-	            " pipelines=%" PRIu64 " epochs=%" PRIu64 " descriptor_state=%" PRIu64 " push_constants=%" PRIu64
-	            " total=%" PRIu64 "\n",
-	            c.commits.load(), c.stream_compared.load(), c.packets.load(), c.direct.load(),
-	            c.set_path.load(), c.writes.load(), c.stream.load(), c.pipelines.load(), c.epochs.load(),
-	            c.descriptor_state.load(), c.push_constants.load(),
-	            c.writes.load() + c.stream.load() + c.pipelines.load() + c.epochs.load() +
-	                c.descriptor_state.load() + c.push_constants.load());
-	std::fflush(stdout);
-}
-
-} // namespace
-
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -6819,128 +6683,6 @@ void RenderExecutor::CommitBindingsEncode(CommandBuffer&                     buf
                                           const PipelineCache::Pipeline&     pipeline,
                                           std::span<PreparedBindings* const> prepared_bindings,
                                           bool                               keep_images) {
-	const auto mode = g_enc_builder.Get();
-	if (mode == 0) {
-		CommitBindingsEncodeOld(buffer, pipeline_bind_point, pipeline, prepared_bindings, keep_images);
-		return;
-	}
-	// KYTY_DRAW_RUN_PUSH: a continuation pushes only its per-draw descriptors; its image and sampler
-	// descriptors are the previous draw's, still in effect (RenderExecutor::DrawRunPartialPush).
-	const bool partial = keep_images && pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
-	                     DrawRunPartialPush(buffer, pipeline);
-	if (mode == 1) {
-		if (partial) {
-			OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
-		}
-		auto sink = buffer.StateSink();
-		(void)EncodeCommit(sink, buffer.EncodeShadow(), buffer, pipeline_bind_point, pipeline,
-		                   prepared_bindings, partial, m_descriptor_scratch, m_built_descriptors, true);
-		return;
-	}
-	// Verify: the builder first, into the capture with a copy of the shadow (it reads only the
-	// bindings, the shadow and what the side effects left), then the old encode for real.
-	if (!m_enc_capture) {
-		m_enc_capture = std::make_unique<EncCapture>();
-	}
-	auto&      capture = *m_enc_capture;
-	auto       shadow  = buffer.EncodeShadow();
-	const auto begin   = capture.ring.WritePosition();
-	const bool full    = EncodeCommit(capture.encoder, shadow, buffer, pipeline_bind_point, pipeline,
-	                                  prepared_bindings, partial, capture.scratch, capture.built, false);
-	const auto end     = capture.ring.WritePosition();
-
-	const auto* real_ring  = buffer.EncoderRing();
-	const auto  real_begin = real_ring != nullptr ? real_ring->WritePosition() : 0;
-	CommitBindingsEncodeOld(buffer, pipeline_bind_point, pipeline, prepared_bindings, keep_images);
-	const auto* real_after = buffer.EncoderRing();
-
-	auto&      c       = g_enc_verify;
-	const auto commits = c.commits.fetch_add(1, std::memory_order_relaxed) + 1;
-	uint32_t   mask    = 0; // 16 writes, 32 stream, 1..8 CompareShadows
-	if (!SameWrites(capture.scratch.writes, m_descriptor_scratch.writes)) {
-		mask |= 16u;
-	}
-	if (!full) {
-		c.set_path.fetch_add(1, std::memory_order_relaxed);
-	} else if (real_ring == nullptr || real_after != real_ring) {
-		c.direct.fetch_add(1, std::memory_order_relaxed);
-	} else {
-		CommandStream::CallLog built_log;
-		CommandStream::CallLog old_log;
-		CommandStream::LogPackets(capture.ring, begin, end, built_log);
-		CommandStream::LogPackets(*real_ring, real_begin, real_ring->WritePosition(), old_log);
-		c.stream_compared.fetch_add(1, std::memory_order_relaxed);
-		c.packets.fetch_add(old_log.calls.size(), std::memory_order_relaxed);
-		if (built_log.calls != old_log.calls) {
-			mask |= 32u;
-		}
-	}
-	// The capture is consumed at once (it only exists to be compared).
-	capture.ring.Publish();
-	while (const auto* header = capture.ring.Peek()) {
-		capture.ring.Advance(header->size);
-	}
-	capture.ring.Release(capture.encoder.Stats());
-	// The set path changed the real shadow's descriptor state through the set bind; the copy skipped it.
-	mask |= CompareShadows(shadow, buffer.EncodeShadow(), full);
-	if (mask != 0) {
-		uint64_t first = 0;
-		if ((mask & 16u) != 0) first += c.writes.fetch_add(1, std::memory_order_relaxed);
-		if ((mask & 32u) != 0) first += c.stream.fetch_add(1, std::memory_order_relaxed);
-		if ((mask & 1u) != 0) first += c.pipelines.fetch_add(1, std::memory_order_relaxed);
-		if ((mask & 2u) != 0) first += c.epochs.fetch_add(1, std::memory_order_relaxed);
-		if ((mask & 4u) != 0) first += c.descriptor_state.fetch_add(1, std::memory_order_relaxed);
-		if ((mask & 8u) != 0) first += c.push_constants.fetch_add(1, std::memory_order_relaxed);
-		if (first < 16) {
-			std::printf("EncBuilder verify: commit %" PRIu64 " mismatch mask 0x%x (point %u, writes %zu/%zu, push %d, set path %d)\n",
-			            commits, mask, static_cast<uint32_t>(pipeline_bind_point), capture.scratch.writes.size(),
-			            m_descriptor_scratch.writes.size(), pipeline.uses_push_descriptors ? 1 : 0, full ? 0 : 1);
-			std::fflush(stdout);
-		}
-	}
-	if (commits == 1 || (commits & 0xfffffu) == 0) {
-		PrintEncVerify();
-	}
-}
-
-void RenderExecutor::CommitBindingsEncodeOld(CommandBuffer&                     buffer,
-                                             vk::PipelineBindPoint              pipeline_bind_point,
-                                             const PipelineCache::Pipeline&     pipeline,
-                                             std::span<PreparedBindings* const> prepared_bindings,
-                                             bool                               keep_images) {
-	size_t descriptor_count = 0;
-	size_t write_count      = 0;
-	ShaderRecompiler::IR::PushData push_data;
-	bool                           has_push_data = false;
-	constexpr auto                 GraphicsStages =
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eMeshEXT |
-	    vk::ShaderStageFlagBits::eTessellationControl |
-	    vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eFragment;
-	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-	                                       ? vk::ShaderStageFlagBits::eFragment
-	                                       : vk::ShaderStageFlags {};
-	bool mesh_stage = false;
-	for (const auto* prepared: prepared_bindings) {
-		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
-		const auto& program = *prepared->runtime->program;
-		mesh_stage |= program.stage == ShaderType::Mesh;
-		write_count += program.bindings.descriptors.size();
-		for (const auto& binding: program.bindings.descriptors) {
-			descriptor_count += NativeDescriptorCount(binding);
-		}
-		const auto shader_stage = NativeShaderStage(program.stage);
-		push_stages |= shader_stage;
-		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
-		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
-		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
-		         shader_stage != vk::ShaderStageFlagBits::eCompute));
-	}
-	m_descriptor_scratch.buffers.clear();
-	m_descriptor_scratch.images.clear();
-	m_descriptor_scratch.writes.clear();
-	m_descriptor_scratch.buffers.reserve(descriptor_count);
-	m_descriptor_scratch.images.reserve(descriptor_count);
-	m_descriptor_scratch.writes.reserve(write_count);
 	// KYTY_DRAW_RUN_PUSH: a continuation pushes only its per-draw descriptors; its image and sampler
 	// descriptors are the previous draw's, still in effect (RenderExecutor::DrawRunPartialPush).
 	const bool partial = keep_images && pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
@@ -6948,220 +6690,9 @@ void RenderExecutor::CommitBindingsEncodeOld(CommandBuffer&                     
 	if (partial) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
 	}
-	CommitStats::StepMark(CommitStats::Step::CbHead);
-
-	for (auto* prepared: prepared_bindings) {
-		const auto& program       = *prepared->runtime->program;
-		auto&       descriptors   = *prepared;
-		const CommitStats::SubScope build_scope(CommitStats::Sub::DescBuild);
-		m_descriptor_scratch.occurrences.assign(descriptors.images.size(), 0);
-		for (const auto& binding: program.bindings.descriptors) {
-			if (partial && (binding.kind == BindingKind::Samplers ||
-			                ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
-			                    ShaderRecompiler::IR::ImageResourceClass::None)) {
-				continue;
-			}
-			vk::WriteDescriptorSet write {};
-			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
-			write.descriptorType = NativeDescriptorType(binding.kind);
-			write.descriptorCount   = NativeDescriptorCount(binding);
-			const auto buffer_start = m_descriptor_scratch.buffers.size();
-			const auto image_start  = m_descriptor_scratch.images.size();
-			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
-			    ShaderRecompiler::IR::ImageResourceClass::None) {
-				for (const auto resource: binding.resources) {
-					m_descriptor_scratch.images.push_back(MakeImageInfo(
-					    descriptors.images.at(resource), m_descriptor_scratch.occurrences.at(resource)++));
-				}
-			} else {
-				switch (binding.kind) {
-					case BindingKind::Buffers:
-						for (const auto resource: binding.resources) {
-							const auto& view = descriptors.buffers.at(resource);
-							EXIT_IF(view.buffer == nullptr);
-							m_descriptor_scratch.buffers.push_back(view);
-						}
-						break;
-					case BindingKind::UniformBuffers: {
-						// KYTY_UNIFORM_BUFFERS: the storage view, its range cut to the uniform
-						// array the shader declares (constant reads stay inside it).
-						const auto max_range = std::min<vk::DeviceSize>(
-						    ShaderRecompiler::IR::UniformBufferBytes,
-						    m_context.GetGraphics()
-						        .GetPhysicalDeviceProperties()
-						        .limits.maxUniformBufferRange);
-						for (const auto resource: binding.resources) {
-							auto view = descriptors.buffers.at(resource);
-							EXIT_IF(view.buffer == nullptr);
-							view.range = std::min(view.range, max_range);
-							m_descriptor_scratch.buffers.push_back(view);
-						}
-						break;
-					}
-					case BindingKind::BdaPagetable:
-					case BindingKind::FaultBuffer: {
-						auto&       cache      = m_context.GetBufferCache();
-						const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
-						                             ? cache.GetBdaPageTableBuffer()
-						                             : cache.GetFaultBuffer();
-						m_descriptor_scratch.buffers.emplace_back(bda_buffer->Handle(), 0,
-						                                  bda_buffer->Size());
-						break;
-					}
-					case BindingKind::MipStats: {
-						auto& lod_stats = m_context.GetLodStats();
-						auto& counters  = descriptors.mip_stats_canary ? lod_stats.CanaryBuffer()
-						                                               : lod_stats.CounterBuffer();
-						m_descriptor_scratch.buffers.emplace_back(counters.Handle(), 0, counters.Size());
-						break;
-					}
-					case BindingKind::FlattenedSrt:
-					case BindingKind::ShaderData:
-					case BindingKind::SharedMemory:
-					case BindingKind::Gds: {
-						const vk::DescriptorBufferInfo* view = &descriptors.gds;
-						if (binding.kind == BindingKind::FlattenedSrt ||
-						    binding.kind == BindingKind::ShaderData) {
-							view = binding.kind == BindingKind::FlattenedSrt
-							           ? &descriptors.flattened_srt
-							           : &descriptors.shader_data_buffer;
-							if (ShaderRecompiler::Spirv::SrtUniformEnabled()) {
-								// KYTY_SRT_UNIFORM: at most the uniform array the shader declares.
-								EXIT_IF(view->buffer == nullptr);
-								auto uniform  = *view;
-								uniform.range = std::min<vk::DeviceSize>(
-								    uniform.range,
-								    std::min<vk::DeviceSize>(ShaderRecompiler::IR::UniformBufferBytes,
-								                             m_context.GetGraphics()
-								                                 .GetPhysicalDeviceProperties()
-								                                 .limits.maxUniformBufferRange));
-								if (uniform.range < view->range) {
-									static std::atomic<uint32_t> reported {0};
-									if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
-										LOGF("KYTY_SRT_UNIFORM: table (kind %u) of %" PRIu64
-										     " bytes cut to the uniform range\n",
-										     static_cast<uint32_t>(binding.kind),
-										     static_cast<uint64_t>(view->range));
-									}
-								}
-								m_descriptor_scratch.buffers.push_back(uniform);
-								break;
-							}
-						} else if (binding.kind == BindingKind::SharedMemory) {
-							view = &descriptors.shared_memory;
-						}
-						EXIT_IF(view->buffer == nullptr);
-						m_descriptor_scratch.buffers.push_back(*view);
-						break;
-					}
-					case BindingKind::Samplers:
-						for (const auto resource: binding.resources) {
-							const auto sampler = descriptors.samplers.at(resource);
-							EXIT_IF(sampler == nullptr);
-							m_descriptor_scratch.images.emplace_back(sampler, nullptr,
-							                                 vk::ImageLayout::eUndefined);
-						}
-						break;
-					case BindingKind::Count: EXIT("invalid descriptor binding kind");
-				}
-			}
-			if (m_descriptor_scratch.buffers.size() != buffer_start) {
-				write.pBufferInfo = m_descriptor_scratch.buffers.data() + buffer_start;
-			}
-			if (m_descriptor_scratch.images.size() != image_start) {
-				write.pImageInfo = m_descriptor_scratch.images.data() + image_start;
-			}
-			m_descriptor_scratch.writes.push_back(write);
-		}
-		for (uint32_t i = 0; !partial && i < descriptors.images.size(); i++) {
-			const auto expected =
-			    descriptors.images[i].mip_views.empty()
-			        ? 1u
-			        : static_cast<uint32_t>(descriptors.images[i].mip_views.size());
-			EXIT_IF(m_descriptor_scratch.occurrences[i] != expected);
-		}
-
-		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
-		if (program.bindings.UsesPushData()) {
-			std::ranges::copy(prepared->shader_data,
-			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
-			has_push_data = true;
-		}
-		CommitStats::StepMark(CommitStats::Step::CbBuild);
-	}
-
-	if (has_push_data) {
-		const CommitStats::SubScope push_scope(CommitStats::Sub::PushConst);
-		buffer.PushConstants(pipeline.pipeline_layout, push_stages, sizeof(push_data),
-		                     push_data.dwords.data());
-	}
-	if (pipeline_bind_point == vk::PipelineBindPoint::eGraphics) {
-		CommitStats::AddItems(CommitStats::Item::DescWrites, m_descriptor_scratch.writes.size());
-	}
-	CommitStats::StepMark(CommitStats::Step::CbPushConst);
-	if (mesh_stage) {
-		// The mesh draw path then records its draw arguments over the first push-constant dwords
-		// through StateHandle(); the shadow no longer describes what is in effect.
-		buffer.InvalidatePushConstants();
-	}
-
-	if (!m_descriptor_scratch.writes.empty()) {
-		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
-		if (DescriptorOffsetAuditEnabled()) [[unlikely]] {
-			// Draws and dispatches are recorded under the render mutex, one at a time.
-			static DescriptorOffsetAudit audit;
-			using E           = Profiler::FrameEvent;
-			const bool push   = pipeline.uses_push_descriptors;
-			const auto result = audit.Note(
-			    m_context.GetCommandScheduler().CurrentTick(), pipeline.descriptor_set_layout,
-			    m_descriptor_scratch.writes,
-			    m_context.GetGraphics()
-			        .GetPhysicalDeviceProperties()
-			        .limits.maxDescriptorSetStorageBuffersDynamic,
-			    push);
-			Profiler::CountFrameEvent(push ? E::DescriptorOffsetAuditPushes
-			                               : E::DescriptorOffsetAuditSets);
-			if (result.previous) {
-				Profiler::CountFrameEvent(push ? E::DescriptorOffsetAuditPushRepeatsPrevious
-				                               : E::DescriptorOffsetAuditSetRepeatsPrevious);
-			}
-			if (result.any) {
-				Profiler::CountFrameEvent(push ? E::DescriptorOffsetAuditPushRepeatsAny
-				                               : E::DescriptorOffsetAuditSetRepeatsAny);
-			}
-			if (result.over_limit) {
-				Profiler::CountFrameEvent(E::DescriptorOffsetAuditOverLimit);
-			}
-		}
-		if (pipeline.uses_push_descriptors) {
-			const CommitStats::SubScope desc_scope(CommitStats::Sub::DescPush);
-			// KYTY_PUSH_SHADOW_FRESH_SKIP: a stage's shader data or flattened SRT was uploaded for
-			// this command, so its descriptor differs from every earlier push of this recording.
-			const bool known_miss =
-			    PushShadowFreshSkipEnabled() &&
-			    std::ranges::any_of(prepared_bindings,
-			                        [](const auto* prepared) { return prepared->fresh_upload; });
-			const auto result = buffer.PushDescriptors(
-			    pipeline_bind_point, pipeline.pipeline_layout, 0,
-			    static_cast<uint32_t>(m_descriptor_scratch.writes.size()), m_descriptor_scratch.writes.data(),
-			    known_miss);
-			CountDescriptorPushMiss(result, m_descriptor_scratch.writes);
-		} else {
-			const CommitStats::SubScope desc_scope(CommitStats::Sub::DescSet);
-			const bool fresh = std::ranges::any_of(
-			    prepared_bindings, [](const auto* prepared) { return prepared->fresh_upload; });
-			CommitDescriptorSet(buffer, pipeline_bind_point, pipeline, fresh);
-		}
-	}
-	if (pipeline.uses_bindless) [[unlikely]] {
-		// Set 1: the bindless table (Senaxx). Binding it leaves set 0 as it is (the same layout).
-		// (Created by CommitBindingsSideEffects.)
-		const auto set = m_context.GetBindlessTable().Set();
-		buffer.StateSink().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set,
-		                                      0, nullptr);
-	}
-	CommitStats::StepMark(CommitStats::Step::CbDescriptors);
+	auto sink = buffer.StateSink();
+	EncodeCommit(sink, buffer.EncodeShadow(), buffer, pipeline_bind_point, pipeline, prepared_bindings, partial,
+	             m_descriptor_scratch, m_built_descriptors);
 }
 
 // KYTY_SET_REUSE_FRESH (default on; 0 off; verify): a descriptor set whose writes refer to a

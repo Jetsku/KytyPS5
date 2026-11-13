@@ -798,7 +798,7 @@ struct RenderExecutorTestAccess {
   static void CommitDescriptorSet(RenderExecutor &executor, CommandBuffer &buffer,
                                   const PipelineCache::Pipeline &pipeline,
                                   std::span<const vk::WriteDescriptorSet> writes, bool fresh) {
-    executor.m_descriptor_writes.assign(writes.begin(), writes.end());
+    executor.m_descriptor_scratch.writes.assign(writes.begin(), writes.end());
     executor.CommitDescriptorSet(buffer, vk::PipelineBindPoint::eGraphics, pipeline, fresh);
   }
 
