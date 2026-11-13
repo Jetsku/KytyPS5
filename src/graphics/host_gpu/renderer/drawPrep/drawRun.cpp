@@ -83,6 +83,8 @@ Live::Switch g_targets("KYTY_DRAW_RUN_TARGETS", [](const char* value) -> int64_t
 // A record made with the swap on is only continued by a swap while it stays on.
 Live::Switch g_pipeswap("KYTY_DRAW_RUN_PIPESWAP", Live::ParseDefaultOff,
                         [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_PIPESWAP change"); });
+Live::Switch g_pipecont("KYTY_PIPE_CONT", Live::ParseDefaultOff,
+                        [](int64_t, int64_t) { NoteForeignActivity("KYTY_PIPE_CONT change"); });
 
 } // namespace Detail
 
@@ -164,12 +166,15 @@ uint64_t ActivityEpoch() noexcept {
 
 uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_config,
                       const DrawPrep::PreparedDraw& prepared, uint64_t* targets_key,
-                      uint64_t* swap_key) {
+                      uint64_t* swap_key, uint64_t* pipe_key) {
 	if (targets_key != nullptr) {
 		*targets_key = 0;
 	}
 	if (swap_key != nullptr) {
 		*swap_key = 0;
+	}
+	if (pipe_key != nullptr) {
+		*pipe_key = 0;
 	}
 	if (!prepared.ok || prepared.failure != DrawPrep::Failure::None ||
 	    !prepared.vertex_info.stage.program) {
@@ -207,6 +212,9 @@ uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_con
 	};
 	if (swap_key != nullptr) {
 		*swap_key = chain({nullptr, programs[1]});
+	}
+	if (pipe_key != nullptr) {
+		*pipe_key = chain({nullptr, nullptr});
 	}
 	return chain(programs);
 }
@@ -555,6 +563,29 @@ void PrintSummary() {
 	            delta[9], delta[10], delta[11], delta[12], delta[13], delta[14], delta[15], delta[16],
 	            delta[17], delta[18], delta[19], delta[20], delta[21], delta[22], delta[23], delta[24],
 	            delta[25], delta[26]);
+	if (PipeContMode() != 0) {
+		static std::array<uint64_t, 5 + static_cast<size_t>(PipeReject::Count)> pc_last {};
+		std::array<uint64_t, 5 + static_cast<size_t>(PipeReject::Count)> pc {};
+		pc[0] = g_totals.pc_attempts.load(std::memory_order_relaxed);
+		pc[1] = g_totals.pc_accepted.load(std::memory_order_relaxed);
+		pc[2] = g_totals.pc_ps_changed.load(std::memory_order_relaxed);
+		pc[3] = g_totals.pc_partial.load(std::memory_order_relaxed);
+		pc[4] = g_totals.pc_key_misses.load(std::memory_order_relaxed);
+		for (size_t i = 0; i < static_cast<size_t>(PipeReject::Count); i++) {
+			pc[5 + i] = g_totals.pc_rejects[i].load(std::memory_order_relaxed);
+		}
+		std::array<uint64_t, pc.size()> d {};
+		for (size_t i = 0; i < pc.size(); i++) {
+			d[i] = pc[i] - pc_last[i];
+		}
+		pc_last = pc;
+		std::printf("DrawRun pipecont (mode %" PRId64 "): %" PRIu64 " attempts, %" PRIu64
+		            " accepted (%" PRIu64 " new pixel program), %" PRIu64
+		            " partial pushes; rejected: cert=%" PRIu64 " vs-bindings=%" PRIu64
+		            " vs-outputs=%" PRIu64 " ps-bindings=%" PRIu64 " ps-outputs=%" PRIu64
+		            " writes=%" PRIu64 "; pipe-key differs (regs/words/flags)=%" PRIu64 "\n",
+		            PipeContMode(), d[0], d[1], d[2], d[3], d[6], d[7], d[8], d[9], d[10], d[11], d[4]);
+	}
 	std::fflush(stdout);
 	if (KeyDiagEnabled()) {
 		PrintKeyDiag(static_cast<double>(now - last_ns) * 1e-9);

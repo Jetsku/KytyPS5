@@ -2434,6 +2434,7 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_verify         = false;
 	m_run_targets_kept   = false;
 	m_run_pipeswap       = false;
+	m_run_pipecont_push  = false;
 	m_prepared_validated = false;
 	if (!m_in_engine_commit && DrawRun::Enabled()) {
 		DrawRun::NoteForeignActivity("draw outside an engine commit");
@@ -2760,46 +2761,127 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		}
 		kd.last_key = m_run_key;
 	}
-	bool pipeswap = false;
+	bool       pipeswap  = false;
+	bool       pipecont  = false; // KYTY_PIPE_CONT: either program may differ
+	const auto pc_mode   = DrawRun::PipeContMode();
+	const auto pc_reject = [&](DrawRun::PipeReject reason) {
+		if (pipecont) {
+			OwnedCounters::Add(totals.pc_rejects[static_cast<uint32_t>(reason)], 1);
+		}
+	};
 	if (!m_run_prev_valid || m_run_key == 0 || m_run_key != m_run.key) {
-		// KYTY_DRAW_RUN_PIPESWAP: the key differs in the vertex program alone.
-		if (!m_run_prev_valid || m_run_key == 0 || m_run_swap_key == 0 ||
-		    m_run_swap_key != m_run.swap_key || !DrawRun::PipeSwapEnabled()) {
+		if (!m_run_prev_valid || m_run_key == 0) {
 			return false;
 		}
-		pipeswap = true;
-		OwnedCounters::Add(totals.swap_matches, 1);
+		// KYTY_DRAW_RUN_PIPESWAP: the key differs in the vertex program alone.
+		if (m_run_swap_key != 0 && m_run_swap_key == m_run.swap_key &&
+		    (DrawRun::PipeSwapEnabled() || pc_mode != 0)) {
+			pipeswap = true;
+			pipecont = pc_mode != 0;
+			OwnedCounters::Add(totals.swap_matches, 1);
+		} else if (pc_mode != 0 && m_run_pipe_key != 0 && m_run_pipe_key == m_run.pipe_key) {
+			// KYTY_PIPE_CONT: the key differs in the programs alone.
+			pipeswap = true;
+			pipecont = true;
+		} else {
+			if (pc_mode != 0) {
+				OwnedCounters::Add(totals.pc_key_misses, 1);
+			}
+			return false;
+		}
+		if (pipecont) {
+			OwnedCounters::Add(totals.pc_attempts, 1);
+		}
 	} else {
 		OwnedCounters::Add(totals.key_matches, 1);
 	}
 	if (DrawRun::ActivityEpoch() != m_run.activity) {
 		DrawRun::CountMiss(Miss::Activity);
+		pc_reject(DrawRun::PipeReject::Cert);
 		return false;
 	}
 	if (buffer.Identity() != m_run.command ||
 	    m_context.GetCommandScheduler().CurrentTick() != m_run.tick) {
 		DrawRun::CountMiss(Miss::Command);
+		pc_reject(DrawRun::PipeReject::Cert);
 		return false;
 	}
 	if (buffer.ActiveRenderingSerial() == 0 ||
 	    buffer.ActiveRenderingSerial() != m_run.rendering_serial) {
 		DrawRun::CountMiss(Miss::Instance);
+		pc_reject(DrawRun::PipeReject::Cert);
 		return false;
 	}
 	if (!m_prepared_validated) {
 		DrawRun::CountMiss(Miss::Validation);
+		pc_reject(DrawRun::PipeReject::Cert);
 		return false;
 	}
 	const void* pixel = state.ps_active ? state.ps_input_info.stage.program : nullptr;
 	if (state.ps_active != m_run.ps_active || render_target_slice_offset != m_run.slice_offset ||
 	    state.vertex_stages_written != 1 ||
 	    (!pipeswap && state.vertex_info[0].stage.program != m_run.vertex_program) ||
-	    pixel != m_run.pixel_program) {
+	    (!pipecont && pixel != m_run.pixel_program)) {
 		DrawRun::CountMiss(Miss::Programs);
+		pc_reject(DrawRun::PipeReject::Cert);
 		return false;
 	}
 	bool swap_writes = false;
-	if (pipeswap) {
+	bool pc_push     = pipecont && pc_mode >= 2;
+	if (pipecont) {
+		// KYTY_PIPE_CONT: each changed program fits the kept bindings, claims and targets.
+		struct Changed {
+			const ShaderRecompiler::IR::CompiledShaderInfo* recorded = nullptr;
+			const ShaderStageRuntime*                       runtime  = nullptr;
+			bool                                            pixel    = false;
+		};
+		std::array<Changed, 2> changed {};
+		uint32_t               changed_count = 0;
+		if (state.vertex_info[0].stage.program != m_run.vertex_program) {
+			changed[changed_count++] = {
+			    static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(m_run.vertex_program),
+			    &state.vertex_info[0].stage, false};
+		}
+		if (pixel != m_run.pixel_program) {
+			changed[changed_count++] = {
+			    static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(m_run.pixel_program),
+			    &state.ps_input_info.stage, true};
+		}
+		if (changed_count == 0) {
+			pc_reject(DrawRun::PipeReject::Cert); // a key collision: the programs are the record's
+			return false;
+		}
+		for (uint32_t i = 0; i < changed_count; i++) {
+			const auto& c       = changed[i];
+			const auto* program = c.runtime->program;
+			if (c.recorded == nullptr || program == nullptr) {
+				pc_reject(c.pixel ? DrawRun::PipeReject::PsBindings : DrawRun::PipeReject::VsBindings);
+				return false;
+			}
+			if (const int reason = DrawRunPipeContCompatible(*c.recorded, *program, c.pixel);
+			    reason != 0) {
+				OwnedCounters::Add(totals.swap_incompatible, 1);
+				pc_reject(static_cast<DrawRun::PipeReject>(reason));
+				return false;
+			}
+			pc_push = pc_push && c.recorded->bindings == program->bindings;
+			if (!DrawRunProgramEligible(*program)) {
+				if (!m_run.record_writes_ok || !DrawRunProgramEligible(*program, true)) {
+					DrawRun::CountMiss(Miss::Writes);
+					pc_reject(DrawRun::PipeReject::Writes);
+					return false;
+				}
+				switch (DrawRunWritesOverRun(*c.runtime, m_run.images)) {
+					case 0: break;
+					case 1: swap_writes = true; break;
+					default:
+						DrawRun::CountMiss(Miss::Writes);
+						pc_reject(DrawRun::PipeReject::Writes);
+						return false;
+				}
+			}
+		}
+	} else if (pipeswap) {
 		const auto* recorded = static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(
 		    m_run.vertex_program);
 		const auto& program = *state.vertex_info[0].stage.program;
@@ -2833,7 +2915,10 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 			switch (DrawRunWritesOverRun(*runtime, m_run.images)) {
 				case 0: break;
 				case 1: writes = true; break;
-				default: DrawRun::CountMiss(Miss::Writes); return false;
+				default:
+					DrawRun::CountMiss(Miss::Writes);
+					pc_reject(DrawRun::PipeReject::Writes);
+					return false;
 			}
 		}
 	}
@@ -2845,7 +2930,65 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		OwnedCounters::Add(totals.swapped, 1);
 		m_run_pipeswap = true;
 	}
+	if (pipecont) {
+		OwnedCounters::Add(totals.pc_accepted, 1);
+		if (pixel != m_run.pixel_program) {
+			OwnedCounters::Add(totals.pc_ps_changed, 1);
+		}
+		m_run_pipecont_push = pc_push;
+	}
 	return true;
+}
+
+int RenderExecutor::DrawRunPipeContCompatible(const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
+                                              const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                              bool                                            pixel) {
+	using ShaderRecompiler::IR::StageOutputKind;
+	using DrawRun::PipeReject;
+	const auto& a = recorded.info;
+	const auto& b = program.info;
+	const auto  bindings_reject =
+	    static_cast<int>(pixel ? PipeReject::PsBindings : PipeReject::VsBindings);
+	if (a.images.size() != b.images.size() || a.samplers.size() != b.samplers.size()) {
+		return bindings_reject;
+	}
+	for (size_t i = 0; i < a.images.size(); i++) {
+		auto x = a.images[i];
+		auto y = b.images[i];
+		x.source = y.source = 0;
+		x.first_use_pc = y.first_use_pc = 0;
+		if (!(x == y)) {
+			return bindings_reject;
+		}
+	}
+	for (size_t i = 0; i < a.samplers.size(); i++) {
+		auto x = a.samplers[i];
+		auto y = b.samplers[i];
+		x.source = y.source = 0;
+		x.first_use_pc = y.first_use_pc = 0;
+		if (!(x == y)) {
+			return bindings_reject;
+		}
+	}
+	// The exports the kept targets, claims and acquisition depend on.
+	const auto exports = [](const auto& outputs) {
+		uint64_t mask = 0;
+		for (const auto& output: outputs) {
+			switch (output.kind) {
+				case StageOutputKind::Mrt: mask |= 1ull << (output.location & 31u); break;
+				case StageOutputKind::Depth: mask |= 1ull << 32u; break;
+				case StageOutputKind::SampleMask: mask |= 1ull << 33u; break;
+				case StageOutputKind::Layer: mask |= 1ull << 34u; break;
+				case StageOutputKind::ViewportIndex: mask |= 1ull << 35u; break;
+				default: break;
+			}
+		}
+		return mask;
+	};
+	if (exports(a.outputs) != exports(b.outputs)) {
+		return static_cast<int>(pixel ? PipeReject::PsOutputs : PipeReject::VsOutputs);
+	}
+	return 0;
 }
 
 bool RenderExecutor::DrawRunPipeSwapCompatible(const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
@@ -3136,7 +3279,8 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 
 bool RenderExecutor::DrawRunPartialPush(const CommandBuffer&           buffer,
                                         const PipelineCache::Pipeline& pipeline) const {
-	return DrawRun::PushPartialEnabled() && !m_run_recall && !m_run_pipeswap &&
+	// KYTY_PIPE_CONT=2: a pipe continuation whose changed programs keep their binding layout.
+	return DrawRun::PushPartialEnabled() && !m_run_recall && (!m_run_pipeswap || m_run_pipecont_push) &&
 	       pipeline.uses_push_descriptors &&
 	       m_run.push_valid &&
 	       m_run.push_layout == pipeline.pipeline_layout &&
@@ -3157,6 +3301,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.key              = m_run_key;
 	run.targets_key      = m_run_targets_key;
 	run.swap_key         = m_run_swap_key;
+	run.pipe_key         = m_run_pipe_key;
 	run.activity         = DrawRun::ActivityEpoch();
 	run.command          = buffer.Identity();
 	run.tick             = m_context.GetCommandScheduler().CurrentTick();
@@ -3168,6 +3313,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 		// changed the vertex program and the pipeline (layout) the next draw is compared with.
 		if (m_run_pipeswap) {
 			run.vertex_program = state.vertex_info[0].stage.program;
+			run.pixel_program  = state.ps_active ? state.ps_input_info.stage.program : nullptr;
 			run.push_valid     = pipeline.uses_push_descriptors;
 			run.push_layout    = pipeline.pipeline_layout;
 		}

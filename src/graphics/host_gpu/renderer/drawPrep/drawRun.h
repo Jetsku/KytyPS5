@@ -81,6 +81,7 @@ extern Live::Switch g_image_epoch; // KYTY_DRAW_RUN_IMAGE_EPOCH
 extern Live::Switch g_cont_eligible; // KYTY_DRAW_RUN_CONT_ELIGIBLE
 extern Live::Switch g_targets;       // KYTY_DRAW_RUN_TARGETS
 extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
+extern Live::Switch g_pipecont;      // KYTY_PIPE_CONT
 } // namespace Detail
 
 [[nodiscard]] inline Mode GetMode() {
@@ -234,6 +235,49 @@ extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
 	return Detail::g_pipeswap.On();
 }
 
+// KYTY_PIPE_CONT (live, default 0; 1 on, 2 on with partial pushes; with KYTY_DRAW_RUN=1 or verify):
+// widens KYTY_DRAW_RUN_PIPESWAP to draws whose structure key differs from the record's in the
+// vertex program, the pixel program or both (UFC 5: ~68% of the draws that start a run differ from
+// their predecessor in the pipeline alone). Implies the vertex-only swap.
+//  - the pipe key (the structure key without either program: every register, the stage flags
+//    including pixel activity, the T# and S# words) equals the record's, as does the slice offset;
+//  - each changed program declares the same images and samplers as the recorded one (every field
+//    but the user-data source and first use), so the kept texture and sampler bindings of that
+//    stage, resolved from the same words, are what its own resolution gives;
+//  - a changed vertex program exports a viewport index and a layer iff the recorded one does (the
+//    scissor union and slices the attachments were claimed for); a changed pixel program exports
+//    the same MRT locations (they select the colour targets), and depth / sample mask iff the
+//    recorded one does;
+//  - a changed program is run-eligible (no address/image writes, GDS, fault buffer); its buffer
+//    writes, when KYTY_DRAW_RUN_WRITES allows them, must not lie over an image of the run;
+//  - the rest of the certificate is a continuation's.
+// It then takes the swap path of KYTY_DRAW_RUN_PIPESWAP: kept targets, textures, samplers, views,
+// acquisition and transitions; the binding plan's pipeline is bound; all descriptors are pushed and
+// the dynamic state recorded again. The record takes both new programs and the pipeline layout.
+// KYTY_PIPE_CONT=2 also lets the swap push only its per-draw descriptors (KYTY_DRAW_RUN_PUSH must
+// be on) when the new pipeline has the record's pipeline layout and every changed program has the
+// recorded one's binding layout (the image/sampler descriptors are then at the same bindings and
+// binding a pipeline of the same layout does not disturb push descriptors).
+// Verify: KYTY_DRAW_RUN=verify runs the normal path for a would-be pipe continuation and compares it
+// with the record (targets, textures, views, samplers, rendering state, transitions, and with
+// KYTY_PIPE_CONT=2 + KYTY_DRAW_RUN_PUSH the pushed image/sampler descriptors). "pipecont:" part of
+// the DrawRun line: attempts (the pipe key matched, the full key did not), accepted, and rejections.
+[[nodiscard]] inline int64_t PipeContMode() {
+	return Detail::g_pipecont.Get();
+}
+
+// Why a pipe-key match did not continue (KYTY_PIPE_CONT).
+enum class PipeReject : uint8_t {
+	None,
+	Cert,       // activity, command buffer, tick, instance, validation, slice offset
+	VsBindings, // the vertex programs' images or samplers differ
+	VsOutputs,  // viewport index / layer export differs
+	PsBindings,
+	PsOutputs,  // MRT locations, depth or sample-mask export differ
+	Writes,     // a changed program is not run-eligible, or writes over the run
+	Count
+};
+
 // Command-processor work other than committed draws (GPU thread). Relaxed: written and read by the
 // GPU thread; other threads only bump it.
 // KYTY_DRAW_RUN_QUIET_OPS (default on): two kinds of command-processor work between draws do not
@@ -269,7 +313,8 @@ void NoteForeignActivity(const char* what = "other") noexcept;
 // (optional): the key without the vertex program (KYTY_DRAW_RUN_PIPESWAP); 0 with the key.
 [[nodiscard]] uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_config,
                                     const DrawPrep::PreparedDraw& prepared,
-                                    uint64_t* targets_key = nullptr, uint64_t* swap_key = nullptr);
+                                    uint64_t* targets_key = nullptr, uint64_t* swap_key = nullptr,
+                                    uint64_t* pipe_key = nullptr);
 
 // Why a candidate did not continue its run (after the key matched).
 enum class Miss : uint8_t {
@@ -310,6 +355,12 @@ struct Totals {
 	std::atomic<uint64_t> swap_matches {0};        // KYTY_DRAW_RUN_PIPESWAP: the swap key matched
 	std::atomic<uint64_t> swapped {0};             // continued with a pipeline swap (verify: would have)
 	std::atomic<uint64_t> swap_incompatible {0};   // vertex programs' bindings or outputs differ
+	std::atomic<uint64_t> pc_key_misses {0};       // KYTY_PIPE_CONT: full key differs, pipe key too
+	std::atomic<uint64_t> pc_attempts {0};         // KYTY_PIPE_CONT: the pipe key matched
+	std::atomic<uint64_t> pc_accepted {0};         // continued with a swap (verify: would have)
+	std::atomic<uint64_t> pc_ps_changed {0};       // accepted with a new pixel program
+	std::atomic<uint64_t> pc_partial {0};          // KYTY_PIPE_CONT=2: partial push allowed
+	std::atomic<uint64_t> pc_rejects[static_cast<uint32_t>(PipeReject::Count)] {};
 	std::atomic<uint64_t> verify_checks {0};
 	std::atomic<uint64_t> verify_mismatches {0};
 	std::atomic<uint64_t> misses[static_cast<uint32_t>(Miss::Count)] {};
