@@ -3083,6 +3083,61 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+namespace {
+bool FastCommitScratchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAST_COMMIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+struct SyncScratch {
+	std::vector<vk::BufferCopy> copies;
+	std::vector<vk::BufferCopy> late_copies;
+	std::vector<GuestRange>     hot_ranges;
+	std::vector<uint64_t>       demote_hot;
+	std::vector<uint64_t>       settle_hot;
+	std::vector<UploadHostCopy> host_copies;
+	void                        Clear() noexcept {
+		copies.clear();
+		late_copies.clear();
+		hot_ranges.clear();
+		demote_hot.clear();
+		settle_hot.clear();
+		host_copies.clear();
+	}
+};
+thread_local SyncScratch g_sync_scratch;
+thread_local bool        g_sync_scratch_busy = false;
+// Lends this thread's scratch lists (empty on entry) to one SynchronizeBuffer call, or private
+// lists when the feature is off or the scratch is already lent (nested call on this thread).
+class SyncScratchLease {
+public:
+	SyncScratchLease() {
+		if (FastCommitScratchEnabled() && !g_sync_scratch_busy) {
+			g_sync_scratch_busy = true;
+			g_sync_scratch.Clear();
+			m_scratch = &g_sync_scratch;
+		} else {
+			m_scratch = &m_own;
+		}
+	}
+	~SyncScratchLease() {
+		if (m_scratch == &g_sync_scratch) {
+			g_sync_scratch.Clear();
+			g_sync_scratch_busy = false;
+		}
+	}
+	SyncScratchLease(const SyncScratchLease&)            = delete;
+	SyncScratchLease& operator=(const SyncScratchLease&) = delete;
+	SyncScratch&      Get() noexcept { return *m_scratch; }
+
+private:
+	SyncScratch  m_own;
+	SyncScratch* m_scratch = nullptr;
+};
+} // namespace
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
@@ -3131,7 +3186,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			RunRangeMemoVerifyHook(vaddr, size);
 		}
 	}
-	std::vector<vk::BufferCopy> copies;
+	// KYTY_FAST_COMMIT: the per-call lists reuse this thread's scratch storage (a nested call
+	// on the same thread gets private vectors).
+	SyncScratchLease            scratch_lease;
+	auto&                       copies     = scratch_lease.Get().copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
 	// KYTY_FALSE_SHARING_WRITES: bytes an early release left to their publication are the GPU's
@@ -3172,14 +3230,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	// Hot pages (MemoryTracker) stay CPU-dirty: they are reported separately and copied only when
 	// they differ from the shadow of the last copy this buffer received (CollectHotPages).
-	std::vector<GuestRange> hot_ranges;
-	std::vector<uint64_t>   demote_hot;
-	std::vector<uint64_t>   settle_hot;
+	auto&                   hot_ranges = scratch_lease.Get().hot_ranges;
+	auto&                   demote_hot = scratch_lease.Get().demote_hot;
+	auto&                   settle_hot = scratch_lease.Get().settle_hot;
 	size_t                guest_copies = 0;
 	uint64_t              host_base    = 0;
 	// Written uploads with KYTY_UPLOAD_COPY_OUTSIDE_LOCK: pages re-dirtied by a racing guest write
 	// while the main copy ran unlocked, copied again under the tracker locks.
-	std::vector<vk::BufferCopy> late_copies;
+	auto&                       late_copies = scratch_lease.Get().late_copies;
 	uint64_t                    late_size = 0;
 	vk::Buffer                  late_source;
 	bool                        reserved_committed = false;
@@ -3204,7 +3262,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): a read upload large enough for the copy engine
 	// leaves its guest bytes to the DMA worker. The pages are already clean and write-protected
 	// when upload() runs (ForEachUploadRange), as for the copy made here.
-	std::vector<UploadHostCopy> host_copies;
+	auto& host_copies = scratch_lease.Get().host_copies;
 	// KYTY_DEFER_PROTECTS (pageManager.h): the collection of a read upload that may go to the DMA
 	// worker defers the write protections of the pages it cleans. The worker applies them before
 	// it copies the pages; every copy of their guest bytes made on this thread applies them first
@@ -4512,11 +4570,67 @@ std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) co
 	return KnownFillLocked(vaddr, size);
 }
 
+namespace {
+// KYTY_FAST_COMMIT=1: per-thread memo of KnownFill answers keyed by (cache, range, generation).
+// Every change of m_known_fills advances m_known_fill_generation under the mutex, so an entry
+// computed under the lock at generation G answers exactly as a fresh scan would while the
+// generation is still G.
+bool FastCommitKnownFill() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAST_COMMIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+struct KnownFillMemo {
+	const void*             owner      = nullptr;
+	uint64_t                vaddr      = 0;
+	uint64_t                size       = 0;
+	uint64_t                generation = 0;
+	std::optional<uint32_t> value;
+};
+constexpr uint32_t                         KnownFillMemoSize = 16;
+thread_local KnownFillMemo                 g_known_fill_memo[KnownFillMemoSize];
+std::atomic<uint64_t>                      g_known_fill_memo_hits {0};
+std::atomic<uint64_t>                      g_known_fill_memo_misses {0};
+std::atomic<uint64_t>                      g_known_fill_memo_last_log {0};
+} // namespace
+
 std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size,
                                                uint64_t& generation) const {
-	std::scoped_lock lock(m_known_fill_mutex);
-	generation = m_known_fill_generation.load(std::memory_order_relaxed);
-	return KnownFillLocked(vaddr, size);
+	if (!FastCommitKnownFill()) {
+		std::scoped_lock lock(m_known_fill_mutex);
+		generation = m_known_fill_generation.load(std::memory_order_relaxed);
+		return KnownFillLocked(vaddr, size);
+	}
+	const uint64_t current = m_known_fill_generation.load(std::memory_order_acquire);
+	auto&          memo    = g_known_fill_memo[((vaddr >> 8u) ^ (size >> 4u)) % KnownFillMemoSize];
+	if (memo.owner == this && memo.vaddr == vaddr && memo.size == size && memo.generation == current) {
+		generation = current;
+		g_known_fill_memo_hits.fetch_add(1, std::memory_order_relaxed);
+		return memo.value;
+	}
+	std::optional<uint32_t> value;
+	{
+		std::scoped_lock lock(m_known_fill_mutex);
+		generation = m_known_fill_generation.load(std::memory_order_relaxed);
+		value      = KnownFillLocked(vaddr, size);
+	}
+	memo = {this, vaddr, size, generation, value};
+	const auto misses = g_known_fill_memo_misses.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (misses % 4096 == 0) {
+		const auto now  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count());
+		auto       last = g_known_fill_memo_last_log.load(std::memory_order_relaxed);
+		if (now >= last + 10 && g_known_fill_memo_last_log.compare_exchange_strong(last, now)) {
+			const auto hits = g_known_fill_memo_hits.load(std::memory_order_relaxed);
+			std::printf("FastCommit: KnownFill memo %llu hits, %llu misses (%.1f%% hit)\n",
+			            static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses),
+			            100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses));
+		}
+	}
+	return value;
 }
 
 std::optional<uint32_t> BufferCache::KnownFillLocked(uint64_t vaddr, uint64_t size) const {
