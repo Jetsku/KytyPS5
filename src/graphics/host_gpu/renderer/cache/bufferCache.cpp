@@ -140,6 +140,17 @@ struct BufferCache::HostImportState {
 		if (alignment == 0) {
 			alignment = 4096;
 		}
+		if (const auto* v = std::getenv("KYTY_HOST_IMPORT_RETRY_FRAMES"); v != nullptr && v[0] != '\0') {
+			retry_frames = std::strtoull(v, nullptr, 10);
+		}
+		if (const auto* v = std::getenv("KYTY_HOST_IMPORT_LOG"); v != nullptr && v[0] != '\0' &&
+		                                                       std::strcmp(v, "0") != 0) {
+			log_left = std::strcmp(v, "1") == 0 ? 64u : static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+		}
+		if (const auto* v = std::getenv("KYTY_HOST_IMPORT_UPLOAD_CANDIDATES");
+		    v != nullptr && std::strcmp(v, "1") == 0) {
+			upload_candidates_enabled = true;
+		}
 		const auto* max_mb = std::getenv("KYTY_HOST_IMPORT_MAX_MB");
 		if (max_mb != nullptr && max_mb[0] != '\0') {
 			max_bytes = std::strtoull(max_mb, nullptr, 10) << 20u;
@@ -260,6 +271,33 @@ struct BufferCache::HostImportState {
 	uint64_t                               frame               = 0;
 	uint64_t                               imported_bytes      = 0;
 	uint64_t                               fallbacks           = 0;
+	// Why a page is not (or no longer) redirected. A fallback page may be redirected again once
+	// eligible and its back-off (KYTY_HOST_IMPORT_RETRY_FRAMES, doubled per repeat) has passed.
+	enum Reason : uint32_t {
+		Eligible,
+		NoBuffer,
+		Failed,
+		Backoff,
+		GpuDirty,
+		Publication,
+		ImageGpuModified,
+		BdaWrite,
+		BdaWriteOverflow,
+		Remap,
+		ReasonCount,
+	};
+	static constexpr const char* ReasonNames[ReasonCount] = {
+	    "eligible", "no-buffer",  "failed", "backoff",  "gpu-dirty", "publication",
+	    "image-gpu-modified", "bda-write", "bda-write-overflow", "remap"};
+	struct Retry {
+		uint64_t until  = 0;
+		uint32_t repeat = 0;
+	};
+	std::unordered_map<uint64_t, Retry>    retry; // cache page -> back-off
+	std::array<uint64_t, ReasonCount>      fallback_pages {};
+	uint64_t                               retry_frames = 60;
+	uint32_t                               log_left     = 0;
+	bool                                   upload_candidates_enabled = false;
 	uint64_t                               failures            = 0;
 	uint64_t                               skipped_bytes       = 0;
 	uint64_t                               validated_structure = 0;
@@ -3545,7 +3583,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		m_staging_buffer.Commit();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
 	}
-	if ((source || late_source) && (UploadSources::Enabled() || m_host_import != nullptr)) {
+	if ((source || late_source) &&
+	    (UploadSources::Enabled() ||
+	     (m_host_import != nullptr && m_host_import->upload_candidates_enabled))) {
 		using namespace UploadSources;
 		const Path guest_path = stats != nullptr          ? BdaSync
 		                        : upload_reason != nullptr ? (is_written ? WrittenBinding : Other)
@@ -4535,7 +4575,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 			}
 			if (read) {
 				m_stream_buffer.Commit();
-				if (UploadSources::Enabled() || m_host_import != nullptr) {
+				if (UploadSources::Enabled() ||
+				    (m_host_import != nullptr && m_host_import->upload_candidates_enabled)) {
 					NoteUploadSource(vaddr, size, UploadSources::StreamRead);
 				}
 				return {&m_stream_buffer, offset};
@@ -6025,7 +6066,7 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 			if (b > cursor) {
 				SettleBdaWrittenRange(cursor, b - cursor, shader_hash, settled_pages);
 			}
-			HostImportSettleWrite(b, e - b);
+			HostImportSettleWrite(b, e - b, writes.overflow);
 			cursor = e;
 		}
 		if (cursor < end) {
@@ -6239,7 +6280,7 @@ void BufferCache::HostImportReapply(uint64_t first_page, uint64_t last_page) {
 	}
 }
 
-void BufferCache::HostImportUnredirect(uint64_t vaddr, uint64_t size, bool exclude) {
+void BufferCache::HostImportUnredirect(uint64_t vaddr, uint64_t size, uint32_t reason) {
 	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	const auto runs  = HostImportRedirectedRuns(begin, end - begin);
@@ -6254,20 +6295,35 @@ void BufferCache::HostImportUnredirect(uint64_t vaddr, uint64_t size, bool exclu
 			state.page_import.erase(page);
 		}
 		HostImportWriteEntries(run_begin >> CACHING_PAGEBITS, run_end >> CACHING_PAGEBITS, false);
-		if (exclude) {
-			state.excluded.Add(run_begin, run_end - run_begin);
-			state.fallbacks += (run_end - run_begin) >> CACHING_PAGEBITS;
+		const auto pages = (run_end - run_begin) >> CACHING_PAGEBITS;
+		state.fallback_pages[reason] += pages;
+		if (state.log_left != 0) {
+			state.log_left--;
+			std::printf("HostImport fallback: 0x%010" PRIx64 "-0x%010" PRIx64 " (%" PRIu64
+			            " pages) reason=%s frame=%" PRIu64 "\n",
+			            run_begin, run_end, pages, HostImportState::ReasonNames[reason], state.frame);
+			std::fflush(stdout);
+		}
+		if (reason != HostImportState::Remap && reason != HostImportState::Eligible) {
+			state.fallbacks += pages;
+			for (uint64_t page = run_begin >> CACHING_PAGEBITS; page < (run_end >> CACHING_PAGEBITS);
+			     ++page) {
+				auto& retry  = state.retry[page];
+				retry.until  = state.frame + (state.retry_frames << std::min<uint32_t>(retry.repeat, 6u));
+				retry.repeat = std::min<uint32_t>(retry.repeat + 1, 30u);
+			}
 		}
 	}
 	// The cache buffer skipped every upload of these pages: the next pass scans fully.
 	InvalidateBdaSynchronization();
 }
 
-void BufferCache::HostImportSettleWrite(uint64_t vaddr, uint64_t size) {
+void BufferCache::HostImportSettleWrite(uint64_t vaddr, uint64_t size, bool overflow) {
 	// A BDA write through a redirected entry landed in guest memory, the truth for a page that is
 	// not GPU-dirty: back to the cache buffer for good, which must then upload the page, exactly as
 	// after a guest CPU write.
-	HostImportUnredirect(vaddr, size, true);
+	HostImportUnredirect(vaddr, size,
+	                     overflow ? HostImportState::BdaWriteOverflow : HostImportState::BdaWrite);
 	InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	ForgetKnownFills(vaddr, size);
@@ -6275,14 +6331,33 @@ void BufferCache::HostImportSettleWrite(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HostImportPageEligible(uint64_t page) {
+	return HostImportPageReason(page) == HostImportState::Eligible;
+}
+
+uint32_t BufferCache::HostImportPageReason(uint64_t page) {
+	auto&      state = *m_host_import;
 	const auto guest = page << CACHING_PAGEBITS;
 	const auto id    = m_page_table[page];
-	if (!id || IsBufferInvalid(id) || m_host_import->excluded.Intersects(guest, CACHING_PAGESIZE)) {
-		return false;
+	if (!id || IsBufferInvalid(id)) {
+		return HostImportState::NoBuffer;
 	}
-	return !HasGpuDirtyBytes(guest, CACHING_PAGESIZE) &&
-	       !HasPendingBackingPublication(guest, CACHING_PAGESIZE) &&
-	       !m_texture_cache.IsRegionGpuModified(guest, CACHING_PAGESIZE);
+	if (state.excluded.Intersects(guest, CACHING_PAGESIZE)) {
+		return HostImportState::Failed;
+	}
+	if (const auto found = state.retry.find(page);
+	    found != state.retry.end() && state.frame < found->second.until) {
+		return HostImportState::Backoff;
+	}
+	if (HasGpuDirtyBytes(guest, CACHING_PAGESIZE)) {
+		return HostImportState::GpuDirty;
+	}
+	if (HasPendingBackingPublication(guest, CACHING_PAGESIZE)) {
+		return HostImportState::Publication;
+	}
+	if (m_texture_cache.IsRegionGpuModified(guest, CACHING_PAGESIZE)) {
+		return HostImportState::ImageGpuModified;
+	}
+	return HostImportState::Eligible;
 }
 
 bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
@@ -6408,15 +6483,19 @@ void BufferCache::HostImportValidate() {
 	const auto images       = m_texture_cache.GpuModifiedTransitions();
 	const bool check_images = images != state.validated_images;
 	const bool publications = m_backing_publication_count.load(std::memory_order_acquire) != 0;
-	std::vector<std::pair<uint64_t, uint64_t>> fallback;
-	std::vector<std::pair<uint64_t, uint64_t>> remapped;
+	std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> fallback;
+	std::vector<std::pair<uint64_t, uint64_t>>            remapped;
 	state.redirected.ForEach([&](uint64_t begin, uint64_t end) {
 		if (HasGpuDirtyBytes(begin, end - begin) ||
 		    (publications && HasPendingBackingPublication(begin, end - begin)) ||
 		    (check_images && m_texture_cache.IsRegionGpuModified(begin, end - begin))) {
 			for (uint64_t page = begin; page < end; page += CACHING_PAGESIZE) {
-				if (!HostImportPageEligible(page >> CACHING_PAGEBITS)) {
-					fallback.emplace_back(page, page + CACHING_PAGESIZE);
+				const auto reason = HostImportPageReason(page >> CACHING_PAGEBITS);
+				// A redirected page is never in back-off; a missing buffer is re-applied on
+				// registration (HostImportReapply), so only ownership moves count.
+				if (reason == HostImportState::GpuDirty || reason == HostImportState::Publication ||
+				    reason == HostImportState::ImageGpuModified) {
+					fallback.emplace_back(page, page + CACHING_PAGESIZE, reason);
 				}
 			}
 		}
@@ -6440,11 +6519,11 @@ void BufferCache::HostImportValidate() {
 			run = stop;
 		}
 	});
-	for (const auto& [begin, end]: fallback) {
-		HostImportUnredirect(begin, end - begin, true);
+	for (const auto& [begin, end, reason]: fallback) {
+		HostImportUnredirect(begin, end - begin, reason);
 	}
 	for (const auto& [begin, end]: remapped) {
-		HostImportUnredirect(begin, end - begin, false);
+		HostImportUnredirect(begin, end - begin, HostImportState::Remap);
 	}
 	state.validated_structure = m_bda_structure_epoch.load(std::memory_order_acquire);
 	state.validated_images    = images;
@@ -6460,8 +6539,10 @@ void BufferCache::HostImportUpdate() {
 	for (const auto& range: m_bda_hot_ranges) {
 		candidates.Add(range.address, range.size);
 	}
-	state.upload_candidates.ForEach(
-	    [&](uint64_t begin, uint64_t end) { candidates.Add(begin, end - begin); });
+	if (state.upload_candidates_enabled) {
+		state.upload_candidates.ForEach(
+		    [&](uint64_t begin, uint64_t end) { candidates.Add(begin, end - begin); });
+	}
 	state.upload_candidates.Clear();
 	using LookupPart = BufferLookupStats::Part;
 	const auto kind  = static_cast<LookupPart>(m_bda_pass_kind);
@@ -6538,6 +6619,11 @@ void BufferCache::HostImportAdvanceFrame() {
 	            f[HostImportState::Other], static_cast<double>(state.skipped_bytes) / MiB / elapsed,
 	            static_cast<double>(state.bound_reads) / elapsed,
 	            static_cast<double>(state.bound_bytes) / MiB / elapsed);
+	std::printf("HostImport fallbacks by reason:");
+	for (uint32_t i = HostImportState::GpuDirty; i < HostImportState::ReasonCount; ++i) {
+		std::printf(" %s %" PRIu64, HostImportState::ReasonNames[i], state.fallback_pages[i]);
+	}
+	std::printf(" (pages, cumulative; %zu pages in back-off table)\n", state.retry.size());
 	std::fflush(stdout);
 	state.skipped_bytes = 0;
 	state.bound_reads   = 0;
@@ -6548,7 +6634,8 @@ void BufferCache::HostImportAdvanceFrame() {
 void BufferCache::NoteUploadSource(uint64_t address, uint64_t size, uint32_t path) {
 	using namespace UploadSources;
 	// Read paths feed the host import's streaming candidates (uploaded in two frames: imported).
-	if (m_host_import != nullptr && path != WrittenBinding && path != TexelRead && path != Other &&
+	if (m_host_import != nullptr && m_host_import->upload_candidates_enabled &&
+	    path != WrittenBinding && path != TexelRead && path != Other &&
 	    GuestGpu::IsGpuThread()) {
 		m_host_import->upload_candidates.Add(address, size);
 	}
@@ -6609,7 +6696,10 @@ void BufferCache::ReportUploadSources() {
 			const auto& state = *m_host_import;
 			status = state.redirected.Contains(entry.lo, span)     ? "imported"
 			         : state.redirected.Intersects(entry.lo, span) ? "partly-imported"
-			         : state.excluded.Intersects(entry.lo, span)   ? "excluded(fallback/failed)"
+			         : state.excluded.Intersects(entry.lo, span)   ? "failed"
+			         : const_cast<BufferCache*>(this)->HostImportPageReason(page >> CACHING_PAGEBITS) ==
+			                   HostImportState::Backoff
+			             ? "fallback-backoff"
 			         : HasGpuDirtyBytes(entry.lo, span)            ? "gpu-dirty"
 			         : !direct                                     ? "not-direct"
 			         : m_texture_cache.IsRegionGpuModified(entry.lo, span) ? "image-gpu-modified"

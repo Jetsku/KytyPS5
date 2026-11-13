@@ -329,8 +329,9 @@ private:
 	void HostImportValidate();
 	void HostImportUpdate();
 	void HostImportReapply(uint64_t first_page, uint64_t last_page);
-	void HostImportUnredirect(uint64_t vaddr, uint64_t size, bool exclude);
-	void HostImportSettleWrite(uint64_t vaddr, uint64_t size);
+	// reason: HostImportState::Reason (0: no fallback, e.g. a remap).
+	void HostImportUnredirect(uint64_t vaddr, uint64_t size, uint32_t reason);
+	void HostImportSettleWrite(uint64_t vaddr, uint64_t size, bool overflow);
 	void HostImportAdvanceFrame();
 	// KYTY_UPLOAD_SOURCES=1: per-path accounting of uploaded guest bytes (bufferCache.cpp).
 	void NoteUploadSource(uint64_t address, uint64_t size, uint32_t path);
@@ -344,6 +345,7 @@ private:
 	[[nodiscard]] std::optional<std::pair<Buffer*, uint64_t>> HostImportReadBinding(uint64_t vaddr,
 	                                                                                 uint64_t size);
 	[[nodiscard]] bool HostImportPageEligible(uint64_t page);
+	[[nodiscard]] uint32_t HostImportPageReason(uint64_t page);
 	void HostImportWriteEntries(uint64_t first_page, uint64_t last_page, bool redirect);
 	// A run of hot pages a full BDA pass found inside one scanned buffer (KYTY_BDA_HOT_SYNC).
 	struct BdaHotRange {
