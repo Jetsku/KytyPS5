@@ -4205,6 +4205,59 @@ void ReportBarrierStats() {
 }
 } // namespace
 
+// KYTY_PIPELINE_FILL=1 (default off; PLAN_60FPS.md Phase 2): fewer draw-prep window drains at
+// WAIT_FLIP_DONE, ~1 parse stop per frame in UFC 5 (CpSeq::IsLockstep).
+// - A flip wait whose display buffer is already not pending, while no Flip op this front emitted
+//   is still unexecuted (the only ops of this stream that can make it pending again), is passed
+//   like an already-satisfied label wait: the resolver still executes it in order (and suspends
+//   there itself if a flip became pending meanwhile), the front keeps parsing. Front reads stay
+//   guarded as everywhere (GPU-touched bytes in lockstep, pending CP writes awaited).
+// - KYTY_PIPELINE_FILL_SPEC (default 1 with the switch): at a flip wait that does stop, the P3c
+//   speculative parse (RunPrefetch) runs as at a self-label wait; its draws are adopted only when
+//   the real parse after the wait consumes the same packets and inputs (TryAdopt), else dropped.
+//   Preparations are certified at commit as usual. As at self-label waits, guest CPU writes are not
+//   in the coherence log: a CPU write ordered before the flip completion (a CPU-submitted flip of
+//   the waited buffer after writing data the draws after the wait read) is not seen by a
+//   speculative preparation. GPU-submitted flips (submitAndFlip, EOP flips) cannot order those.
+namespace {
+bool PipelineFillEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PIPELINE_FILL");
+		return v != nullptr && v[0] == '1';
+	}();
+	return enabled;
+}
+bool PipelineFillSpec() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PIPELINE_FILL_SPEC");
+		return PipelineFillEnabled() && (v == nullptr || v[0] != '0');
+	}();
+	return enabled;
+}
+struct PipelineFillStats {
+	std::atomic<uint64_t> flip_waits {0}, flip_passed {0}, spec_runs {0}, spec_published {0},
+	    adopted {0}, dropped {0};
+};
+PipelineFillStats g_fill_stats;
+void ReportPipelineFillStats() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	const double secs = std::chrono::duration<double>(now - last).count();
+	last              = now;
+	auto& f           = g_fill_stats;
+	std::printf("PipelineFill %.1fs: flip_waits=%llu passed=%llu spec_runs=%llu spec_draws=%llu "
+	            "adopted=%llu dropped=%llu\n",
+	            secs, (unsigned long long)f.flip_waits.exchange(0),
+	            (unsigned long long)f.flip_passed.exchange(0),
+	            (unsigned long long)f.spec_runs.exchange(0),
+	            (unsigned long long)f.spec_published.exchange(0),
+	            (unsigned long long)f.adopted.exchange(0), (unsigned long long)f.dropped.exchange(0));
+}
+} // namespace
+
 // KYTY_LOOP_GUARD: guarded shaders count exhausted invocations in the last GDS dword. The mapped
 // word is read without waiting for the GPU (a diagnostic) and reported when it changes.
 static void NoteLoopGuardHits(RenderContext& renderer) {
@@ -5063,6 +5116,9 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 			}
 		}
 	}
+	if (kind == CpSeq::OpKind::Flip) {
+		m_last_flip_op = sequence + 1u;
+	}
 	if (CpSeq::IsLockstep(kind)) {
 		// P3c: speculative slots the real parse has not adopted by an ordering point are stale (a
 		// speculation stops at the first one); the resolver retires them before this op.
@@ -5152,6 +5208,21 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 			}
 		}
 	}
+	if (kind == CpSeq::OpKind::WaitFlipDone && PipelineFillEnabled()) {
+		g_fill_stats.flip_waits.fetch_add(1, std::memory_order_relaxed);
+		ReportPipelineFillStats();
+		const auto& wait = *static_cast<const CpSeq::WaitFlipDoneOp*>(payload);
+		if (m_last_flip_op <= m_sequencer->Executed() &&
+		    !m_renderer.GetVideoOut().IsFlipPending(static_cast<int>(wait.video_out_handle),
+		                                            static_cast<int>(wait.display_buffer_index))) {
+			g_fill_stats.flip_passed.fetch_add(1, std::memory_order_relaxed);
+			if (BarrierStatsEnabled()) {
+				g_barrier_stats.passed.fetch_add(1, std::memory_order_relaxed);
+			}
+			m_adopt_tracking = false;
+			return {false, 0};
+		}
+	}
 	if (BarrierStatsEnabled()) {
 		switch (kind) {
 			case CpSeq::OpKind::WaitRegMem: {
@@ -5169,8 +5240,10 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 	}
 	// P3c (KYTY_CP_SEQ_PREFETCH): at a wait on the label this stream just wrote, parse ahead on a
 	// copy of the front while the resolver catches up, publishing the draws it meets.
-	const bool prefetch = kind == CpSeq::OpKind::WaitRegMem && CpSeq::PrefetchMode() != 0 &&
-	                      IsSelfLabelWait(*static_cast<const CpSeq::WaitRegMemOp*>(payload));
+	const bool flip_spec = kind == CpSeq::OpKind::WaitFlipDone && PipelineFillSpec();
+	const bool prefetch  = flip_spec ||
+	                      (kind == CpSeq::OpKind::WaitRegMem && CpSeq::PrefetchMode() != 0 &&
+	                       IsSelfLabelWait(*static_cast<const CpSeq::WaitRegMemOp*>(payload)));
 	if (prefetch) {
 		RunPrefetch(sequence);
 	}
@@ -5184,6 +5257,7 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 	// The real parse after the wait: its draws are matched with the speculative slots by the
 	// packets and bytes it consumes from here (the wait packet itself completes first).
 	m_adopt_tracking = prefetch && m_draw_prep != nullptr && m_draw_prep->SpeculativeSlots() != 0;
+	m_adopt_fill     = flip_spec && m_adopt_tracking;
 	m_adopt_skip_one = true;
 	m_adopt_packets  = 0;
 	m_adopt_inputs   = 0;
@@ -5650,8 +5724,12 @@ void CommandProcessor::DropSpeculativeSlots() {
 		return;
 	}
 	if (const auto dropped = m_draw_prep->DropSpeculative(); dropped != 0) {
+		if (m_adopt_fill) {
+			g_fill_stats.dropped.fetch_add(dropped, std::memory_order_relaxed);
+		}
 		EmitSkipSlots(dropped);
 	}
+	m_adopt_fill = false;
 }
 
 template <typename Op>
@@ -5669,6 +5747,9 @@ bool CommandProcessor::AdoptSpeculativeDraw(Op& op) {
 	uint64_t dropped  = 0;
 	switch (engine->TryAdopt(m_adopt_packets, CurrentPacketKey(), position, dropped)) {
 		case DrawPrep::Engine::Adoption::Adopted:
+			if (m_adopt_fill) {
+				g_fill_stats.adopted.fetch_add(1, std::memory_order_relaxed);
+			}
 			op.flags |= CpSeq::DrawFlagPublished;
 			op.window = position;
 			if (engine->SpeculativeSlots() == 0) {
@@ -5677,6 +5758,10 @@ bool CommandProcessor::AdoptSpeculativeDraw(Op& op) {
 			return true;
 		case DrawPrep::Engine::Adoption::Dropped:
 			m_adopt_tracking = false;
+			if (m_adopt_fill) {
+				g_fill_stats.dropped.fetch_add(dropped, std::memory_order_relaxed);
+			}
+			m_adopt_fill = false;
 			EmitSkipSlots(dropped);
 			return false;
 		case DrawPrep::Engine::Adoption::None: break;
@@ -5875,6 +5960,10 @@ void CommandProcessor::RunPrefetch(uint64_t wait_op) {
 		if (shadow.m_prefetch_stop || spec.m_suspended) {
 			break;
 		}
+	}
+	if (PipelineFillEnabled()) {
+		g_fill_stats.spec_runs.fetch_add(1, std::memory_order_relaxed);
+		g_fill_stats.spec_published.fetch_add(shadow.m_prefetch_draws, std::memory_order_relaxed);
 	}
 }
 

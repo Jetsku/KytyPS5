@@ -561,6 +561,10 @@ private:
 	// Both fronts after a wait (P3c): the adoption key so far. skip_one: the wait packet itself
 	// completes first and is not counted.
 	bool     m_adopt_tracking = false;
+	// KYTY_PIPELINE_FILL: the tracked speculation ran at a flip wait (stats only).
+	bool     m_adopt_fill     = false;
+	// Sequencer, KYTY_PIPELINE_FILL: sequence + 1 of the last Flip op it emitted (0: none).
+	uint64_t m_last_flip_op   = 0;
 	bool     m_adopt_skip_one = false;
 	uint64_t m_adopt_packets  = 0;
 	uint64_t m_adopt_inputs   = 0;
