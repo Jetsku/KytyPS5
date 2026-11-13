@@ -1483,10 +1483,11 @@ void TestSpirvRequirementsAnalysis() {
       "invalid buffer requirement metadata did not terminate analysis");
   ExpectFatal(
       [&] {
-        add_tid.stage = ShaderType::Vertex;
+        add_tid.memory_info[0].resource = 0;
+        add_tid.stage = ShaderType::TessellationControl;
         ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
       },
-      "graphics buffer ADD_TID did not terminate requirements analysis");
+      "hull shader buffer ADD_TID did not terminate requirements analysis");
 #endif
 
   Program empty;
@@ -1920,13 +1921,12 @@ void TestNativeStoreCompletion() {
   Check(source.find("OpControlBarrier") == std::string::npos &&
             source.find("OpMemoryBarrier") == std::string::npos,
         "other wait counters or VSCNT 63 became a store completion barrier");
-#ifndef _WIN32
+  // A partial or register-based count waits for all stores: waiting longer is always correct.
   for (const uint32_t word : {EncodeSopk(0x17, 125, 1), register_wait[0]}) {
-    const std::array unsupported = {word, EncodeSopp(0x01)};
-    ExpectFatal([&] { (void)RecompileForTest(unsupported, options); },
-                "unsupported partial or register-based store wait was dropped");
+    const std::array partial = {word, EncodeSopp(0x01)};
+    Check(RecompileForTest(partial, options).ir_dump.find("StoreCompletion") != std::string::npos,
+          "partial or register-based store wait lost its store completion");
   }
-#endif
 }
 
 void TestSopkCompareImmediateExtension() {
@@ -8335,7 +8335,6 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
@@ -8350,14 +8349,25 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
       0xbf810000u,
   };
 
+  std::array<uint32_t, 64> user_data{};
+  for (const uint32_t base : {8u, 48u}) {
+    user_data[base] = base == 8u ? 0x1000u : 0x2000u;
+    user_data[base + 2] = 64u;
+    user_data[base + 3] = 0x30005204u;
+  }
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying scalar-buffer descriptor did not terminate "
-              "compilation");
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.program.info.uses_dma && !result.program.dispatcher_fallback &&
+            SpirvContainsOpcode(result.spirv, 246),
+        "self-modifying scalar descriptor lost its structured GPU loop");
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].written &&
+            result.resources.flattened_srt.empty(),
+        "self-modifying scalar descriptor was flattened or bound on the host");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
+void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
       EncodeMubuf0(0x0c),
@@ -8370,13 +8380,15 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
       0xbf810000u,
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying vector-buffer descriptor did not terminate "
-              "compilation");
+  const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(result.program.info.uses_dma && !result.program.dispatcher_fallback &&
+            SpirvContainsOpcode(result.spirv, 246),
+        "loop-carried vector descriptor lost its structured GPU loop");
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].written &&
+            result.resources.flattened_srt.empty(),
+        "loop-carried vector descriptor was evaluated on the host");
+  CheckSpirvBinaryValidates(result.spirv);
 }
-#endif
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
@@ -10192,6 +10204,16 @@ void TestCapturedBufferAtomicsX2() {
           "GLC=1 64-bit MUBUF atomic did not return both dwords");
     CheckSpirvBinaryValidates(glc_result.spirv);
   }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const std::array shader = {cases[0].words[0], cases[0].words[1], EncodeSopp(0x01)};
+  ExpectFatal(
+      [&] {
+        ShaderRecompiler::SetHostBufferInt64Atomics(false);
+        (void)RecompileForTest(shader, options);
+      },
+      "64-bit buffer atomic did not stop without shaderBufferInt64Atomics");
+#endif
 }
 
 // A wave reduction as compilers write it for RDNA (from Senaxx's wolverine branch): with every
@@ -16001,13 +16023,8 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgIdenticalBranchTargets();
   TestNewShaderRecompilerCfgLoopBreakContinue();
-  // Upstream b4d32394b/ec3e48cdd made these two loop-carried descriptor cases structured GPU loops
-  // (TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured); our resource tracker still rejects
-  // them, as before this merge.
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
-#endif
+  TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
