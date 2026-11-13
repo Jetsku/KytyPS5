@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/mtRecord.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/watchdogSubmit.h"
 #include "kernel/memory.h"
@@ -23,6 +24,8 @@
 #include <thread>
 #include <unordered_map>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -414,7 +417,17 @@ struct CommandRecorder::NativeExecutor {
 	}
 
 	// ---- vk::CommandBuffer forwarding ----
-	void beginRendering(const vk::RenderingInfo& info) { command.beginRendering(info); }
+	// KYTY_MT_RECORD: added to the pass flags (secondary command buffer contents).
+	vk::RenderingFlags extra_rendering_flags {};
+	void beginRendering(const vk::RenderingInfo& info) {
+		if (extra_rendering_flags) {
+			auto copy  = info;
+			copy.flags |= extra_rendering_flags;
+			command.beginRendering(copy);
+			return;
+		}
+		command.beginRendering(info);
+	}
 	void endRendering() { command.endRendering(); }
 	void pipelineBarrier2(const vk::DependencyInfo& info) { command.pipelineBarrier2(info); }
 	void pipelineBarrier(vk::PipelineStageFlags src, vk::PipelineStageFlags dst,
@@ -597,6 +610,814 @@ struct CommandRecorder::NativeExecutor {
 
 // ------------------------------------------------------------------------------------------------
 
+// ------------------------------------------------------------------------------------------------
+// KYTY_MT_RECORD (mtRecord.h): render passes recorded into secondary command buffers in parallel.
+
+namespace {
+
+using CommandStream::Header;
+
+constexpr uint32_t MtMaxSets   = 8;
+constexpr uint32_t MtMaxVb     = 32;
+constexpr uint32_t MtMaxPc     = 16;
+constexpr uint32_t MtMaxColors = 8;
+constexpr uint32_t MtNoKey     = UINT32_MAX;
+constexpr uint32_t MtDynCount  = static_cast<uint32_t>(Op::SetAttachmentFeedbackLoopEnable) -
+                                static_cast<uint32_t>(Op::SetViewportWithCount) + 1u;
+enum : uint32_t {
+	MtKeyGfxPipeline = 0,
+	MtKeyCsPipeline  = 1,
+	MtKeyGfxSets     = 2,
+	MtKeyCsSets      = MtKeyGfxSets + MtMaxSets,
+	MtKeyGfxPush     = MtKeyCsSets + MtMaxSets,
+	MtKeyCsPush      = MtKeyGfxPush + MtMaxSets,
+	MtKeyVb          = MtKeyCsPush + MtMaxSets,
+	MtKeyIndex       = MtKeyVb + MtMaxVb,
+	MtKeyDyn         = MtKeyIndex + 1,
+	MtKeyStencil     = MtKeyDyn + MtDynCount, // 4 face-keyed stencil commands x 3 face masks
+	MtKeyPc          = MtKeyStencil + 12,
+	MtKeyCount       = MtKeyPc + MtMaxPc,
+};
+
+bool MtComputeKey(uint32_t key) {
+	return key == MtKeyCsPipeline || (key >= MtKeyCsSets && key < MtKeyCsSets + MtMaxSets) ||
+	       (key >= MtKeyCsPush && key < MtKeyCsPush + MtMaxSets);
+}
+
+enum class MtReason : uint32_t { Small, Incomplete, Op, Drain, Query, View, Flags, Large, State, Count };
+constexpr const char* MtReasonNames[] = {"small", "incomplete", "op",    "drain", "query",
+                                         "view",  "flags",      "large", "state"};
+static_assert(std::size(MtReasonNames) == static_cast<size_t>(MtReason::Count));
+
+bool MtIsDraw(Op op) {
+	switch (op) {
+		case Op::Draw:
+		case Op::DrawIndexed:
+		case Op::DrawMeshTasks:
+		case Op::DrawMeshTasksIndirect:
+		case Op::DrawMeshTasksIndirectCount:
+		case Op::DrawIndirect:
+		case Op::DrawIndexedIndirect:
+		case Op::DrawIndirectCount:
+		case Op::DrawIndexedIndirectCount: return true;
+		default: return false;
+	}
+}
+
+bool MtIsDynamic(Op op) {
+	return static_cast<uint32_t>(op) >= static_cast<uint32_t>(Op::SetViewportWithCount) &&
+	       static_cast<uint32_t>(op) <= static_cast<uint32_t>(Op::SetAttachmentFeedbackLoopEnable);
+}
+
+template <typename T>
+const T& MtGet(const Header* header) {
+	const CommandStream::SiteBlock*   site   = nullptr;
+	const CommandStream::VerifyBlock* verify = nullptr;
+	const auto offset = CommandStream::Detail::PayloadOffset(*header, &site, &verify);
+	return *reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(header) + offset);
+}
+
+// The latest packet per state key since the primary's Begin. Replaying the kept packets in their
+// original order reproduces the state the full sequence leaves behind.
+struct MtTracker {
+	struct Entry {
+		uint64_t             seq     = 0;
+		const Header*        ptr     = nullptr;
+		bool                 in_ring = false; // points into the ring (segment being recorded)
+		std::vector<uint8_t> owned;
+	};
+	struct PcKey {
+		uint32_t stages = 0;
+		uint32_t offset = 0;
+		uint32_t size   = 0;
+	};
+	std::array<Entry, MtKeyCount> entries;
+	std::array<PcKey, MtMaxPc>    pc_keys {};
+	uint32_t                      pc_count       = 0;
+	uint64_t                      seq            = 0;
+	uint64_t                      tick           = 0;
+	uint32_t                      active_queries = 0;
+	bool                          unknown        = false;
+	std::vector<std::pair<uint64_t, const Header*>> scratch;
+
+	void Reset() {
+		for (auto& e: entries) {
+			e.seq     = 0;
+			e.ptr     = nullptr;
+			e.in_ring = false;
+		}
+		pc_count       = 0;
+		active_queries = 0;
+		unknown        = false;
+	}
+
+	uint32_t BindKey(vk::PipelineBindPoint point, uint32_t index, uint32_t gfx, uint32_t cs,
+	                 uint32_t limit) {
+		if (index >= limit) {
+			unknown = true;
+			return MtNoKey;
+		}
+		if (point == vk::PipelineBindPoint::eGraphics) {
+			return gfx + index;
+		}
+		if (point == vk::PipelineBindPoint::eCompute) {
+			return cs + index;
+		}
+		unknown = true;
+		return MtNoKey;
+	}
+
+	uint32_t StencilKey(uint32_t command, vk::StencilFaceFlags faces) {
+		const auto f = static_cast<uint32_t>(static_cast<VkStencilFaceFlags>(faces));
+		if (f < 1u || f > 3u) {
+			unknown = true;
+			return MtNoKey;
+		}
+		return MtKeyStencil + command * 3u + (f - 1u);
+	}
+
+	uint32_t Key(const Header* h) {
+		switch (h->op) {
+			case Op::BindPipeline: {
+				const auto& p = MtGet<CommandStream::BindPipelinePacket>(h);
+				return BindKey(p.point, 0, MtKeyGfxPipeline, MtKeyCsPipeline, 1);
+			}
+			case Op::BindDescriptorSets: {
+				const auto& p = MtGet<CommandStream::BindDescriptorSetsPacket>(h);
+				return BindKey(p.point, p.first_set, MtKeyGfxSets, MtKeyCsSets, MtMaxSets);
+			}
+			case Op::PushDescriptorSet: {
+				const auto& p = MtGet<CommandStream::PushDescriptorSetPacket>(h);
+				return BindKey(p.point, p.set, MtKeyGfxPush, MtKeyCsPush, MtMaxSets);
+			}
+			case Op::BindVertexBuffers2: {
+				const auto& p = MtGet<CommandStream::BindVertexBuffers2Packet>(h);
+				if (p.first >= MtMaxVb) {
+					unknown = true;
+					return MtNoKey;
+				}
+				return MtKeyVb + p.first;
+			}
+			case Op::BindIndexBuffer: return MtKeyIndex;
+			case Op::SetStencilOp:
+				return StencilKey(0, MtGet<CommandStream::StencilOpPacket>(h).faces);
+			case Op::SetStencilCompareMask:
+				return StencilKey(1, MtGet<CommandStream::StencilValuePacket>(h).faces);
+			case Op::SetStencilWriteMask:
+				return StencilKey(2, MtGet<CommandStream::StencilValuePacket>(h).faces);
+			case Op::SetStencilReference:
+				return StencilKey(3, MtGet<CommandStream::StencilValuePacket>(h).faces);
+			case Op::PushConstants: {
+				const auto& p      = MtGet<CommandStream::PushConstantsPacket>(h);
+				const auto  stages = static_cast<uint32_t>(static_cast<VkShaderStageFlags>(p.stages));
+				for (uint32_t i = 0; i < pc_count; i++) {
+					if (pc_keys[i].stages == stages && pc_keys[i].offset == p.offset &&
+					    pc_keys[i].size == p.size) {
+						return MtKeyPc + i;
+					}
+				}
+				if (pc_count == MtMaxPc) {
+					unknown = true;
+					return MtNoKey;
+				}
+				pc_keys[pc_count] = {stages, p.offset, p.size};
+				return MtKeyPc + pc_count++;
+			}
+			default:
+				if (MtIsDynamic(h->op)) {
+					return MtKeyDyn + (static_cast<uint32_t>(h->op) -
+					                   static_cast<uint32_t>(Op::SetViewportWithCount));
+				}
+				return MtNoKey;
+		}
+	}
+
+	void Track(const Header* h, bool in_ring) {
+		switch (h->op) {
+			case Op::Begin:
+				Reset();
+				tick = MtGet<CommandStream::BeginPacket>(h).tick;
+				return;
+			case Op::BeginQuery: active_queries++; return;
+			case Op::EndQuery:
+				if (active_queries != 0) {
+					active_queries--;
+				}
+				return;
+			default: break;
+		}
+		const auto key = Key(h);
+		if (key == MtNoKey) {
+			return;
+		}
+		auto& e = entries[key];
+		e.seq   = ++seq;
+		if (in_ring) {
+			e.ptr     = h;
+			e.in_ring = true;
+		} else {
+			const auto* bytes = reinterpret_cast<const uint8_t*>(h);
+			e.owned.assign(bytes, bytes + h->size);
+			e.ptr     = reinterpret_cast<const Header*>(e.owned.data());
+			e.in_ring = false;
+		}
+	}
+
+	// Copies the entries that point into the ring (before the ring region is released).
+	void Materialize() {
+		for (auto& e: entries) {
+			if (e.in_ring && e.ptr != nullptr) {
+				const auto* bytes = reinterpret_cast<const uint8_t*>(e.ptr);
+				e.owned.assign(bytes, bytes + e.ptr->size);
+				e.ptr     = reinterpret_cast<const Header*>(e.owned.data());
+				e.in_ring = false;
+			}
+		}
+	}
+
+	void Snapshot(std::vector<const Header*>& out, bool graphics_only) {
+		scratch.clear();
+		for (uint32_t key = 0; key < MtKeyCount; key++) {
+			const auto& e = entries[key];
+			if (e.ptr != nullptr && !(graphics_only && MtComputeKey(key))) {
+				scratch.emplace_back(e.seq, e.ptr);
+			}
+		}
+		std::sort(scratch.begin(), scratch.end(),
+		          [](const auto& a, const auto& b) { return a.first < b.first; });
+		out.clear();
+		for (const auto& [s, p]: scratch) {
+			out.push_back(p);
+		}
+	}
+};
+
+struct MtChunk {
+	std::vector<const Header*> prefix;
+	std::vector<const Header*> packets;
+	uint32_t                   draws = 0;
+	uint64_t                   tick  = 0;
+	vk::CommandBuffer          command = nullptr;
+	bool                       pushed  = false; // handed to the workers
+	std::atomic<bool>          done {false};
+};
+
+uint64_t MtEnvUs(const char* name, uint64_t default_value) {
+	const auto* value = std::getenv(name);
+	return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : default_value;
+}
+
+void MtPause() {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_pause();
+#endif
+}
+
+} // namespace
+
+struct CommandRecorder::MtState {
+	struct Slot {
+		vk::CommandPool                                     pool = nullptr;
+		std::vector<vk::CommandBuffer>                      free;
+		std::deque<std::pair<uint64_t, vk::CommandBuffer>> pending;
+		std::unique_ptr<NativeExecutor>                     exec;
+		CommandStream::ReplayState                          replay;
+	};
+
+	explicit MtState(CommandRecorder& owner): owner(owner) {
+		chunk_draws = static_cast<uint32_t>(std::clamp<uint64_t>(MtEnvUs("KYTY_MT_RECORD_CHUNK", 48), 4, 4096));
+		min_draws   = static_cast<uint32_t>(std::clamp<uint64_t>(MtEnvUs("KYTY_MT_RECORD_MIN_DRAWS", 16), 1, 1u << 20u));
+		wait_ns     = MtEnvUs("KYTY_MT_RECORD_WAIT_US", 4000) * 1000u;
+		spin_ns     = MtEnvUs("KYTY_MT_RECORD_SPIN_US", 300) * 1000u;
+		const auto workers = MtRecord::Threads();
+		slots.resize(workers + 1u); // the last slot is the recorder thread's
+		for (auto& slot: slots) {
+			vk::CommandPoolCreateInfo info {};
+			info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer |
+			             vk::CommandPoolCreateFlagBits::eTransient;
+			info.queueFamilyIndex = owner.m_graphics.queue_family;
+			EXIT_NOT_IMPLEMENTED(owner.m_graphics.device.createCommandPool(&info, nullptr, &slot.pool) !=
+			                     vk::Result::eSuccess);
+			slot.exec = std::make_unique<NativeExecutor>(owner);
+		}
+		for (uint32_t i = 0; i < workers; i++) {
+			threads.emplace_back([this, i] { WorkerRun(i); });
+		}
+		last_print_ns = MtRecord::NowNs();
+		std::printf("Kyty MtRecord: enabled, %u worker threads, chunk %u draws, min %u draws, wait %" PRIu64
+		            " us\n",
+		            workers, chunk_draws, min_draws, wait_ns / 1000u);
+		std::fflush(stdout);
+	}
+
+	~MtState() { StopWorkers(); }
+
+	void StopWorkers() {
+		{
+			std::lock_guard lock(queue_mutex);
+			stop.store(true, std::memory_order_release);
+		}
+		queue_cv.notify_all();
+		for (auto& t: threads) {
+			if (t.joinable()) {
+				t.join();
+			}
+		}
+		threads.clear();
+		// The command pools are left alive: the GPU may still execute their buffers.
+	}
+
+	void Push(MtChunk* chunk) {
+		chunk->pushed = true;
+		{
+			std::lock_guard lock(queue_mutex);
+			queue.push_back(chunk);
+			queued.fetch_add(1, std::memory_order_release);
+		}
+		queue_cv.notify_one();
+	}
+
+	MtChunk* TryPop() {
+		if (queued.load(std::memory_order_acquire) == 0) {
+			return nullptr;
+		}
+		std::lock_guard lock(queue_mutex);
+		if (queue.empty()) {
+			return nullptr;
+		}
+		auto* chunk = queue.front();
+		queue.pop_front();
+		queued.fetch_sub(1, std::memory_order_release);
+		return chunk;
+	}
+
+	void WorkerRun(uint32_t index) {
+		Common::PlaceCurrentThread(Common::ThreadRole::Host);
+		Common::RaiseCurrentThreadPriority();
+		for (;;) {
+			if (auto* chunk = TryPop()) {
+				Record(index, *chunk);
+				continue;
+			}
+			const auto start = MtRecord::NowNs();
+			bool       found = false;
+			while (MtRecord::NowNs() - start < spin_ns) {
+				if (queued.load(std::memory_order_acquire) != 0 ||
+				    stop.load(std::memory_order_acquire)) {
+					found = true;
+					break;
+				}
+				for (int i = 0; i < 32; i++) {
+					MtPause();
+				}
+			}
+			if (found) {
+				std::lock_guard lock(queue_mutex);
+				if (stop && queue.empty()) {
+					return;
+				}
+				continue;
+			}
+			std::unique_lock lock(queue_mutex);
+			queue_cv.wait(lock, [this] { return stop || !queue.empty(); });
+			if (stop && queue.empty()) {
+				return;
+			}
+		}
+	}
+
+	// Records one chunk into a secondary command buffer of slot `index` (one thread per slot).
+	void Record(uint32_t index, MtChunk& chunk) {
+		auto&      slot  = slots[index];
+		const auto known = owner.m_master.KnownGpuTick();
+		while (!slot.pending.empty() && slot.pending.front().first <= known) {
+			slot.free.push_back(slot.pending.front().second);
+			slot.pending.pop_front();
+		}
+		if (slot.free.empty()) {
+			std::array<vk::CommandBuffer, 16> buffers {};
+			vk::CommandBufferAllocateInfo     allocate {};
+			allocate.commandPool        = slot.pool;
+			allocate.level              = vk::CommandBufferLevel::eSecondary;
+			allocate.commandBufferCount = static_cast<uint32_t>(buffers.size());
+			EXIT_NOT_IMPLEMENTED(owner.m_graphics.device.allocateCommandBuffers(&allocate, buffers.data()) !=
+			                     vk::Result::eSuccess);
+			slot.free.insert(slot.free.end(), buffers.begin(), buffers.end());
+		}
+		const auto command = slot.free.back();
+		slot.free.pop_back();
+
+		vk::CommandBufferInheritanceRenderingInfo rendering {};
+		rendering.flags                   = pass_flags;
+		rendering.viewMask                = view_mask;
+		rendering.colorAttachmentCount    = color_count;
+		rendering.pColorAttachmentFormats = color_formats.data();
+		rendering.depthAttachmentFormat   = depth_format;
+		rendering.stencilAttachmentFormat = stencil_format;
+		rendering.rasterizationSamples    = samples;
+		vk::CommandBufferInheritanceInfo inheritance {};
+		inheritance.pNext = &rendering;
+		vk::CommandBufferBeginInfo begin {};
+		begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit |
+		              vk::CommandBufferUsageFlagBits::eRenderPassContinue;
+		begin.pInheritanceInfo = &inheritance;
+		EXIT_NOT_IMPLEMENTED(command.begin(&begin) != vk::Result::eSuccess);
+		slot.exec->command = command;
+		for (const auto* h: chunk.prefix) {
+			CommandStream::Replay(*h, *slot.exec, slot.replay, nullptr, nullptr);
+		}
+		for (const auto* h: chunk.packets) {
+			CommandStream::Replay(*h, *slot.exec, slot.replay, nullptr, nullptr);
+		}
+		slot.exec->command = nullptr;
+		EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
+		slot.pending.emplace_back(chunk.tick, command);
+		chunk.command = command;
+		chunk.done.store(true, std::memory_order_release);
+	}
+
+	MtChunk* NewChunk() {
+		if (chunks_used == chunk_pool.size()) {
+			chunk_pool.push_back(std::make_unique<MtChunk>());
+		}
+		auto* chunk = chunk_pool[chunks_used++].get();
+		chunk->prefix.clear();
+		chunk->packets.clear();
+		chunk->draws   = 0;
+		chunk->tick    = tracker.tick;
+		chunk->command = nullptr;
+		chunk->pushed  = false;
+		chunk->done.store(false, std::memory_order_relaxed);
+		return chunk;
+	}
+
+	// Recorder thread: waits for every dispatched chunk, recording queued ones itself meanwhile.
+	void WaitChunks() {
+		for (size_t i = 0; i < chunks_used; i++) {
+			auto& chunk = *chunk_pool[i];
+			if (chunk.pushed) {
+				while (!chunk.done.load(std::memory_order_acquire)) {
+					if (auto* other = TryPop()) {
+						Record(static_cast<uint32_t>(slots.size() - 1u), *other);
+					} else {
+						MtPause();
+					}
+				}
+			}
+		}
+	}
+
+	CommandRecorder&                       owner;
+	std::vector<Slot>                      slots;
+	std::vector<std::thread>               threads;
+	std::mutex                             queue_mutex;
+	std::condition_variable                queue_cv;
+	std::deque<MtChunk*>                   queue;
+	std::atomic<uint32_t>                  queued {0};
+	std::atomic<bool>                      stop {false};
+	std::vector<std::unique_ptr<MtChunk>> chunk_pool;
+	size_t                                 chunks_used = 0;
+	MtTracker                              tracker;
+	std::vector<const Header*>             emit;
+
+	// Inheritance of the current segment (immutable while its chunks are recorded).
+	vk::RenderingFlags                     pass_flags {};
+	uint32_t                               view_mask   = 0;
+	uint32_t                               color_count = 0;
+	std::array<vk::Format, MtMaxColors>    color_formats {};
+	vk::Format                             depth_format   = vk::Format::eUndefined;
+	vk::Format                             stencil_format = vk::Format::eUndefined;
+	vk::SampleCountFlagBits                samples        = vk::SampleCountFlagBits::e1;
+
+	// UpdateDescriptorSets / HostCopy packets executed during the look-ahead of an abandoned
+	// segment: skipped by the serial replay (ring positions, ascending).
+	std::vector<uint64_t> executed;
+	size_t                executed_next = 0;
+
+	uint32_t chunk_draws = 48;
+	uint32_t min_draws   = 16;
+	uint64_t wait_ns     = 0;
+	uint64_t spin_ns     = 0;
+
+	// Stats (recorder thread).
+	uint64_t                                               segments      = 0;
+	uint64_t                                               chunks        = 0;
+	uint64_t                                               draws_off     = 0;
+	uint64_t                                               draws_serial  = 0;
+	uint64_t                                               abandoned     = 0; // after chunks ran
+	uint64_t                                               lookahead_wait_ns = 0;
+	std::array<uint64_t, static_cast<size_t>(MtReason::Count)> fallbacks {};
+	std::array<uint64_t, static_cast<size_t>(Op::Count)>    fallback_ops {};
+	uint64_t                                               last_print_ns = 0;
+	uint64_t                                               last_busy_ns  = 0;
+	uint64_t                                               last_cp_ns    = 0;
+	uint64_t                                               last_cp_draws = 0;
+};
+
+bool CommandRecorder::MtTrySegment(const Header* begin) {
+	auto&      mt   = *m_mt;
+	const auto fail = [&mt](MtReason reason) {
+		mt.fallbacks[static_cast<size_t>(reason)]++;
+		return false;
+	};
+	if (mt.tracker.unknown) {
+		return fail(MtReason::State);
+	}
+	if (mt.tracker.active_queries != 0) {
+		return fail(MtReason::Query);
+	}
+	if ((begin->flags & CommandStream::FlagVerify) != 0) {
+		return fail(MtReason::Op);
+	}
+	// Inheritance: flags, formats and the sample count of the attachments.
+	{
+		const CommandStream::SiteBlock*   site   = nullptr;
+		const CommandStream::VerifyBlock* verify = nullptr;
+		CommandStream::Reader reader(begin, CommandStream::Detail::PayloadOffset(*begin, &site, &verify));
+		const auto& p      = reader.Get<CommandStream::BeginRenderingPacket>();
+		const auto* colors = reader.GetArray<vk::RenderingAttachmentInfo>(p.colors);
+		const vk::RenderingAttachmentInfo* depth =
+		    p.has_depth != 0 ? &reader.Get<vk::RenderingAttachmentInfo>() : nullptr;
+		const vk::RenderingAttachmentInfo* stencil =
+		    p.has_stencil != 0 ? &reader.Get<vk::RenderingAttachmentInfo>() : nullptr;
+		if (p.flags & (vk::RenderingFlagBits::eSuspending | vk::RenderingFlagBits::eResuming |
+		               vk::RenderingFlagBits::eContentsSecondaryCommandBuffers)) {
+			return fail(MtReason::Flags);
+		}
+		if (p.colors > MtMaxColors) {
+			return fail(MtReason::View);
+		}
+		bool have_samples = false;
+		bool ok           = true;
+		const auto lookup = [&](vk::ImageView view, vk::Format* format) {
+			*format = vk::Format::eUndefined;
+			if (!view) {
+				return;
+			}
+			MtRecord::ViewInfo info;
+			if (!MtRecord::LookupView(view, &info)) {
+				ok = false;
+				return;
+			}
+			if (have_samples && info.samples != mt.samples) {
+				ok = false;
+			}
+			have_samples = true;
+			mt.samples   = info.samples;
+			*format      = info.format;
+		};
+		for (uint32_t i = 0; i < p.colors; i++) {
+			lookup(colors[i].imageView, &mt.color_formats[i]);
+		}
+		lookup(depth != nullptr ? depth->imageView : vk::ImageView {}, &mt.depth_format);
+		lookup(stencil != nullptr ? stencil->imageView : vk::ImageView {}, &mt.stencil_format);
+		if (!ok || !have_samples) {
+			return fail(MtReason::View);
+		}
+		mt.pass_flags  = p.flags;
+		mt.view_mask   = p.view_mask;
+		mt.color_count = p.colors;
+	}
+
+	// Look-ahead to the EndRendering: chunks are dispatched to the workers as they fill up, while
+	// the CP still encodes the rest of the pass.
+	const uint64_t start_pos  = m_ring.ReadPosition();
+	uint64_t       pos        = start_pos + begin->size;
+	const Header*  end        = nullptr;
+	uint64_t       end_pos    = 0;
+	uint32_t       draws      = 0;
+	uint64_t       idle_since = 0;
+	uint64_t       wait_start = 0;
+	bool           dispatched = false;
+	const size_t   executed_mark = mt.executed.size();
+	MtReason       reason        = MtReason::Count;
+	Op             bad_op        = Op::Wrap;
+	mt.chunks_used               = 0;
+	MtChunk* chunk               = mt.NewChunk();
+	mt.tracker.Snapshot(chunk->prefix, true);
+	while (end == nullptr) {
+		const auto* h = m_ring.PeekAt(pos);
+		if (h == nullptr) {
+			if (m_stop.load(std::memory_order_acquire)) {
+				reason = MtReason::Incomplete;
+				break;
+			}
+			const auto now = MtRecord::NowNs();
+			if (idle_since == 0) {
+				idle_since = now;
+				wait_start = now;
+			} else if (now - idle_since >= mt.wait_ns) {
+				mt.lookahead_wait_ns += now - wait_start;
+				reason = MtReason::Incomplete;
+				break;
+			}
+			if (auto* other = mt.TryPop()) {
+				mt.Record(static_cast<uint32_t>(mt.slots.size() - 1u), *other);
+			} else {
+				for (int i = 0; i < 16; i++) {
+					MtPause();
+				}
+			}
+			continue;
+		}
+		if (idle_since != 0) {
+			mt.lookahead_wait_ns += MtRecord::NowNs() - wait_start;
+		}
+		idle_since = 0;
+		if (pos - start_pos > m_ring.Capacity() / 4u) {
+			reason = MtReason::Large;
+			break;
+		}
+		const auto op = h->op;
+		if (op == Op::Wrap) {
+			pos += h->size;
+			continue;
+		}
+		if ((h->flags & CommandStream::FlagVerify) != 0) {
+			reason = MtReason::Op;
+			bad_op = op;
+			break;
+		}
+		if (op == Op::EndRendering) {
+			end     = h;
+			end_pos = pos + h->size;
+			break;
+		}
+		if (op == Op::DrainMarker) {
+			reason = MtReason::Drain;
+			break;
+		}
+		if (op == Op::UpdateDescriptorSets || op == Op::HostCopy) {
+			// Device-side work in stream order, before any later command that binds the set is
+			// recorded (by a worker). Executed now; skipped by a serial replay if abandoned.
+			CommandStream::Replay(*h, *m_exec, m_replay, nullptr, nullptr);
+			mt.executed.push_back(pos);
+			pos += h->size;
+			continue;
+		}
+		if (MtIsDraw(op)) {
+			chunk->packets.push_back(h);
+			chunk->draws++;
+			draws++;
+			if (chunk->draws >= mt.chunk_draws) {
+				mt.Push(chunk);
+				dispatched = true;
+				chunk      = mt.NewChunk();
+				mt.tracker.Snapshot(chunk->prefix, true);
+			}
+		} else if (op == Op::BindPipeline || op == Op::BindDescriptorSets ||
+		           op == Op::PushDescriptorSet || op == Op::PushConstants ||
+		           op == Op::BindVertexBuffers2 || op == Op::BindIndexBuffer || MtIsDynamic(op)) {
+			if ((op == Op::BindPipeline &&
+			     MtGet<CommandStream::BindPipelinePacket>(h).point != vk::PipelineBindPoint::eGraphics) ||
+			    (op == Op::BindDescriptorSets &&
+			     MtGet<CommandStream::BindDescriptorSetsPacket>(h).point != vk::PipelineBindPoint::eGraphics) ||
+			    (op == Op::PushDescriptorSet &&
+			     MtGet<CommandStream::PushDescriptorSetPacket>(h).point != vk::PipelineBindPoint::eGraphics)) {
+				reason = MtReason::Op;
+				bad_op = op;
+				break;
+			}
+			chunk->packets.push_back(h);
+			mt.tracker.Track(h, true);
+			if (mt.tracker.unknown) {
+				reason = MtReason::State;
+				break;
+			}
+		} else {
+			reason = MtReason::Op;
+			bad_op = op;
+			break;
+		}
+		pos += h->size;
+	}
+	if (end != nullptr && !dispatched && draws < mt.min_draws) {
+		reason = MtReason::Small;
+	}
+
+	if (reason != MtReason::Count) {
+		// Abandoned: finish what the workers started (their buffers are recycled with the tick),
+		// then replay the pass serially. The tracker's in-ring entries are all packets of this
+		// pass: the serial replay tracks them again (owned copies) in the same order.
+		if (dispatched) {
+			mt.WaitChunks();
+			mt.abandoned++;
+		}
+		mt.chunks_used = 0;
+		mt.fallbacks[static_cast<size_t>(reason)]++;
+		if (reason == MtReason::Op) {
+			mt.fallback_ops[static_cast<size_t>(bad_op)]++;
+		}
+		if (mt.tracker.unknown) {
+			// Track() set it on a packet of this pass; the serial replay sets it again.
+			mt.tracker.unknown = false;
+		}
+		return false;
+	}
+
+	if (!chunk->packets.empty()) {
+		mt.Push(chunk);
+	}
+	// Packets executed ahead belong to this segment: no serial replay will see them.
+	mt.executed.resize(executed_mark);
+
+	// Primary: BeginRendering (secondary contents), the chunks in order, EndRendering.
+	m_exec->extra_rendering_flags = vk::RenderingFlagBits::eContentsSecondaryCommandBuffers;
+	CommandStream::Replay(*begin, *m_exec, m_replay, nullptr, nullptr);
+	m_exec->extra_rendering_flags = {};
+	mt.WaitChunks();
+	static thread_local std::vector<vk::CommandBuffer> buffers;
+	buffers.clear();
+	for (size_t i = 0; i < mt.chunks_used; i++) {
+		const auto& c = *mt.chunk_pool[i];
+		if (c.command) {
+			buffers.push_back(c.command);
+			mt.draws_off += c.draws;
+		}
+	}
+	if (!buffers.empty()) {
+		m_exec->command.executeCommands(static_cast<uint32_t>(buffers.size()), buffers.data());
+	}
+	CommandStream::Replay(*end, *m_exec, m_replay, nullptr, nullptr);
+	// The primary's state is undefined after vkCmdExecuteCommands: re-emit every tracked state
+	// (graphics and compute) so the serial commands that follow see what they expect.
+	mt.tracker.Snapshot(mt.emit, false);
+	for (const auto* h: mt.emit) {
+		CommandStream::Replay(*h, *m_exec, m_replay, nullptr, nullptr);
+	}
+	mt.tracker.Materialize();
+	mt.segments++;
+	mt.chunks += buffers.size();
+	mt.chunks_used = 0;
+	m_ring.Advance(static_cast<uint32_t>(end_pos - start_pos));
+	m_ring.Release(m_consumer_stats);
+	return true;
+}
+
+void CommandRecorder::MtMaybePrintStats() {
+	auto&      mt  = *m_mt;
+	const auto now = MtRecord::NowNs();
+	if (now - mt.last_print_ns < 5'000'000'000ull) {
+		return;
+	}
+	const double seconds = static_cast<double>(now - mt.last_print_ns) / 1e9;
+	mt.last_print_ns     = now;
+	const auto busy      = m_busy_ns.load(std::memory_order_acquire);
+	const auto cp_ns     = MtRecord::g_cp_draw_ns.load(std::memory_order_relaxed);
+	const auto cp_draws  = MtRecord::g_cp_draws.load(std::memory_order_relaxed);
+	const auto d_busy    = busy - mt.last_busy_ns;
+	const auto d_cp_ns   = cp_ns - mt.last_cp_ns;
+	const auto d_cp      = cp_draws - mt.last_cp_draws;
+	mt.last_busy_ns      = busy;
+	mt.last_cp_ns        = cp_ns;
+	mt.last_cp_draws     = cp_draws;
+	const auto draws     = mt.draws_off + mt.draws_serial;
+	// Top three ops that made a pass fall back.
+	std::array<size_t, 3> top {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+	for (size_t i = 0; i < mt.fallback_ops.size(); i++) {
+		if (mt.fallback_ops[i] == 0) {
+			continue;
+		}
+		for (size_t t = 0; t < top.size(); t++) {
+			if (top[t] == SIZE_MAX || mt.fallback_ops[i] > mt.fallback_ops[top[t]]) {
+				for (size_t m = top.size() - 1; m > t; m--) {
+					top[m] = top[m - 1];
+				}
+				top[t] = i;
+				break;
+			}
+		}
+	}
+	std::string ops;
+	for (const auto i: top) {
+		if (i != SIZE_MAX) {
+			char item[64];
+			std::snprintf(item, sizeof(item), "%s%s=%" PRIu64, ops.empty() ? "" : ",",
+			              CommandStream::OpName(static_cast<Op>(i)), mt.fallback_ops[i]);
+			ops += item;
+		}
+	}
+	std::string reasons;
+	for (size_t i = 0; i < mt.fallbacks.size(); i++) {
+		char item[48];
+		std::snprintf(item, sizeof(item), " %s=%" PRIu64, MtReasonNames[i], mt.fallbacks[i]);
+		reasons += item;
+	}
+	std::printf("MtRecord: %.1fs segments=%" PRIu64 " chunks=%" PRIu64 " draws_off=%" PRIu64
+	            " draws_serial=%" PRIu64 " (%.1f%% off) abandoned=%" PRIu64 " fallbacks:%s [ops %s] lookahead_wait=%.1fms"
+	            " | recorder busy %.2f us/draw | CP %.2f us/draw (%" PRIu64 " draws)\n",
+	            seconds, mt.segments, mt.chunks, mt.draws_off, mt.draws_serial,
+	            draws != 0 ? 100.0 * static_cast<double>(mt.draws_off) / static_cast<double>(draws) : 0.0,
+	            mt.abandoned, reasons.c_str(), ops.empty() ? "-" : ops.c_str(),
+	            static_cast<double>(mt.lookahead_wait_ns) / 1e6,
+	            draws != 0 ? static_cast<double>(d_busy) / 1e3 / static_cast<double>(draws) : 0.0,
+	            d_cp != 0 ? static_cast<double>(d_cp_ns) / 1e3 / static_cast<double>(d_cp) : 0.0, d_cp);
+	std::fflush(stdout);
+	mt.segments = mt.chunks = mt.draws_off = mt.draws_serial = mt.abandoned = mt.lookahead_wait_ns = 0;
+	mt.fallbacks.fill(0);
+	mt.fallback_ops.fill(0);
+}
+
 namespace {
 CommandStream::Encoder::Options MakeOptions(CommandRecorder::Mode mode, void* self,
                                             void (*after_commit)(void*)) {
@@ -624,6 +1445,22 @@ CommandRecorder::CommandRecorder(GraphicContext& graphics, MasterSemaphore& mast
 	m_replay.verify        = VerifyEnabled();
 	m_exec                 = std::make_unique<NativeExecutor>(*this);
 	m_registry_slot        = VerifyEnabled() ? RegisterRecorder(this) : MaxRecorders;
+	if (MtRecord::Enabled()) {
+		const auto* guard = std::getenv("KYTY_CMD_GUARD");
+		const bool  guard_on = guard != nullptr && guard[0] != '\0' && std::strcmp(guard, "0") != 0;
+		const char* why = mode != Mode::Thread                ? "recorder not in thread mode"
+		                  : VerifyEnabled()                   ? "KYTY_CP_RECORDER_VERIFY"
+		                  : gpu_ops || GpuOpProfiler::Enabled() || GpuOpProfiler::CaptureEnabled()
+		                      ? "GPU op profiler"
+		                  : guard_on ? "KYTY_CMD_GUARD"
+		                             : nullptr;
+		if (why == nullptr) {
+			m_mt = std::make_unique<MtState>(*this);
+		} else {
+			std::printf("Kyty MtRecord: disabled (%s)\n", why);
+			std::fflush(stdout);
+		}
+	}
 	if (mode == Mode::Thread) {
 		m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
 	}
@@ -744,6 +1581,9 @@ void CommandRecorder::Stop() {
 			m_thread.join();
 		}
 	}
+	if (m_mt) {
+		m_mt->StopWorkers();
+	}
 	PublishCounters();
 	if (m_encoder.Packets() != 0) {
 		std::printf("Kyty CP recorder: %" PRIu64 " packets, %" PRIu64 " MiB, %" PRIu64
@@ -803,7 +1643,29 @@ void CommandRecorder::ConsumeAvailable() {
 	constexpr uint64_t ReleaseEvery = 64u << 10u;
 	uint64_t           since        = 0;
 	while (const auto* header = m_ring.Peek()) {
-		if (header->op != Op::Wrap) {
+		if (m_mt) {
+			if (header->op == Op::BeginRendering && MtTrySegment(header)) {
+				since = 0;
+				continue;
+			}
+			if (header->op != Op::Wrap) {
+				auto& mt = *m_mt;
+				if (mt.executed_next < mt.executed.size() &&
+				    mt.executed[mt.executed_next] == m_ring.ReadPosition()) {
+					// Executed during an abandoned look-ahead (MtTrySegment).
+					if (++mt.executed_next == mt.executed.size()) {
+						mt.executed.clear();
+						mt.executed_next = 0;
+					}
+				} else {
+					CommandStream::Replay(*header, *m_exec, m_replay, &OnMismatch, this);
+					mt.tracker.Track(header, false);
+					if (MtIsDraw(header->op)) {
+						mt.draws_serial++;
+					}
+				}
+			}
+		} else if (header->op != Op::Wrap) {
 			CommandStream::Replay(*header, *m_exec, m_replay, &OnMismatch, this);
 		}
 		m_ring.Advance(header->size);
@@ -814,6 +1676,9 @@ void CommandRecorder::ConsumeAvailable() {
 		}
 	}
 	m_ring.Release(m_consumer_stats);
+	if (m_mt) {
+		MtMaybePrintStats();
+	}
 	if (m_mode == Mode::Thread && (++m_placement_batches & 255u) == 0) {
 		SamplePlacement();
 	}
