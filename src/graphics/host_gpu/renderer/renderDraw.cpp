@@ -6130,8 +6130,14 @@ bool Bindless(const DrawRenderState& state) {
 	       std::ranges::any_of(state.vertex_info, [&](const auto& info) { return bindless_stage(info.stage); });
 }
 
-void NoteTaken() {
-	if (const auto n = g_counters.taken.fetch_add(1, std::memory_order_relaxed) + 1; (n & 0x1fffffu) == 0) {
+// KYTY_BK_LEAN: the commit thread is the counter's only writer; a plain add (no locked RMW per draw).
+void NoteTaken(bool plain) {
+	auto&      taken = g_counters.taken;
+	const auto n     = plain ? taken.load(std::memory_order_relaxed) + 1 : taken.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (plain) {
+		taken.store(n, std::memory_order_relaxed);
+	}
+	if ((n & 0x1fffffu) == 0) {
 		Print("kernel");
 	}
 }
@@ -6522,8 +6528,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
-	// Reused per thread (draws run on the GPU thread under the render mutex).
-	static thread_local std::vector<MeshDrawSegment> mesh_segments;
+	// Reused per thread (draws run on the GPU thread under the render mutex). KYTY_BK_LEAN: one
+	// function-local vector instead of the thread_local one (no TLS lookup per draw; one thread draws).
+	static thread_local std::vector<MeshDrawSegment> mesh_segments_tls;
+	static std::vector<MeshDrawSegment>              mesh_segments_one;
+	auto& mesh_segments = DrawPrep::BkLeanMode() != DrawPrep::Bookkeep::Mode::Off ? mesh_segments_one : mesh_segments_tls;
 	mesh_segments.clear();
 	// KYTY_NATIVE_INDIRECT_MESH: the counts are GPU data, converted into the dispatches right
 	// before the draw (meshIndirect.h); nothing below may read them.
@@ -7012,7 +7021,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::ImageAspectFlags feedback_aspects;
 	// KYTY_DRAW_PREP_BINDINGS statics: the plan's program flags and scissor union.
 	const bool plan_statics = plan_stages && plan->statics_valid;
-	RenderState rendering;
+	// KYTY_BK_LEAN (drawPrep/bookkeep.h): a continuation's rendering state is its record's, used by
+	// reference; any other draw's is built here (not constructed when unused).
+	std::optional<RenderState> rendering_own;
+	const RenderState*         rendering_ref = nullptr;
+	const auto                 lean_mode     = DrawPrep::BkLeanMode();
 	// KYTY_DRAW_RUN=verify: the continuation's skipped acquisition and transitions must be no-ops.
 	const bool run_verify_images   = m_run_verify && DrawRunImagesUnchanged(false);
 	const auto run_transitions     = m_run_verify ? Image::RecordedTransitions() : uint64_t {0};
@@ -7041,7 +7054,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// KYTY_DRAW_RUN continuation: the attachments were acquired, claimed and transitioned by the
 		// previous draw of the run, for the same targets, scissors and textures (no feedback), and
 		// are still in that state (DrawRunImagesUnchanged).
-		rendering              = m_run.rendering;
+		if (lean_mode == DrawPrep::Bookkeep::Mode::Off) {
+			rendering_own = m_run.rendering;
+		} else {
+			rendering_ref = &m_run.rendering;
+			if (lean_mode == DrawPrep::Bookkeep::Mode::Verify) {
+				rendering_own = m_run.rendering; // compared with the record after the draw
+			}
+			auto& bk = DrawPrep::BkCounters();
+			bk.Add(bk.lean_rendering);
+		}
 		m_depth_feedback.valid = false;
 	} else {
 		// KYTY_DRAW_RUN_ACQUIRE: the same targets and scissor union right after the recorded draw, in
@@ -7057,18 +7079,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			OwnedCounters::Add(DrawRun::GetTotals().acquire_reused, 1);
 		}
 		if (acquire_reuse && DrawRun::GetMode() == DrawRun::Mode::On) {
-			rendering              = m_run.rendering;
+			rendering_own          = m_run.rendering;
 			m_depth_feedback.valid = false;
 		} else {
 			const auto acquire_transitions =
 			    acquire_reuse || texdelta_compare ? Image::RecordedTransitions() : uint64_t {0};
-			rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+			rendering_own = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 			                                 state.depth_info, feedback_aspects, stages,
 			                                 bounded ? &written : nullptr);
 			if (acquire_reuse) {
 				// Verify mode: the acquisition a reuse skips must have been a repeat.
 				DrawRun::CountVerifyCheck();
-				if (!(rendering == m_run.rendering) || feedback_aspects) {
+				if (!(*rendering_own == m_run.rendering) || feedback_aspects) {
 					DrawRun::ReportMismatch("reused acquisition's rendering state");
 				}
 				if (Image::RecordedTransitions() != acquire_transitions) {
@@ -7081,7 +7103,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			if (texdelta_compare) {
 				TexDeltaStats::Check(TexDeltaStats::Transitions, Image::RecordedTransitions() == acquire_transitions);
-				TexDeltaVerify(state, rendering, feedback_aspects, false, stages);
+				TexDeltaVerify(state, *rendering_own, feedback_aspects, false, stages);
 			}
 			if (run_verify_images) {
 				if (const auto change = DrawRunImagesChange(false, false, true); change != 0) {
@@ -7091,6 +7113,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 	}
+	if (rendering_ref == nullptr) {
+		rendering_ref = &*rendering_own;
+	}
+	const RenderState& rendering = *rendering_ref;
 	CommitStats::StepMark(CommitStats::Step::Acquire);
 	CommitStats::Mark(CommitStats::Phase::AcquireTargets);
 
@@ -7686,6 +7712,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// mode what this draw's normal path computed against what a continuation would have reused.
 	// KYTY_CONT_KERNEL: a kernel continuation's eligibility is its record's but for the terms that
 	// can change after the key matched (ContinuationKernelEntry checks the switches' terms).
+	if (rendering_own.has_value() && rendering_ref != &*rendering_own) {
+		// KYTY_BK_LEAN verify: the record's rendering state did not change while the draw used it.
+		auto& bk = DrawPrep::BkCounters();
+		bk.Add(bk.lean_checks);
+		if (!(*rendering_own == *rendering_ref)) {
+			DrawPrep::Bookkeep::ReportMismatch(bk.lean_mismatches, "lean", "record rendering state changed");
+		}
+	}
 	const bool kernel_eligible = (m_kernel || kernel_verify) && buffer.ActiveRenderingSerial() != 0 &&
 	                             RenderStateFastEnabled(RenderStatePart::Reset) &&
 	                             !graphics_debug_dump_enabled();
@@ -8044,7 +8078,7 @@ bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffe
 		counters.declined.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
-	ContKernel::NoteTaken();
+	ContKernel::NoteTaken(DrawPrep::BkLeanMode() != DrawPrep::Bookkeep::Mode::Off);
 	m_bk_kernel_taken         = true;
 	m_run_slice_offset        = args.render_target_slice_offset;
 	state.color_count         = m_run.color_count;
