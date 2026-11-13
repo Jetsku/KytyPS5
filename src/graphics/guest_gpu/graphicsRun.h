@@ -43,6 +43,12 @@ public:
 	void              SubmitFlipPreparation(uint64_t request_id);
 	void              Done();
 	[[nodiscard]] int GetFrameNum() const;
+	// The admission sequence of the latest submission on any queue (0: none yet). Any thread.
+	[[nodiscard]] uint64_t SubmittedWork();
+	// Waits until the command processor has completed every submission admitted up to `marker`
+	// (SubmittedWork), or the GPU stops: true. False when `cancel` is set first. Not on the GPU
+	// thread.
+	[[nodiscard]] bool WaitForWork(uint64_t marker, const std::atomic_bool& cancel);
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
@@ -165,6 +171,9 @@ private:
 	uint64_t                                       m_done_boundary            = 0;
 	uint32_t                                       m_done_waiters             = 0;
 	Common::CondVar                                m_done_progress;
+	// WaitForWork: the markers waited for; m_work_progress is signalled once the smallest is reached.
+	std::multiset<uint64_t>                        m_work_waits;
+	Common::CondVar                                m_work_progress;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

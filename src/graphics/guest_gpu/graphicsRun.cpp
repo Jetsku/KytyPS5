@@ -703,6 +703,30 @@ int GuestGpu::GetFrameNum() const {
 	return m_done_num;
 }
 
+uint64_t GuestGpu::SubmittedWork() {
+	Common::LockGuard lock(m_queue_mutex);
+	return m_next_submission_sequence - 1;
+}
+
+bool GuestGpu::WaitForWork(uint64_t marker, const std::atomic_bool& cancel) {
+	EXIT_IF(IsGpuThread());
+	Common::LockGuard lock(m_queue_mutex);
+	// Done's prefix test: every submission admitted up to the marker has left m_in_flight.
+	const auto done = [this, marker] {
+		return m_stopping || m_in_flight.empty() || *m_in_flight.begin() > marker;
+	};
+	if (done()) {
+		return true;
+	}
+	const auto wait = m_work_waits.insert(marker);
+	while (!done() && !cancel) {
+		// Neither `cancel` nor Shutdown signals m_work_progress: look again every 10 ms.
+		(void)m_work_progress.WaitFor(&m_queue_mutex, 10000);
+	}
+	m_work_waits.erase(wait);
+	return done();
+}
+
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	EXIT_IF(queue_id >= QueueCount);
 	if (queue_id == 0) {
@@ -1755,6 +1779,11 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_in_flight.erase(submission.sequence);
 			if (gpu->m_done_waiters != 0) {
 				gpu->m_done_progress.SignalAll();
+			}
+			if (!gpu->m_work_waits.empty() &&
+			    (gpu->m_in_flight.empty() ||
+			     *gpu->m_in_flight.begin() > *gpu->m_work_waits.begin())) {
+				gpu->m_work_progress.SignalAll();
 			}
 		}
 		gpu->m_processing = false;
