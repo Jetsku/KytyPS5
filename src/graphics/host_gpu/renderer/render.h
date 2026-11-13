@@ -1370,6 +1370,7 @@ private:
 		uint64_t          key              = 0;
 		uint64_t          targets_key      = 0; // KYTY_DRAW_RUN_TARGETS
 		uint64_t          swap_key         = 0; // KYTY_DRAW_RUN_PIPESWAP
+		uint64_t          pipe_key         = 0; // KYTY_PIPE_CONT
 		uint64_t          activity         = 0;
 		vk::CommandBuffer command          = nullptr;
 		uint64_t          tick             = 0;
@@ -1498,11 +1499,18 @@ private:
 	uint64_t      m_run_key            = 0;     // the committed draw's structure key (the engine)
 	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)
 	uint64_t      m_run_swap_key       = 0;     // and the key without the vertex program (PIPESWAP)
+	uint64_t      m_run_pipe_key       = 0;     // and the key without either program (KYTY_PIPE_CONT)
 	bool          m_run_pipeswap       = false; // KYTY_DRAW_RUN_PIPESWAP: the continuation swaps
+	bool          m_run_pipecont_push  = false; // KYTY_PIPE_CONT=2: the swap may push partially
+	[[nodiscard]] bool DrawRunPipeContPush() const { return m_run_pipeswap && m_run_pipecont_push; }
 	// KYTY_DRAW_RUN_PIPESWAP: the kept vertex-stage bindings and claims fit the new vertex program.
 	[[nodiscard]] static bool DrawRunPipeSwapCompatible(
 	    const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
 	    const ShaderRecompiler::IR::CompiledShaderInfo& program);
+	// KYTY_PIPE_CONT: 0 compatible, else the DrawRun::PipeReject reason.
+	[[nodiscard]] static int DrawRunPipeContCompatible(
+	    const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
+	    const ShaderRecompiler::IR::CompiledShaderInfo& program, bool pixel);
 	bool          m_run_targets_kept   = false; // KYTY_DRAW_RUN_TARGETS: the draw kept the record's
 	// KYTY_DRAW_RUN_TARGETS: whether the committed draw may keep the record's resolved targets.
 	[[nodiscard]] bool DrawRunTargetsCandidate(const CommandBuffer& buffer, const DrawRenderState& state,

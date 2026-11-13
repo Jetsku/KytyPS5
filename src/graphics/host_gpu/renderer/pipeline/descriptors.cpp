@@ -2675,6 +2675,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	                     DrawRunPartialPush(buffer, pipeline);
 	if (partial) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
+		if (DrawRunPipeContPush()) {
+			OwnedCounters::Add(DrawRun::GetTotals().pc_partial, 1);
+		}
 	}
 	CommitStats::StepMark(CommitStats::Step::CbHead);
 
