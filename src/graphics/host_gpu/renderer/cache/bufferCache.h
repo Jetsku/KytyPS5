@@ -145,6 +145,55 @@ public:
 	// KYTY_INPLACE (inplaceHeap.h): a command-processor CPU write of guest memory (DMA_DATA) is
 	// about to happen. Any thread.
 	void                   InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_LIVE_PAGES = 0 | 1 | verify (bufferCacheLive.cpp; default 0, live; the state exists
+	// only when the variable is set at start). A CPU-dirty page of a BDA-mapped buffer that the full
+	// pass would upload is instead served to BDA reads from the guest bytes themselves: its page-table
+	// entry points into an imported window of the guest backing alias, and the page stays CPU-dirty
+	// and writable (no upload, no re-protection, no write fault). Invariants: rtskip DESIGN.md 4.
+	[[nodiscard]] int64_t BdaLivePagesMode() const;
+	[[nodiscard]] bool    BdaLivePagesBuilt() const { return m_bda_live != nullptr; }
+	// Before a full BDA pass (RenderContext::PrepareBda): restores the pages a tag report or the
+	// CP blacklist promoted, restores everything when the switch is 0, and uploads the forced set
+	// (entries given back without an upload). GPU thread.
+	void                   LivePagesPrePass();
+	// A command-processor or emulator write of guest memory is about to happen (any thread; waits on
+	// the GPU thread when it hits a page earlier recorded work can read live).
+	void                   LivePagesBeforeCpWrite(uint64_t vaddr, uint64_t size);
+	// The same for the StreamCopyDefer write hooks, on the cache that built the state (if any).
+	static void            LiveCpWriteHook(uint64_t vaddr, uint64_t size);
+	// Guest unmap of [vaddr, vaddr + size): every redirect in it goes back (GPU thread).
+	void                   DropLivePages(uint64_t vaddr, uint64_t size);
+	// Whether the caching page of `vaddr` is served live (tests).
+	[[nodiscard]] bool     IsBdaLivePage(uint64_t vaddr) const;
+	struct BdaLiveTotals {
+		uint64_t redirects        = 0; // pages a full pass redirected instead of uploading
+		uint64_t held             = 0; // pages redirected now
+		uint64_t restore_upload   = 0; // restores: an upload covered the page
+		uint64_t restore_written  = 0; // restores: a written binding over the page
+		uint64_t restore_register = 0; // redirects dropped by a buffer (un)registration
+		uint64_t restore_unmap    = 0; // restores: guest unmap
+		uint64_t restore_read     = 0; // restores: a shader read the page live (tag report)
+		uint64_t restore_cp       = 0; // restores: CP blacklist
+		uint64_t restore_off      = 0; // restores: switch 0
+		uint64_t restore_writes   = 0; // restores: before a BDA-writing program
+		uint64_t forced_syncs     = 0; // forced-set ranges synchronized by the pre-pass
+		uint64_t live_reads       = 0; // tag reports of pages read through a redirect
+		uint64_t cp_hits          = 0; // CP / emulator writes over a redirected page
+		uint64_t cp_waits         = 0; // of them, GPU waits on the GPU thread
+		uint64_t cp_unordered     = 0; // of them, on another thread (counted only)
+		uint64_t rejects_window   = 0; // candidate pages without an imported window
+		uint64_t blocked_passes   = 0; // passes with BDA-write settles pending (no redirects)
+		uint64_t faults           = 0; // guest write faults on tracked memory
+		uint64_t v1               = 0; // verify: CPU-dirty pages left on the cache entry (must be 0)
+		uint64_t v1_checks        = 0;
+		uint64_t v1_skipped       = 0; // checks skipped: the fault epoch moved during the pass
+		uint64_t v2               = 0; // verify: redirected pages that are GPU-dirty / hot / image-written
+		uint64_t v3               = 0; // verify: redirects alive at a BDA-writing program
+		uint64_t windows          = 0;
+		uint64_t pinned_bytes     = 0;
+		uint64_t import_failures  = 0;
+	};
+	[[nodiscard]] BdaLiveTotals GetBdaLiveTotals() const;
 	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
 	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
 	// records them all behind one barrier. Every command recorded meanwhile through
@@ -1102,8 +1151,36 @@ private:
 	void ApplyBdaTags(uint64_t first_page, std::span<vk::DeviceAddress> entries, bool insert);
 	// The entry of `page` with its accessed tag (0 stays 0).
 	[[nodiscard]] vk::DeviceAddress TaggedBdaEntry(uint64_t page, vk::DeviceAddress entry) const;
+	// Whether a DMA shader reported the caching page (false without tags).
+	[[nodiscard]] bool BdaTagAccessed(uint64_t page) const;
 	// ChangeRegister: page-table entries of [first_page, last_page) were rewritten.
 	void NoteBdaReachRegister(uint64_t first_page, uint64_t last_page, bool insert);
+	// KYTY_BDA_LIVE_PAGES state (bufferCacheLive.cpp), created when the variable is set at start.
+	struct BdaLive;
+	std::shared_ptr<BdaLive>                          m_bda_live;
+	// Pages redirected now (lock-free fast path of the hooks).
+	std::atomic<uint64_t>                             m_bda_live_count {0};
+	// Guest write faults (any thread), for the report line.
+	std::atomic<uint64_t>                             m_bda_live_faults {0};
+	// Set by SynchronizeBdaBuffers around the full pass: SynchronizeBuffersInRange redirects then.
+	bool                                              m_bda_live_pass = false;
+	void CreateBdaLive();
+	// SynchronizeBuffersInRange during a full pass with the switch on: qualifying caching pages of
+	// [start, start + size) of `buffer` are redirected, the rest synchronized as before.
+	void LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size, BdaSyncStats* stats);
+	// The redirect entry of `page` (0 when not redirected); with its tag when tags exist and the page
+	// was reported.
+	[[nodiscard]] vk::DeviceAddress LiveEntry(uint64_t page) const;
+	enum class LiveRestore : uint8_t { Upload, Written, Register, Unmap, Read, Cp, Off, Writes };
+	// Gives the redirected pages of [vaddr, vaddr + size) their cache entries back (0 without a buffer)
+	// and queues them in the forced set. Register: the caller rewrote the entries already. GPU thread.
+	void RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore why);
+	// After a full pass ran: V1/V2 (verify), and the tick later CP writes wait for.
+	void LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fault_epoch_before);
+	// KYTY_BDA_WRITES: before a BDA-writing program, every redirect is restored and uploaded (I-W1).
+	void LivePagesBeforeBdaWrites();
+	// Faults counter (InvalidateMemory on a write fault) and the 10 s report (AdvanceFrame).
+	void ReportBdaLive();
 	RangeSet                                          m_gpu_modified_ranges;
 	uint64_t                                          m_unregister_epoch = 0;
 	struct KnownFillRange {

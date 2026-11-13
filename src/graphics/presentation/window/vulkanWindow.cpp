@@ -2385,8 +2385,11 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		// KYTY_INPLACE (renderer/cache/inplaceHeap.h): guest memory imported as Vulkan memory.
-		if (const auto* inplace = std::getenv("KYTY_INPLACE");
-		    inplace != nullptr && (std::strcmp(inplace, "1") == 0 || std::strcmp(inplace, "verify") == 0)) {
+		// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp), set at start to any value: the same import.
+		const auto* inplace = std::getenv("KYTY_INPLACE");
+		const auto* live    = std::getenv("KYTY_BDA_LIVE_PAGES");
+		if ((inplace != nullptr && (std::strcmp(inplace, "1") == 0 || std::strcmp(inplace, "verify") == 0)) ||
+		    (live != nullptr && live[0] != '\0')) {
 			if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
 				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 				graphic_ctx.external_memory_host_enabled = true;
