@@ -267,7 +267,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 		NoteForeignCommand();
 	}
 	// Including push-constant updates with other layouts (helper passes, occlusion reductions).
-	m_push_constants.valid = false;
+	m_shadow.InvalidatePushConstants();
 	if (Encoding()) {
 		// KYTY_CP_RECORDER: the recorder executes everything encoded so far (including the batch
 		// flushed above); the caller then records natively at exactly this position.
@@ -291,7 +291,7 @@ CommandSink CommandBuffer::Sink() const {
 		FlushBarriers();
 		NoteForeignCommand();
 	}
-	m_push_constants.valid = false;
+	m_shadow.InvalidatePushConstants();
 	return CommandSink(*this);
 }
 
@@ -750,16 +750,8 @@ void CommandBuffer::NoteDrawRecorded() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	m_bound_pipelines = {};
-	for (auto& state: m_descriptor_states) {
-		state.layout    = nullptr;
-		state.bound_set = nullptr;
-	}
-	for (auto& epoch: m_descriptor_epochs) {
-		epoch++;
-	}
-	// Push constants are undefined at the start of a command buffer.
-	m_push_constants.valid = false;
+	// Nothing bound, every descriptor epoch advances, push constants are undefined.
+	m_shadow.Begin();
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
 	ResetBarrierState();
 	m_direct_window = false;
@@ -796,156 +788,37 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-static size_t BindingPointIndex(vk::PipelineBindPoint point) {
-	EXIT_IF(point != vk::PipelineBindPoint::eGraphics && point != vk::PipelineBindPoint::eCompute);
-	return point == vk::PipelineBindPoint::eCompute ? 1u : 0u;
+DrawEncode::ShadowFlags CommandBuffer::EncodeFlags() {
+	return {Common::RendererBatchEnabled(), PushConstantShadowEnabled(), DescriptorSetReuseEnabled()};
 }
 
+// State commands: not ordered by barriers, so not batch flush points (render.h).
 void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
-	auto& current = m_bound_pipelines[BindingPointIndex(point)];
-	if (Common::RendererBatchEnabled() && current == pipeline) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineBindsAvoided);
-		return;
-	}
-	// State commands: not ordered by barriers, so not a batch flush point (render.h).
-	StateSink().bindPipeline(point, pipeline);
-	current = pipeline;
+	auto sink = StateSink();
+	m_shadow.BindPipeline(sink, EncodeFlags(), point, pipeline);
 }
 
 void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
-	auto& state     = m_descriptor_states[BindingPointIndex(point)];
-	state.layout    = nullptr;
-	state.bound_set = nullptr;
-	m_descriptor_epochs[BindingPointIndex(point)]++;
+	m_shadow.InvalidateDescriptors(point);
 }
 
 void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                       vk::DescriptorSet set) {
-	auto& state = m_descriptor_states[BindingPointIndex(point)];
-	EXIT_IF(set == nullptr || layout == nullptr);
-	if (DescriptorSetReuseEnabled() && state.bound_set == set && state.layout == layout) {
-		// Still bound as set 0 with this layout: nothing since disturbed it (every other bind and
-		// every push descriptor update of this bind point passes through this class), and binding
-		// a pipeline never disturbs descriptor sets.
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetBindsAvoided);
-		return;
-	}
-	StateSink().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
-	m_descriptor_epochs[BindingPointIndex(point)]++;
-	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
-	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
-	state.writes.clear();
-	state.buffers.clear();
-	state.images.clear();
+	auto sink = StateSink();
+	m_shadow.BindDescriptorSet(sink, EncodeFlags(), point, layout, set);
 }
 
 void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
                                   uint32_t size, const void* data) {
-	auto& shadow = m_push_constants;
-	// Push-constant values persist in the command buffer across pipeline binds; values set with
-	// this very layout are valid for every pipeline created with it.
-	if (PushConstantShadowEnabled() && shadow.valid && shadow.layout == layout &&
-	    shadow.stages == stages && shadow.size == size &&
-	    std::memcmp(shadow.dwords.data(), data, size) == 0) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdatesAvoided);
-		return;
-	}
-	StateSink().pushConstants(layout, stages, 0, size, data);
-	Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdates);
-	shadow.valid = PushConstantShadowEnabled() && size <= sizeof(shadow.dwords);
-	if (shadow.valid) {
-		shadow.layout = layout;
-		shadow.stages = stages;
-		shadow.size   = size;
-		std::memcpy(shadow.dwords.data(), data, size);
-	}
+	auto sink = StateSink();
+	m_shadow.PushConstants(sink, EncodeFlags(), layout, stages, size, data);
 }
 
 int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                        uint32_t set, uint32_t count,
                                        const vk::WriteDescriptorSet* writes, bool known_miss) {
-	auto& state = m_descriptor_states[BindingPointIndex(point)];
-	if (known_miss) {
-		// The comparison below could only miss. No copy is kept for the next update either: one
-		// equal to this (its upload deduplicated to the same range) is then recorded again, which
-		// is only redundant; the Sky Garden start avoids no push at all (DescriptorPushesAvoided).
-		StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
-		state.layout    = nullptr;
-		state.bound_set = nullptr;
-		return PushMissFresh;
-	}
-	bool supported = Common::RendererBatchEnabled() && set == 0;
-	size_t buffer_count = 0, image_count = 0;
-	for (uint32_t i = 0; supported && i < count; ++i) {
-		const auto& write = writes[i];
-		const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-		                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-		const bool image_type = write.descriptorType == vk::DescriptorType::eSampler ||
-		                        write.descriptorType == vk::DescriptorType::eSampledImage ||
-		                        write.descriptorType == vk::DescriptorType::eStorageImage ||
-		                        write.descriptorType == vk::DescriptorType::eCombinedImageSampler;
-		supported = write.pNext == nullptr && write.pTexelBufferView == nullptr &&
-		            ((buffer_type && write.pBufferInfo != nullptr) ||
-		             (image_type && write.pImageInfo != nullptr));
-		buffer_count += buffer_type ? write.descriptorCount : 0u;
-		image_count += image_type ? write.descriptorCount : 0u;
-	}
-	int32_t result = PushMissState;
-	if (supported && state.layout == layout && state.bound_set == nullptr) {
-		result = state.writes.size() == count && state.buffers.size() == buffer_count &&
-		                 state.images.size() == image_count
-		             ? PushAvoided
-		             : PushMissShape;
-		size_t buffer_index = 0, image_index = 0;
-		for (uint32_t i = 0; result == PushAvoided && i < count; ++i) {
-			const auto& write = writes[i];
-			const auto& old   = state.writes[i];
-			if (write.dstBinding != old.dstBinding || write.dstArrayElement != old.dstArrayElement ||
-			    write.descriptorCount != old.descriptorCount ||
-			    write.descriptorType != old.descriptorType) {
-				result = PushMissShape;
-				break;
-			}
-			const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-			                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-			for (uint32_t j = 0; j < write.descriptorCount; ++j) {
-				const bool equal = buffer_type ? write.pBufferInfo[j] == state.buffers[buffer_index++]
-				                               : write.pImageInfo[j] == state.images[image_index++];
-				if (!equal) {
-					result = static_cast<int32_t>(i);
-					break;
-				}
-			}
-		}
-	}
-	if (result == PushAvoided) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushesAvoided);
-		return result;
-	}
-	StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
-	m_descriptor_epochs[BindingPointIndex(point)]++;
-	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
-	state.layout    = nullptr;
-	state.bound_set = nullptr;
-	if (!supported) return result;
-	state.writes.assign(writes, writes + count);
-	state.buffers.clear();
-	state.images.clear();
-	state.buffers.reserve(buffer_count);
-	state.images.reserve(image_count);
-	for (auto& write: state.writes) {
-		const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-		                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-		if (buffer_type) state.buffers.insert(state.buffers.end(), write.pBufferInfo,
-		                                     write.pBufferInfo + write.descriptorCount);
-		else state.images.insert(state.images.end(), write.pImageInfo,
-		                         write.pImageInfo + write.descriptorCount);
-		write.pBufferInfo = nullptr;
-		write.pImageInfo = nullptr;
-	}
-	state.layout = layout;
-	return result;
+	auto sink = StateSink();
+	return m_shadow.PushDescriptors(sink, EncodeFlags(), point, layout, set, count, writes, known_miss);
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,

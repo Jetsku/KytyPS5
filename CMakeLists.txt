@@ -1327,6 +1327,15 @@ add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(cp_recorder_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(cp_recorder_tests PRIVATE ${inc_headers})
+
+# The draw encode (renderer/drawEncode.h): shadow comparisons and the builder into a command-stream
+# encoder, without a Vulkan device.
+add_executable(draw_encode_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DrawEncodeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandStream.cpp"
+)
+target_link_libraries(draw_encode_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(draw_encode_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(cp_recorder_tests Threads::Threads)
 endif()
@@ -1514,6 +1523,7 @@ if(BUILD_TESTING)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
+	add_test(NAME draw_encode COMMAND $<TARGET_FILE:draw_encode_tests>)
 	add_test(NAME cp_sequencer COMMAND $<TARGET_FILE:cp_sequencer_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
@@ -2859,6 +2869,7 @@ if(BUILD_TESTING)
 		binding_path_tests
 		rt_hardware_tests
 		cp_recorder_tests
+		draw_encode_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

@@ -555,6 +555,11 @@ public:
 	// waits for anything the consumer does.
 	void                   Kick(WaitStats& stats) noexcept;
 	[[nodiscard]] uint64_t WritePosition() const noexcept { return m_write; }
+	// The packet at a producer position the producer wrote (it stays intact until the producer
+	// writes over it): the producer reading back its own packets (KYTY_ENC_BUILDER verify).
+	[[nodiscard]] const Header* At(uint64_t position) const noexcept {
+		return reinterpret_cast<const Header*>(m_data + (position & m_mask));
+	}
 	// Waits until the consumer has released everything up to `position`.
 	void WaitConsumed(uint64_t position, const WaitPolicy& policy, WaitStats& stats);
 	[[nodiscard]] uint64_t Consumed() const noexcept {

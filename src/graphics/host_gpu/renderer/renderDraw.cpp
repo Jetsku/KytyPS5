@@ -4493,7 +4493,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 		}
 	}
 	if (verify) {
-		run.pushed_images.assign(m_descriptor_images.begin(), m_descriptor_images.end());
+		run.pushed_images.assign(m_descriptor_scratch.images.begin(), m_descriptor_scratch.images.end());
 		run.textures.clear();
 		run.samplers.clear();
 		for (const auto* stage: stages) {
@@ -4616,23 +4616,15 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(const CommandSink&           vk_buffer,
-                                const PreparedVertexBuffers& prepared) {
-	for (uint32_t i = 0; i < prepared.count; i++) {
-		EXIT_IF(prepared.buffers[i] == nullptr);
-	}
-	if (prepared.count != 0) {
-		// Guest descriptor bounds must survive allocation merging in the cache.
-		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
-		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
-	}
+template <typename Sink>
+static void CommitVertexBuffers(Sink& vk_buffer, const PreparedVertexBuffers& prepared) {
+	DrawEncode::EmitVertexBuffers(vk_buffer, prepared.count, prepared.buffers.data(), prepared.offsets.data(),
+	                              prepared.sizes.data());
 }
 
-static void CommitIndexBuffer(const CommandSink& vk_buffer, const PreparedIndexBuffer& prepared) {
-	if (prepared.buffer == nullptr) {
-		return;
-	}
-	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+template <typename Sink>
+static void CommitIndexBuffer(Sink& vk_buffer, const PreparedIndexBuffer& prepared) {
+	DrawEncode::EmitIndexBuffer(vk_buffer, prepared.buffer, prepared.offset, prepared.type);
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -4654,8 +4646,10 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandSink& vk_buffer,
-                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+// The draw command of a direct draw (DrawEncode::EmitDirectDraw), by primitive type.
+static DrawEncode::DirectDraw MakeDirectDraw(const HW::UserConfig& ucfg, const DrawCallInfo& draw,
+                                            const DrawEmitInfo& emit) {
+	DrawEncode::DirectDraw direct;
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -4666,29 +4660,23 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandSink& vk
 		case Prospero::PrimitiveType::kRectList:
 		case Prospero::PrimitiveType::kPolygon:
 		case Prospero::PrimitiveType::kRectListLegacy:
-		case Prospero::PrimitiveType::kPatch:
-			if (draw.IsIndexed()) {
-				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      emit.first_instance);
-			} else {
-				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
-				               emit.first_instance);
-			}
-			break;
-		case Prospero::PrimitiveType::kQuadListLegacy:
-			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
-			for (uint32_t i = 0; i < draw.index_count; i += 4) {
-				if (draw.IsIndexed()) {
-					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
-					                      emit.first_instance);
-				} else {
-					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
-					               emit.first_instance);
-				}
-			}
-			break;
+		case Prospero::PrimitiveType::kPatch: break;
+		case Prospero::PrimitiveType::kQuadListLegacy: direct.quad_list = true; break;
 		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 	}
+	direct.indexed        = draw.IsIndexed();
+	direct.count          = draw.index_count;
+	direct.instance_count = draw.instance_count;
+	direct.vertex_offset  = emit.vertex_offset;
+	direct.first_vertex   = emit.first_vertex;
+	direct.first_instance = emit.first_instance;
+	return direct;
+}
+
+template <typename Sink>
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, Sink& vk_buffer, const DrawCallInfo& draw,
+                               const DrawEmitInfo& emit) {
+	DrawEncode::EmitDirectDraw(vk_buffer, MakeDirectDraw(ucfg, draw, emit));
 }
 
 // CommandBuffer::DrawScope: the draw's only memory writes are its own color/depth attachments,
@@ -6737,9 +6725,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (run_verify_push) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
 		DrawRun::CountVerifyCheck();
-		if (m_descriptor_images != m_run.pushed_images) {
+		if (m_descriptor_scratch.images != m_run.pushed_images) {
 			DrawRun::ReportMismatch("pushed image or sampler descriptors",
-			                        m_descriptor_images.size());
+			                        m_descriptor_scratch.images.size());
 		}
 	}
 	if (run_verify_images && Image::RecordedTransitions() != run_transitions) {

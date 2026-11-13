@@ -7,6 +7,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/commandStream.h"
+#include "graphics/host_gpu/renderer/drawEncode.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorEncode.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/texDelta.h"
@@ -397,19 +399,19 @@ public:
 	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);
 	// The pipeline last bound through BindPipeline since Begin (null after Begin).
 	[[nodiscard]] vk::Pipeline BoundPipeline(vk::PipelineBindPoint point) const {
-		return m_bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
+		return m_shadow.BoundPipeline(point);
 	}
 	// PushDescriptors result: the update was skipped (identical to the one still in effect), there
 	// was nothing comparable (no earlier push in this command buffer for the bind point, another
 	// layout, a bound set, or the dedup is off), or the binding list differs; otherwise the index
 	// of the first write whose descriptors differ.
-	static constexpr int32_t PushAvoided   = -1;
-	static constexpr int32_t PushMissState = -2;
-	static constexpr int32_t PushMissShape = -3;
+	static constexpr int32_t PushAvoided   = DrawEncode::Shadow::PushAvoided;
+	static constexpr int32_t PushMissState = DrawEncode::Shadow::PushMissState;
+	static constexpr int32_t PushMissShape = DrawEncode::Shadow::PushMissShape;
 	// `known_miss`: the caller knows the update differs from every earlier one of this command
 	// buffer (a descriptor refers to an upload made for this command, KYTY_PUSH_SHADOW_FRESH_SKIP):
 	// recorded without the comparison and without keeping a copy for the next one.
-	static constexpr int32_t PushMissFresh = -4;
+	static constexpr int32_t PushMissFresh = DrawEncode::Shadow::PushMissFresh;
 	int32_t PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                        uint32_t count, const vk::WriteDescriptorSet* writes,
 	                        bool known_miss = false);
@@ -420,7 +422,7 @@ public:
 	// BindDescriptorSet), so a later push with the same layout may update them incrementally
 	// (KYTY_DRAW_RUN_PUSH).
 	[[nodiscard]] uint64_t DescriptorEpoch(vk::PipelineBindPoint point) const {
-		return m_descriptor_epochs[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
+		return m_shadow.DescriptorEpoch(point);
 	}
 	// Binds `set` as set 0 unless it is still the set bound there with this layout
 	// (KYTY_DESCRIPTOR_SET_REUSE). Bound sets are disturbed only by another bind or a push
@@ -434,7 +436,15 @@ public:
 	// push constants through StateHandle().
 	void PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t size,
 	                   const void* data);
-	void InvalidatePushConstants() const { m_push_constants.valid = false; }
+	void InvalidatePushConstants() const { m_shadow.InvalidatePushConstants(); }
+
+	// The encode's view (drawEncode.h): the shadow the state commands above update, the switches
+	// its comparisons depend on, and the ring the encoder writes (null while recording natively).
+	[[nodiscard]] DrawEncode::Shadow& EncodeShadow() const noexcept { return m_shadow; }
+	[[nodiscard]] static DrawEncode::ShadowFlags EncodeFlags();
+	[[nodiscard]] const CommandStream::Ring* EncoderRing() const noexcept {
+		return Encoding() ? &m_encoder->GetRing() : nullptr;
+	}
 
 	// Native handle for recording any command. Records pending batched barriers first.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -519,25 +529,9 @@ private:
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
-	std::array<vk::Pipeline, 2> m_bound_pipelines {};
-	struct DescriptorState {
-		vk::PipelineLayout layout = nullptr;
-		// Non-null: set 0 is this bound descriptor set (the push contents below are unused).
-		vk::DescriptorSet bound_set = nullptr;
-		std::vector<vk::WriteDescriptorSet> writes;
-		std::vector<vk::DescriptorBufferInfo> buffers;
-		std::vector<vk::DescriptorImageInfo> images;
-	};
-	std::array<DescriptorState, 2> m_descriptor_states;
-	std::array<uint64_t, 2>        m_descriptor_epochs {};
-	struct PushConstantShadow {
-		bool                     valid  = false;
-		vk::PipelineLayout       layout = nullptr;
-		vk::ShaderStageFlags     stages;
-		uint32_t                 size = 0;
-		std::array<uint32_t, 64> dwords {};
-	};
-	mutable PushConstantShadow m_push_constants;
+	// What the state commands recorded in this buffer left in effect (drawEncode.h): bound
+	// pipelines, push-descriptor contents and epochs, push constants.
+	mutable DrawEncode::Shadow m_shadow;
 
 	// Barrier batcher state (see BarrierBatchEnabled()). Owned by the recording producer.
 	mutable PendingBarriers m_pending;
@@ -1149,6 +1143,25 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings, bool keep_images = false);
+	// CommitBindings' cache and barrier work, which runs ahead of its encode (descriptors.cpp).
+	void CommitBindingsSideEffects(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                               std::span<PreparedBindings* const> bindings, bool keep_images);
+	// The encode after the side effects: as it was (KYTY_ENC_BUILDER=0, temporary) and through the
+	// builder (descriptorEncode.h) into any sink and shadow.
+	void CommitBindingsEncode(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
+	                          const PipelineCache::Pipeline&     pipeline,
+	                          std::span<PreparedBindings* const> bindings, bool keep_images);
+	void CommitBindingsEncodeOld(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
+	                             const PipelineCache::Pipeline&     pipeline,
+	                             std::span<PreparedBindings* const> bindings, bool keep_images);
+	template <typename Sink>
+	bool EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, CommandBuffer& buffer,
+	                  vk::PipelineBindPoint point, const PipelineCache::Pipeline& pipeline,
+	                  std::span<PreparedBindings* const> stages, bool partial,
+	                  DrawEncode::DescriptorScratch& scratch, DrawEncode::BuiltDescriptors& built, bool real);
+	[[nodiscard]] DrawEncode::DescriptorEnv MakeDescriptorEnv(std::span<PreparedBindings* const> stages);
+	void NoteDescriptorOffsetAudit(const PipelineCache::Pipeline&          pipeline,
+	                               std::span<const vk::WriteDescriptorSet> writes);
 
 	// Draw-prep: hands the committed draw's preparation to its program refresh (once).
 	[[nodiscard]] DrawPrep::PreparedDraw* TakePreparedDraw() noexcept {
@@ -1430,10 +1443,17 @@ private:
 	// on demand; a replaced one is released once the tick that used it has completed.
 	std::unique_ptr<Buffer>               m_compute_lds;
 	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
-	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
+	// The descriptor writes the last CommitBindings built (drawEncode.h).
+	DrawEncode::DescriptorScratch m_descriptor_scratch;
+	DrawEncode::BuiltDescriptors  m_built_descriptors;
+	// KYTY_ENC_BUILDER verify: the builder's encode goes to this capture (consumed at once).
+	struct EncCapture {
+		CommandStream::Ring          ring {1u << 20u};
+		CommandStream::Encoder       encoder {ring, CommandStream::Encoder::Options {}};
+		DrawEncode::DescriptorScratch scratch;
+		DrawEncode::BuiltDescriptors  built;
+	};
+	std::unique_ptr<EncCapture> m_enc_capture;
 	struct ShaderUploadEntry {
 		uint64_t tick = 0;
 		uint64_t hash = 0;
