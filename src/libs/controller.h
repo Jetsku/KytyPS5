@@ -82,6 +82,9 @@ void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
+// While held, the pad reports a side-to-side shake (games that ask the player to shake the controller).
+// No effect on a pad with a real accelerometer.
+void Shake(int id, bool down);
 void ResetInputState();
 int  GetActiveControllerId();
 // True when the player has a keyboard or gamepad assigned.

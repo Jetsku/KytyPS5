@@ -37,6 +37,7 @@ struct ControlInfo {
 	Controller::Setting setting {};
 	bool                gyro          = false;
 	bool                touchpad_mode = false;
+	bool                shake         = false;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -72,6 +73,7 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {.name    = "TriggerEffectIntensity",
                  .setting = Controller::Setting::TriggerEffectIntensity},
     ControlInfo {.name = "GyroToggle", .gyro = true},
+    ControlInfo {.name = "Shake", .shake = true},
     ControlInfo {.name = "TouchPadMode", .touchpad_mode = true},
 };
 
@@ -478,6 +480,10 @@ void SetControl(std::size_t control, bool down) {
 		}
 		return;
 	}
+	if (info.shake) {
+		Controller::Shake(Controller::HOST_INPUT_CONTROLLER_ID, down);
+		return;
+	}
 	if (info.touchpad_mode) {
 		if (down) {
 			HostInputToggleTouchPadMode();
@@ -520,6 +526,7 @@ void DefaultKeyboardInput(int key_code, bool down) {
 		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
+		case SDLK_X: Controller::Shake(Controller::HOST_INPUT_CONTROLLER_ID, down); return;
 		case SDLK_A:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
@@ -649,6 +656,8 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 		if (down) {
 			Controller::ToggleGyroEmulation(id);
 		}
+	} else if (info.shake) {
+		Controller::Shake(id, down);
 	} else if (info.touchpad_mode) {
 		if (down) {
 			HostInputToggleGamepadTouchPad(id);
@@ -796,7 +805,18 @@ void HostInputShutdown() {
 	}
 }
 
-void HostInputKey(int key_code, bool down) {
+void HostInputKey(int key_code, int scan_code, bool down) {
+	// The default bindings are key positions (WASD, IJKL), so letters and digits come from the physical
+	// key: on AZERTY, ZQSD moves the stick. Custom bindings name the key the player sees, so keep it.
+	if (!GetInputMap().Custom()) {
+		if (scan_code >= SDL_SCANCODE_A && scan_code <= SDL_SCANCODE_Z) {
+			key_code = static_cast<int>(SDLK_A) + (scan_code - SDL_SCANCODE_A);
+		} else if (scan_code >= SDL_SCANCODE_1 && scan_code <= SDL_SCANCODE_9) {
+			key_code = static_cast<int>(SDLK_1) + (scan_code - SDL_SCANCODE_1);
+		} else if (scan_code == SDL_SCANCODE_0) {
+			key_code = SDLK_0;
+		}
+	}
 	Common::HostInputTrace("host-key", key_code, down);
 	g_input_pulse.Key(key_code, down, SDL_GetTicks(), ApplyHostKey);
 }
