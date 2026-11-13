@@ -320,6 +320,24 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// KYTY_HOST_IMPORT=1 (default off; VK_EXT_external_memory_host): BDA page-table entries of
+	// streaming guest pages (CPU-written every frame) point at an import of their direct-memory
+	// backing alias instead of the cache buffer, and BDA passes skip those pages. See
+	// bufferCache.cpp (HostImportState).
+	struct HostImportState;
+	std::unique_ptr<HostImportState> m_host_import;
+	void HostImportValidate();
+	void HostImportUpdate();
+	void HostImportReapply(uint64_t first_page, uint64_t last_page);
+	void HostImportUnredirect(uint64_t vaddr, uint64_t size, bool exclude);
+	void HostImportSettleWrite(uint64_t vaddr, uint64_t size);
+	void HostImportAdvanceFrame();
+	[[nodiscard]] bool HostImportRedirects(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> HostImportRedirectedRuns(uint64_t vaddr,
+	                                                                                 uint64_t size) const;
+	[[nodiscard]] bool HostImportTryRedirect(uint64_t begin, uint64_t end);
+	[[nodiscard]] bool HostImportPageEligible(uint64_t page);
+	void HostImportWriteEntries(uint64_t first_page, uint64_t last_page, bool redirect);
 	// A run of hot pages a full BDA pass found inside one scanned buffer (KYTY_BDA_HOT_SYNC).
 	struct BdaHotRange {
 		BufferId id;
@@ -341,6 +359,7 @@ private:
 		uint64_t verify_mismatch_pages  = 0;
 	};
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
+	void SynchronizeBdaPart(Buffer& buffer, uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
 	// KYTY_BDA_HOT_SYNC pass: re-synchronizes only the hot page runs the last full pass recorded.
 	// False (nothing done) when a recorded buffer is gone; the caller then scans fully.
 	[[nodiscard]] bool SynchronizeBdaHotRanges(BdaSyncStats& stats);
