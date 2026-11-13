@@ -9,6 +9,8 @@
 
 #include <Zydis/Zydis.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <array>
 #include <bitset>
 #include <climits>
@@ -1631,6 +1633,35 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 	return features;
 }
 
+// 0: scan functions on one thread per CPU for modules with at least 1024 functions.
+static std::atomic<size_t> g_patch_scan_threads {0};
+
+void SetGuestInstructionPatchScanThreads(size_t threads) {
+	g_patch_scan_threads.store(threads);
+}
+
+namespace {
+
+void AddPatchCounts(GuestInstructionPatchResult& total, const GuestInstructionPatchResult& add) {
+	total.function_count += add.function_count;
+	total.instruction_count += add.instruction_count;
+	total.red_zone_function_count += add.red_zone_function_count;
+	total.memory_instruction_count += add.memory_instruction_count;
+	total.short_memory_instruction_count += add.short_memory_instruction_count;
+	total.patched_memory_instruction_count += add.patched_memory_instruction_count;
+	total.stack_dependent_memory_instruction_count += add.stack_dependent_memory_instruction_count;
+	total.control_flow_memory_instruction_count += add.control_flow_memory_instruction_count;
+	total.unrelocatable_memory_instruction_count += add.unrelocatable_memory_instruction_count;
+	total.indirect_red_zone_function_count += add.indirect_red_zone_function_count;
+	total.reciprocal_sqrt += add.reciprocal_sqrt;
+	total.extrq += add.extrq;
+	total.insertq += add.insertq;
+	total.rdpid += add.rdpid;
+	total.clwb += add.clwb;
+}
+
+} // namespace
+
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
@@ -1662,40 +1693,103 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif
-	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
+	// Decodes and analyzes one function and collects its rewrite sites. Reads guest code only.
+	const auto analyze = [&](size_t function_index, GuestInstructionPatchResult& counts,
+	                         DecodedFunction&                         function,
+	                         std::map<uintptr_t, InstructionRewrite>& rewrite_sites) -> bool {
 		const uintptr_t function_start = starts[function_index];
 		const uintptr_t function_end =
 		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
 		if (function_end <= function_start) {
-			continue;
+			return false;
 		}
 
-		++result.function_count;
+		++counts.function_count;
 		// Jump tables usually sit in a read-only data segment, not in the code segment.
-		auto function = DecodeFunction(function_start, function_end,
-		                               reinterpret_cast<uintptr_t>(module->start),
-		                               reinterpret_cast<uintptr_t>(module->end));
+		function = DecodeFunction(function_start, function_end,
+		                          reinterpret_cast<uintptr_t>(module->start),
+		                          reinterpret_cast<uintptr_t>(module->end));
 		if (analyze_red_zone) {
 			AnalyzeRedZoneLiveness(function);
 		}
-		result.instruction_count += function.instructions.size();
-
-		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+		counts.instruction_count += function.instructions.size();
 
 		if (function.uses_red_zone) {
-			++result.red_zone_function_count;
-			result.indirect_red_zone_function_count += function.has_indirect_branch;
+			++counts.red_zone_function_count;
+			counts.indirect_red_zone_function_count += function.has_indirect_branch;
 		}
 		if (protect_memory) {
-			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
+			CollectRedZoneMemoryInstructions(function, rewrite_sites, counts);
 		}
 		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result, host_features);
+			CollectAmdInstructions(function, rewrite_sites, counts, host_features);
 		}
-		if (!rewrite_sites.empty()) {
+		return true;
+	};
+	const auto patch = [&](size_t function_index) {
+		DecodedFunction                         function;
+		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+		if (analyze(function_index, result, function, rewrite_sites) && !rewrite_sites.empty()) {
 			RejectionMap rejections;
 			RelocateGuestInstructions(module, function, rewrite_sites, rejections, result);
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, rejections, result);
+		}
+	};
+
+	// Decoding every function to find the few with rewrite sites is the costly part: Astro Bot's
+	// 252 MB eboot.bin took ~9 s at boot on one emulated core. Scan the functions on several
+	// threads first. The functions with rewrite sites are then decoded again and patched in address
+	// order on this thread, exactly as a single-threaded pass does: patching a function writes only
+	// inside that function and the module's trampolines, so the scan sees the same code bytes, and
+	// the other functions only add to the counters.
+	const size_t forced_threads = g_patch_scan_threads.load();
+	const size_t scan_threads =
+	    forced_threads != 0 ? forced_threads
+	    : starts.size() < 1024 ? 1
+	                           : std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+	if (scan_threads <= 1) {
+		for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
+			patch(function_index);
+		}
+	} else {
+		std::atomic<size_t>                      next_function {0};
+		std::vector<GuestInstructionPatchResult> scan_counts(scan_threads);
+		std::vector<std::vector<size_t>>         scan_sites(scan_threads);
+		const auto                               scan = [&](size_t worker) {
+			constexpr size_t Batch = 64;
+			for (size_t begin = next_function.fetch_add(Batch); begin < starts.size();
+			     begin        = next_function.fetch_add(Batch)) {
+				for (size_t function_index = begin;
+				     function_index < std::min(begin + Batch, starts.size()); ++function_index) {
+					GuestInstructionPatchResult             counts {};
+					DecodedFunction                         function;
+					std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+					analyze(function_index, counts, function, rewrite_sites);
+					if (rewrite_sites.empty()) {
+						AddPatchCounts(scan_counts[worker], counts);
+					} else {
+						scan_sites[worker].push_back(function_index);
+					}
+				}
+			}
+		};
+		std::vector<std::thread> workers;
+		for (size_t worker = 1; worker < scan_threads; ++worker) {
+			workers.emplace_back(scan, worker);
+		}
+		scan(0);
+		for (auto& worker: workers) {
+			worker.join();
+		}
+		std::vector<size_t> functions_with_sites;
+		for (size_t worker = 0; worker < scan_threads; ++worker) {
+			AddPatchCounts(result, scan_counts[worker]);
+			functions_with_sites.insert(functions_with_sites.end(), scan_sites[worker].begin(),
+			                            scan_sites[worker].end());
+		}
+		std::ranges::sort(functions_with_sites);
+		for (const size_t function_index: functions_with_sites) {
+			patch(function_index);
 		}
 	}
 	const auto trampoline_addr =

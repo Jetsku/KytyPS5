@@ -85,6 +85,10 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
+// Tests: the number of threads that scan a module's functions (0: automatic). The patched code is the
+// same for every thread count.
+void SetGuestInstructionPatchScanThreads(size_t threads);
+
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks.
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
