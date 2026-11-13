@@ -7963,6 +7963,7 @@ bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffe
 		return false;
 	}
 	ContKernel::NoteTaken();
+	m_bk_kernel_taken         = true;
 	m_run_slice_offset        = args.render_target_slice_offset;
 	state.color_count         = m_run.color_count;
 	state.color_slots_written = m_run.color_slots;

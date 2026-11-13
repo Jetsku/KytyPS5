@@ -428,6 +428,32 @@ Segment::Counters& SegmentCounters() {
 	return g_segment_counters;
 }
 
+// KYTY_BK_* (live, default 0; bookkeep.h): 0 off, 1 on, 2 / verify.
+static int64_t ParseBookkeepMode(const char* value) {
+	return static_cast<int64_t>(Bookkeep::ParseMode(value));
+}
+static Live::Switch       g_bk_handover("KYTY_BK_HANDOVER", ParseBookkeepMode);
+static Live::Switch       g_bk_adopt("KYTY_BK_ADOPT", ParseBookkeepMode);
+static Live::Switch       g_bk_record("KYTY_BK_RECORD", ParseBookkeepMode);
+static Live::Switch       g_bk_lean("KYTY_BK_LEAN", ParseBookkeepMode);
+static Bookkeep::Counters g_bk_counters;
+
+Bookkeep::Mode BkHandoverMode() {
+	return static_cast<Bookkeep::Mode>(g_bk_handover.Get());
+}
+Bookkeep::Mode BkAdoptMode() {
+	return static_cast<Bookkeep::Mode>(g_bk_adopt.Get());
+}
+Bookkeep::Mode BkRecordMode() {
+	return static_cast<Bookkeep::Mode>(g_bk_record.Get());
+}
+Bookkeep::Mode BkLeanMode() {
+	return static_cast<Bookkeep::Mode>(g_bk_lean.Get());
+}
+Bookkeep::Counters& BkCounters() {
+	return g_bk_counters;
+}
+
 static std::atomic<bool (*)()> g_service_commands_pending {nullptr};
 
 void SetServiceCommandsPending(bool (*pending)()) {
@@ -1957,9 +1983,10 @@ void ApplyAdaptMode(int64_t /*previous*/, int64_t value) {
 } // namespace
 
 Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
-               std::function<void()> after_commit)
+               void (*after_commit)(void*), void* after_commit_context)
     : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
-      m_after_commit(std::move(after_commit)), m_inline_slot(std::make_unique<Slot>()) {
+      m_after_commit(after_commit), m_after_commit_context(after_commit_context),
+      m_inline_slot(std::make_unique<Slot>()) {
 	if (RepeatTrace::Enabled()) {
 		RepeatTrace::SetRenderContext(&m_renderer);
 	}
@@ -2200,26 +2227,24 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	EXIT_IF(m_workers == nullptr || m_workers->window.Empty() ||
 	        m_workers->window.Head() != position);
-	const std::function<void(Slot&)> patch = [submit_id, instance_count](Slot& slot) {
-		slot.submit_id = submit_id;
-		if (instance_count != UINT32_MAX) {
-			if (slot.kind == DrawKind::Index) {
-				slot.index_args.instance_count = instance_count;
-			} else {
-				slot.auto_args.instance_count = instance_count;
-			}
-		}
-	};
+	const HeadPatch patch {submit_id, instance_count};
 	CommitHead(&patch);
 }
 
-void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
+void Engine::CommitHead(const HeadPatch* patch) {
 	auto& slot = ReadyHead();
 	// A dispatch slot is only ever taken by its own op (ExecuteDispatch).
 	EXIT_IF(slot.kind == DrawKind::Dispatch);
 	if (patch != nullptr) {
 		// The preparation (and the preparing thread's reads of the slot) is complete.
-		(*patch)(slot);
+		slot.submit_id = patch->submit_id;
+		if (patch->instance_count != UINT32_MAX) {
+			if (slot.kind == DrawKind::Index) {
+				slot.index_args.instance_count = patch->instance_count;
+			} else {
+				slot.auto_args.instance_count = patch->instance_count;
+			}
+		}
 	}
 	Commit(slot);
 	m_workers->window.Retire();
@@ -2233,6 +2258,36 @@ Engine::Slot& Engine::ReadyHead() {
 	EXIT_IF(Speculative());
 	auto& slot = window.HeadPayload();
 	CommitStats::StepMark(CommitStats::Step::GapDrawOp);
+	// KYTY_BK_HANDOVER (bookkeep.h): a head inside the ready run was seen finished already.
+	const auto handover = static_cast<Bookkeep::Mode>(g_bk_handover.Get());
+	m_bk_run_head       = false;
+	if (handover != Bookkeep::Mode::Off) {
+		g_bk_counters.Add(g_bk_counters.heads);
+		if (m_ready_run.Covers(window.Head())) {
+			bool ready = true;
+			if (handover == Bookkeep::Mode::Verify) {
+				// The per-draw protocol: the head's state word says Done for this position.
+				g_bk_counters.Add(g_bk_counters.handover_checks);
+				ready = window.HeadDone();
+				if (!ready) {
+					Bookkeep::ReportMismatch(g_bk_counters.handover_mismatches, "handover", "head not done");
+					m_ready_run.Reset();
+				}
+			}
+			if (ready) {
+				auto& prep_stats = PrepStats::g_commit;
+				prep_stats.heads++;
+				prep_stats.ready++;
+				prep_stats.occupancy += window.Occupancy();
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
+				g_bk_counters.Add(g_bk_counters.run_heads);
+				m_bk_run_head = true;
+				CommitStats::StepMark(CommitStats::Step::GapHead);
+				PrefetchAhead();
+				return slot;
+			}
+		}
+	}
 	const auto stats_start = CommitStats::Now();
 	auto&      prep_stats  = PrepStats::g_commit;
 	const auto head_tsc    = PrepStats::Tsc();
@@ -2388,7 +2443,24 @@ Engine::Slot& Engine::ReadyHead() {
 		}
 		prep_stats.wait_tsc += PrepStats::Tsc() - head_tsc;
 	}
+	if (handover != Bookkeep::Mode::Off) {
+		// The head is ready: note the finished positions after it (one acquire load each), up to
+		// a segment's cap (32 draws).
+		constexpr uint32_t ReadyRunCap = 32;
+		const auto positions = m_ready_run.Extend(window.Head(), window.Tail(), ReadyRunCap,
+		                                          [&window](uint64_t seq) { return window.DoneAt(seq); });
+		if (positions != 0) {
+			g_bk_counters.Add(g_bk_counters.runs);
+			g_bk_counters.Add(g_bk_counters.run_positions, positions);
+		}
+	}
 	CommitStats::StepMark(CommitStats::Step::GapHead);
+	PrefetchAhead();
+	return slot;
+}
+
+void Engine::PrefetchAhead() {
+	auto& window = m_workers->window;
 	if (const auto mode = g_cert_prefetch.Get(); mode != 0) {
 		// KYTY_CERT_PREFETCH, a two-step pipeline: the position after next gets its state word and
 		// certificate header lines prefetched; the next one (whose lines the previous commit
@@ -2403,7 +2475,6 @@ Engine::Slot& Engine::ReadyHead() {
 			PrefetchCertificate(window.PayloadAt(head + 1u).prepared, mode);
 		}
 	}
-	return slot;
 }
 
 bool Engine::IndirectEnabled() {
@@ -2781,6 +2852,20 @@ void PrintDrawPrepSummary() {
 		// KYTY_SPEC_SEGMENTS: totals since the start (segment.h FormatLine).
 		std::printf("%s\n", Segment::FormatLine(g_segment_counters, mode == Segment::Mode::Verify ? "verify" : "on").c_str());
 	}
+	{
+		// KYTY_BK_* (bookkeep.h): totals since the start, while any part is on or has counted.
+		const auto handover = BkHandoverMode();
+		const auto adopt    = BkAdoptMode();
+		const auto record   = BkRecordMode();
+		const auto lean     = BkLeanMode();
+		const auto& c       = g_bk_counters;
+		if (handover != Bookkeep::Mode::Off || adopt != Bookkeep::Mode::Off || record != Bookkeep::Mode::Off ||
+		    lean != Bookkeep::Mode::Off || c.heads.load(std::memory_order_relaxed) != 0 ||
+		    c.adopted.load(std::memory_order_relaxed) != 0 || c.record_checks.load(std::memory_order_relaxed) != 0 ||
+		    c.lean_rendering.load(std::memory_order_relaxed) != 0) {
+			std::printf("%s\n", Bookkeep::FormatLine(c, handover, adopt, record, lean).c_str());
+		}
+	}
 	if (BindingParts() != 0) {
 		// KYTY_DRAW_PREP_BINDINGS: how many committed plans carried a pipeline the commit could use.
 		auto&           totals = GetBindingTotals();
@@ -2853,6 +2938,10 @@ void Engine::Commit(Slot& slot) {
 	} else {
 		executor.DrawAuto(slot.submit_id, scheduler.Current(), slot.auto_args);
 	}
+	if (m_bk_run_head && executor.m_bk_kernel_taken) {
+		g_bk_counters.Add(g_bk_counters.run_kernel);
+	}
+	executor.m_bk_kernel_taken = false;
 	if (segments) {
 		static Segment::SegmentTracker tracker; // (the commit thread only)
 		if (executor.m_segment_validated) {
@@ -2893,8 +2982,8 @@ void Engine::Commit(Slot& slot) {
 		RepeatTrace::OnDraw(record);
 	}
 	scheduler.RestoreRegisters(previous);
-	if (m_after_commit) {
-		m_after_commit();
+	if (m_after_commit != nullptr) {
+		m_after_commit(m_after_commit_context);
 	}
 	CommitStats::EndDraw();
 	PrintDrawPrepSummary();

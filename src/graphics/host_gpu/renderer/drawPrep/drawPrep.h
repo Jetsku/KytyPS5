@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWPREP_H_
 
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/bookkeep.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/drawPrep/segment.h"
@@ -99,6 +100,12 @@ void               SetServiceCommandsPending(bool (*pending)());
 // thread encoded for a continuation the kernel takes, 2 verify.
 [[nodiscard]] Segment::Mode     SpecSegmentsMode();
 [[nodiscard]] Segment::Counters& SegmentCounters();
+// KYTY_BK_HANDOVER / KYTY_BK_ADOPT / KYTY_BK_RECORD / KYTY_BK_LEAN (live, default 0; bookkeep.h).
+[[nodiscard]] Bookkeep::Mode      BkHandoverMode();
+[[nodiscard]] Bookkeep::Mode      BkAdoptMode();
+[[nodiscard]] Bookkeep::Mode      BkRecordMode();
+[[nodiscard]] Bookkeep::Mode      BkLeanMode();
+[[nodiscard]] Bookkeep::Counters& BkCounters();
 
 // The register state a draw reads, copied when the draw packet is parsed.
 struct RegisterSnapshot {
@@ -284,8 +291,9 @@ public:
 	// idle-GPU early submit). Commits happen at packet boundaries (before a fence packet or a
 	// service command, at the end of a slice) or at the start of a draw packet, before the
 	// packet records anything, so a flush there splits no packet.
+	// The hook is a direct call (`after_commit(after_commit_context)`), not a std::function.
 	Engine(RenderContext& renderer, std::function<void()> service_commands,
-	       std::function<void()> after_commit);
+	       void (*after_commit)(void*), void* after_commit_context);
 	~Engine();
 	Engine(const Engine&)            = delete;
 	Engine& operator=(const Engine&) = delete;
@@ -411,11 +419,18 @@ private:
 	struct Workers;
 
 	void Commit(Slot& slot);
+	// P3b: what the resolver knows only at commit (CommitPublished).
+	struct HeadPatch {
+		uint64_t submit_id      = 0;
+		uint32_t instance_count = UINT32_MAX; // UINT32_MAX: keep the slot's
+	};
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
-	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
+	void CommitHead(const HeadPatch* patch = nullptr);
 	// The head slot once prepared (by a worker, or here); the caller commits or uses it, then
 	// retires it.
 	Slot& ReadyHead();
+	// KYTY_CERT_PREFETCH: the hints for the next positions once the head is ready.
+	void PrefetchAhead();
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,
@@ -424,7 +439,11 @@ private:
 	RenderContext&           m_renderer;
 	Mode                     m_mode;
 	std::function<void()>    m_service_commands;
-	std::function<void()>    m_after_commit;
+	void (*m_after_commit)(void*) = nullptr;
+	void*                    m_after_commit_context = nullptr;
+	// KYTY_BK_HANDOVER: positions the commit thread has seen finished (bookkeep.h).
+	Bookkeep::ReadyRun       m_ready_run;
+	bool                     m_bk_run_head = false; // the head being committed came from the run
 	std::unique_ptr<Slot>    m_inline_slot;
 	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
 	uint64_t                 m_draws_since_fence = 0;

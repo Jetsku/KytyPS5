@@ -1075,7 +1075,7 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 		    },
 		    // After each committed (recorded) draw, with the live registers bound again: the
 		    // idle-GPU early submit counts recorded draws, exactly as after a serial draw.
-		    [this] { MaybeFlushIdleGpu(); }));
+		    [](void* self) { static_cast<CommandProcessor*>(self)->MaybeFlushIdleGpu(); }, this));
 	}
 	return m_draw_prep.get();
 }

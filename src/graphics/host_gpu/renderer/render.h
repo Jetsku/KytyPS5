@@ -1814,6 +1814,9 @@ private:
 	} m_kernel_record;
 	bool m_kernel        = false; // KYTY_CONT_KERNEL=1: the committed draw takes the kernel
 	bool m_kernel_verify = false; // KYTY_CONT_KERNEL=2: the committed draw would have
+	// KYTY_BK_HANDOVER (drawPrep/bookkeep.h): the committed draw was a kernel continuation (the
+	// engine reads and clears it for the run counters).
+	bool m_bk_kernel_taken = false;
 	// KYTY_CP_COMMIT_STATS: the kernel's outcome for the committed draw (Taken is m_kernel itself).
 	CommitStats::KernelOutcome    m_stats_kernel    = CommitStats::KernelOutcome::Off;
 	CommitStats::CandidateOutcome m_stats_candidate = CommitStats::CandidateOutcome::NotReached;
