@@ -1013,6 +1013,39 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
 }
 
+} // namespace
+
+bool MayContainAmdInstruction(const uint8_t* begin, const uint8_t* end) {
+	// The forms CollectAmdInstructions takes: VRSQRTPS xmm, xmm (VEX.128 map 0F, no SIMD prefix,
+	// register operand), EXTRQ/INSERTQ on XMM registers, RDPID on a register, CLWB on memory.
+	const auto register_form = [](uint8_t modrm) { return modrm >= 0xc0u; };
+	for (const uint8_t* p = begin; p < end; ++p) {
+		const auto left = end - p;
+		if (*p == 0xc5) {
+			if (left > 3 && (p[1] & 0x07u) == 0 && p[2] == 0x52 && register_form(p[3])) {
+				return true;
+			}
+		} else if (*p == 0xc4) {
+			if (left > 4 && (p[1] & 0x1fu) == 1 && (p[2] & 0x07u) == 0 && p[3] == 0x52 &&
+			    register_form(p[4])) {
+				return true;
+			}
+		} else if (*p == 0x0f && left > 2) {
+			const uint8_t opcode = p[1];
+			const uint8_t modrm  = p[2];
+			const uint8_t reg    = (modrm >> 3u) & 7u;
+			if (((opcode == 0x78 || opcode == 0x79) && register_form(modrm)) ||
+			    (opcode == 0xc7 && reg == 7 && register_form(modrm)) ||
+			    (opcode == 0xae && reg == 6 && !register_form(modrm))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+namespace {
+
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                             GuestInstructionPatchResult&             result,
@@ -1694,18 +1727,35 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif
+	// A function's bytes: from its start to the next function's (empty: none).
+	const auto function_range = [&](size_t function_index) {
+		const uintptr_t function_start = starts[function_index];
+		const uintptr_t function_end =
+		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
+		return std::pair {function_start, std::max(function_start, function_end)};
+	};
+	// Only the AMD instructions are collected without red-zone protection. They lie inside the
+	// function (decoding stops at its end), so a function without their opcode bytes has no
+	// rewrite site: decoding it would only add to the instruction counters, which only the red-zone
+	// report prints. Astro Bot: 4.7k of its 312697 functions remain.
+	const auto may_have_sites = [&](uintptr_t function_start, uintptr_t function_end) {
+		return protect_memory ||
+		       MayContainAmdInstruction(reinterpret_cast<const uint8_t*>(function_start),
+		                                reinterpret_cast<const uint8_t*>(function_end));
+	};
 	// Decodes and analyzes one function and collects its rewrite sites. Reads guest code only.
 	const auto analyze = [&](size_t function_index, GuestInstructionPatchResult& counts,
 	                         DecodedFunction&                         function,
 	                         std::map<uintptr_t, InstructionRewrite>& rewrite_sites) -> bool {
-		const uintptr_t function_start = starts[function_index];
-		const uintptr_t function_end =
-		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
-		if (function_end <= function_start) {
+		const auto [function_start, function_end] = function_range(function_index);
+		if (function_end == function_start) {
 			return false;
 		}
 
 		++counts.function_count;
+		if (!may_have_sites(function_start, function_end)) {
+			return true;
+		}
 		// Jump tables usually sit in a read-only data segment, not in the code segment.
 		function = DecodeFunction(function_start, function_end,
 		                          reinterpret_cast<uintptr_t>(module->start),
@@ -1739,10 +1789,11 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 
 	// Decoding every function to find the few with rewrite sites is the costly part: Astro Bot's
 	// 252 MB eboot.bin took ~9 s at boot on one emulated core. Scan the functions on several
-	// threads first. The functions with rewrite sites are then decoded again and patched in address
-	// order on this thread, exactly as a single-threaded pass does: patching a function writes only
-	// inside that function and the module's trampolines, so the scan and the second decode see the
-	// same code bytes, and the other functions only add to the counters.
+	// threads first: without red-zone protection only through the opcode filter, with it by decoding
+	// them. The functions left (that may have, or have, rewrite sites) are then decoded on the
+	// workers and patched in address order on this thread, exactly as a single-threaded pass does:
+	// patching a function writes only inside that function and the module's trampolines, so the
+	// scan and the decode see the same code bytes, and the other functions only add to the counters.
 	const size_t forced_threads = g_patch_scan_threads.load();
 	const size_t scan_threads =
 	    forced_threads != 0 ? forced_threads
@@ -1755,13 +1806,22 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	} else {
 		std::atomic<size_t>                      next_function {0};
 		std::vector<GuestInstructionPatchResult> scan_counts(scan_threads);
-		std::vector<std::vector<size_t>>         scan_sites(scan_threads);
+		std::vector<std::vector<size_t>>         scan_candidates(scan_threads);
 		const auto                               scan = [&](size_t worker) {
 			constexpr size_t Batch = 64;
 			for (size_t begin = next_function.fetch_add(Batch); begin < starts.size();
 			     begin        = next_function.fetch_add(Batch)) {
 				for (size_t function_index = begin;
 				     function_index < std::min(begin + Batch, starts.size()); ++function_index) {
+					if (!protect_memory) {
+						const auto [function_start, function_end] = function_range(function_index);
+						if (may_have_sites(function_start, function_end)) {
+							scan_candidates[worker].push_back(function_index);
+						} else if (function_end != function_start) {
+							++scan_counts[worker].function_count;
+						}
+						continue;
+					}
 					GuestInstructionPatchResult             counts {};
 					DecodedFunction                         function;
 					std::map<uintptr_t, InstructionRewrite> rewrite_sites;
@@ -1769,7 +1829,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 					if (rewrite_sites.empty()) {
 						AddPatchCounts(scan_counts[worker], counts);
 					} else {
-						scan_sites[worker].push_back(function_index);
+						scan_candidates[worker].push_back(function_index);
 					}
 				}
 			}
@@ -1782,75 +1842,85 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		for (auto& worker: workers) {
 			worker.join();
 		}
-		std::vector<size_t> functions_with_sites;
+		std::vector<size_t> candidates;
 		for (size_t worker = 0; worker < scan_threads; ++worker) {
 			AddPatchCounts(result, scan_counts[worker]);
-			functions_with_sites.insert(functions_with_sites.end(), scan_sites[worker].begin(),
-			                            scan_sites[worker].end());
+			candidates.insert(candidates.end(), scan_candidates[worker].begin(),
+			                  scan_candidates[worker].end());
 		}
-		std::ranges::sort(functions_with_sites);
-		// Decoding them again on this thread took as long as the whole scan (Astro Bot: 4643 large
-		// functions, 1.26 s). The workers decode them again, at most Window functions ahead of this
-		// thread, which patches them in address order as before; a decoded function holds about
+		std::ranges::sort(candidates);
+		// Decoding them on this thread took as long as the whole scan (Astro Bot: 4643 large
+		// functions with sites, 1.26 s). The workers decode them, at most Window functions ahead of
+		// this thread, which patches them in address order as before; a decoded function holds about
 		// 1 KiB per instruction, so the window bounds the memory.
 		struct DecodedSites {
 			GuestInstructionPatchResult             counts {};
 			DecodedFunction                         function;
 			std::map<uintptr_t, InstructionRewrite> rewrite_sites;
-			bool                                    ready = false;
+			size_t                                  worker = 0;
 		};
-		constexpr size_t                   Window = 64;
-		std::vector<DecodedSites>          decoded(Window);
-		std::mutex                         decoded_mutex;
-		std::condition_variable            decoded_changed;
-		size_t                             next_decode = 0;
-		size_t                             patched     = 0;
-		const auto                         decode      = [&] {
+		// decoded[i % Window]: candidate i once a worker decoded it. A patched function goes back
+		// to the worker that decoded it (consumed), which frees it: freeing another thread's decode
+		// cost the patching thread 0.9 s for Astro Bot, and the decoding threads contend less.
+		constexpr size_t                                         Window = 64;
+		std::vector<std::unique_ptr<DecodedSites>>               decoded(Window);
+		std::vector<std::vector<std::unique_ptr<DecodedSites>>> consumed(scan_threads);
+		std::mutex                                               decoded_mutex;
+		std::condition_variable                                  decoded_changed;
+		size_t                                                   next_decode = 0;
+		size_t                                                   patched     = 0;
+		const auto                                               decode = [&](size_t worker) {
+			std::vector<std::unique_ptr<DecodedSites>> patched_functions;
 			for (;;) {
-				size_t site_index = 0;
+				size_t candidate_index = 0;
 				{
 					std::unique_lock decoded_lock(decoded_mutex);
+					patched_functions.swap(consumed[worker]);
 					decoded_changed.wait(decoded_lock, [&] {
-						return next_decode >= functions_with_sites.size() ||
+						return next_decode >= candidates.size() ||
 						       next_decode < patched + Window;
 					});
-					if (next_decode >= functions_with_sites.size()) {
+					if (next_decode >= candidates.size()) {
 						return;
 					}
-					site_index = next_decode++;
+					candidate_index = next_decode++;
 				}
-				auto& slot = decoded[site_index % Window];
-				// The previous function of this slot is freed here, not on the patching thread:
-				// freeing a decode another thread allocated cost it 0.9 s for Astro Bot.
-				slot = DecodedSites {};
-				analyze(functions_with_sites[site_index], slot.counts, slot.function,
-				        slot.rewrite_sites);
+				patched_functions.clear();
+				auto function    = std::make_unique<DecodedSites>();
+				function->worker = worker;
+				analyze(candidates[candidate_index], function->counts, function->function,
+				        function->rewrite_sites);
 				{
 					std::lock_guard decoded_lock(decoded_mutex);
-					slot.ready = true;
+					decoded[candidate_index % Window] = std::move(function);
 				}
 				decoded_changed.notify_all();
 			}
 		};
 		workers.clear();
 		for (size_t worker = 1; worker < scan_threads; ++worker) {
-			workers.emplace_back(decode);
+			workers.emplace_back(decode, worker);
 		}
-		for (size_t site_index = 0; site_index < functions_with_sites.size(); ++site_index) {
-			auto& slot = decoded[site_index % Window];
+		for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+			std::unique_ptr<DecodedSites> function;
 			{
 				std::unique_lock decoded_lock(decoded_mutex);
-				decoded_changed.wait(decoded_lock, [&] { return slot.ready; });
+				auto&            slot = decoded[candidate_index % Window];
+				decoded_changed.wait(decoded_lock, [&] { return slot != nullptr; });
+				function = std::move(slot);
 			}
-			AddPatchCounts(result, slot.counts);
-			RejectionMap rejections;
-			RelocateGuestInstructions(module, slot.function, slot.rewrite_sites, rejections, result);
-			TrapUnrelocatedInstructions(*module, slot.function, slot.rewrite_sites, rejections,
-			                            result);
+			AddPatchCounts(result, function->counts);
+			if (!function->rewrite_sites.empty()) {
+				RejectionMap rejections;
+				RelocateGuestInstructions(module, function->function, function->rewrite_sites,
+				                          rejections, result);
+				TrapUnrelocatedInstructions(*module, function->function, function->rewrite_sites,
+				                            rejections, result);
+			}
 			{
 				std::lock_guard decoded_lock(decoded_mutex);
-				slot.ready = false;
-				patched    = site_index + 1;
+				consumed[function->worker].push_back(std::move(function));
+				patched = candidate_index + 1;
 			}
 			decoded_changed.notify_all();
 		}

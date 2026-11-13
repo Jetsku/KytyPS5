@@ -27,7 +27,8 @@ constexpr size_t FunctionCount   = 2048;
 constexpr size_t CodeSize        = FunctionSize * FunctionCount;
 constexpr size_t TrampolineSize  = 1024 * 1024;
 
-// 2048 small functions; every 7th uses VRSQRTPS, every 11th EXTRQ, every 13th INSERTQ.
+// 2048 small functions; every 7th uses VRSQRTPS, every 11th EXTRQ, every 13th INSERTQ, every 17th
+// MFENCE (CLWB's opcode, register form: filtered out).
 std::vector<uint8_t> MakeCode() {
 	std::vector<uint8_t> code(CodeSize, 0xcc);
 	for (size_t i = 0; i < FunctionCount; ++i) {
@@ -39,6 +40,8 @@ std::vector<uint8_t> MakeCode() {
 			body = {0x66, 0x0f, 0x78, 0xc0, 0x04, 0x08, 0xc3};  // extrq xmm0, 4, 8; ret
 		} else if (i % 13 == 0) {
 			body = {0x90, 0xf2, 0x0f, 0x79, 0xc1, 0xc3};        // nop; insertq xmm0, xmm1; ret
+		} else if (i % 17 == 0) {
+			body = {0x0f, 0xae, 0xf0, 0xc3};                    // mfence; ret (0F AE /6, no site)
 		} else {
 			body = {0xb8, static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 8), 0x00, 0x00, 0xc3};  // mov eax, i; ret
 		}
@@ -91,6 +94,42 @@ bool SameResult(const Loader::GuestInstructionPatchResult& a, const Loader::Gues
 	       SameCounts(a.insertq, b.insertq) && SameCounts(a.rdpid, b.rdpid) && SameCounts(a.clwb, b.clwb);
 }
 
+void CheckByteFilter() {
+	struct Case {
+		std::vector<uint8_t> bytes;
+		bool                 match;
+		const char*          name;
+	};
+	const std::array<Case, 19> cases {{
+	    {{0xc5, 0xf8, 0x52, 0xc1}, true, "vrsqrtps xmm0, xmm1"},
+	    {{0xc4, 0x41, 0x78, 0x52, 0xc1}, true, "vrsqrtps xmm8, xmm9 (3-byte VEX)"},
+	    {{0x66, 0x0f, 0x78, 0xc0, 0x04, 0x08}, true, "extrq xmm0, 4, 8"},
+	    {{0x66, 0x41, 0x0f, 0x79, 0xc1}, true, "extrq xmm0, xmm9 (REX)"},
+	    {{0xf2, 0x0f, 0x79, 0xc1}, true, "insertq xmm0, xmm1"},
+	    {{0xf2, 0x0f, 0x78, 0xc1, 0x04, 0x08}, true, "insertq xmm0, xmm1, 4, 8"},
+	    {{0xf3, 0x0f, 0xc7, 0xf8}, true, "rdpid rax"},
+	    {{0x66, 0x0f, 0xae, 0x30}, true, "clwb [rax]"},
+	    {{0x66, 0x41, 0x0f, 0xae, 0x74, 0x24, 0x08}, true, "clwb [r12+8] (REX, SIB)"},
+	    {{0xc5, 0xf8, 0x52, 0x00}, false, "vrsqrtps xmm0, [rax] (memory form, not rewritten)"},
+	    {{0xc5, 0xfc, 0x52, 0xc1}, false, "vrsqrtps ymm0, ymm1 (VEX.256, not rewritten)"},
+	    {{0xc5, 0xfa, 0x52, 0xc1}, false, "vrsqrtss xmm0, xmm0, xmm1"},
+	    {{0x0f, 0xae, 0xf0}, false, "mfence"},
+	    {{0x0f, 0xae, 0xe8}, false, "lfence"},
+	    {{0x0f, 0xc7, 0xf0}, false, "rdrand eax"},
+	    {{0x52, 0xc3}, false, "push rdx; ret"},
+	    {{0xb8, 0x52, 0x00, 0x00, 0x00}, false, "mov eax, 0x52"},
+	    {{0x90, 0xc5, 0xf8, 0x52}, false, "VEX instruction cut off by the end"},
+	    {{0x0f}, false, "escape byte at the end"},
+	}};
+	for (const auto& c: cases) {
+		const bool match = Loader::MayContainAmdInstruction(c.bytes.data(), c.bytes.data() + c.bytes.size());
+		if (match != c.match) {
+			std::fprintf(stderr, "GuestInstructionPatchScanTests: byte filter %s for %s\n",
+			             match ? "matches" : "misses", c.name);
+			g_failures++;
+		}
+	}
+}
 } // namespace
 
 int main() {
@@ -100,11 +139,18 @@ int main() {
 	if (area == MAP_FAILED) {
 		return 1;
 	}
+	CheckByteFilter();
 	const auto code   = MakeCode();
 	const Run  serial = Patch(area, code, 1);
 	Check(serial.result.function_count == FunctionCount, "every function is scanned");
 	Check(serial.result.reciprocal_sqrt.found == (FunctionCount + 6) / 7, "every VRSQRTPS is found");
-	Check(serial.result.extrq.found != 0 && serial.result.insertq.found != 0, "EXTRQ and INSERTQ are found");
+	size_t extrq = 0, insertq = 0;
+	for (size_t i = 0; i < FunctionCount; ++i) {
+		extrq += i % 7 != 0 && i % 11 == 0;
+		insertq += i % 7 != 0 && i % 11 != 0 && i % 13 == 0;
+	}
+	Check(serial.result.extrq.found == extrq && serial.result.insertq.found == insertq,
+	      "every EXTRQ and INSERTQ is found");
 	Check(serial.code != code, "the serial pass patches the code");
 	for (const size_t threads: std::array<size_t, 3> {2, 5, 16}) {
 		const Run parallel = Patch(area, code, threads);
