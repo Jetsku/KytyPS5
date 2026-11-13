@@ -1238,6 +1238,27 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
 		    "displaying PQ video-out pixels unchanged.\n");
 	}
+	{
+		// KYTY_FLIP_LOG=1: log the first 40 flips, then every 300th (index, special, surface).
+		static const bool flip_log = [] {
+			const char* v = std::getenv("KYTY_FLIP_LOG");
+			return v != nullptr && v[0] == '1';
+		}();
+		static std::atomic<uint64_t> flip_count {0};
+		const uint64_t               n = flip_count.fetch_add(1, std::memory_order_relaxed);
+		if (flip_log && (n < 40 || n % 300 == 0)) {
+			char flip_buf[320];
+			std::snprintf(flip_buf, sizeof(flip_buf),
+			    "FlipLog #%" PRIu64 ": id=%" PRIu64 " index=%d special=%d headset=%d %ux%u "
+			    "addr=0x%016" PRIx64 " size=0x%" PRIx64 " fmt=%d hdr=%d\n",
+			    n, request_id, index, special ? 1 : 0, headset ? 1 : 0,
+			    special ? width : source_info.extent.width,
+			    special ? height : source_info.extent.height, special ? 0 : source_info.data.address,
+			    special ? 0 : source_info.data.size, special ? -1 : static_cast<int>(source_info.pixel_format),
+			    hdr ? 1 : 0);
+			Log::WriteToConsoleAndLog(flip_buf);
+		}
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
