@@ -3324,13 +3324,12 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
 		return {};
 	}
-	if (!m_flip_wait_suspended) {
-		// First evaluation of this packet: submit everything recorded before it (as the
-		// blocking form did); retries have nothing new to submit.
-		BufferFlush();
-	}
 	if (m_renderer.GetVideoOut().IsFlipPending(handle, index)) {
 		if (!m_flip_wait_suspended) {
+			// The queue suspends: submit everything recorded before this packet first, so the GPU
+			// runs it meanwhile; retries have nothing new to submit. A flip already done needs no
+			// submission (it would only end the active rendering instance).
+			BufferFlush();
 			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
 		}
 		m_flip_wait_suspended = true;
