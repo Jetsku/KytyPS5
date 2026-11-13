@@ -4761,7 +4761,38 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	if (!m_run_active) {
 		DrawRunKeep();
 	}
-	auto& run            = m_run;
+	auto& run = m_run;
+	// KYTY_BK_RECORD (drawPrep/bookkeep.h): a kernel continuation of the record (same key, no pipeline
+	// swap or texture delta) proved activity, command buffer, tick and rendering instance equal to the
+	// record's (DrawRunCandidate; the late check keeps the command and images); only the descriptor
+	// epoch moves with its push. Verify: those fields are compared with the full update's values.
+	if (const auto record_mode = DrawPrep::BkRecordMode();
+	    record_mode != DrawPrep::Bookkeep::Mode::Off && m_run_active) {
+		auto& bk = DrawPrep::BkCounters();
+		if (!m_kernel || m_run_pipeswap || m_run_texdelta) {
+			bk.Fall(DrawPrep::Bookkeep::Fallback::RecordNotKernel);
+		} else if (record_mode == DrawPrep::Bookkeep::Mode::On) {
+			run.key         = m_run_key;
+			run.targets_key = m_run_targets_key;
+			run.swap_key    = m_run_swap_key;
+			run.texfree_key = m_run_texfree_key;
+			run.push_epoch  = buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics);
+			run.valid       = true;
+			bk.Add(bk.record_lean);
+			return;
+		} else {
+			bk.Add(bk.record_checks);
+			const char* field = run.key != m_run_key                                          ? "key"
+			                    : run.activity != DrawRun::ActivityEpoch()                    ? "activity"
+			                    : run.command != buffer.Identity()                            ? "command"
+			                    : run.tick != m_context.GetCommandScheduler().CurrentTick()   ? "tick"
+			                    : run.rendering_serial != buffer.ActiveRenderingSerial()      ? "rendering_serial"
+			                                                                                  : nullptr;
+			if (field != nullptr) {
+				DrawPrep::Bookkeep::ReportMismatch(bk.record_mismatches, "record", field);
+			}
+		}
+	}
 	run.key              = m_run_key;
 	run.targets_key      = m_run_targets_key;
 	run.swap_key         = m_run_swap_key;
