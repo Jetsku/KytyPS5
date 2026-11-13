@@ -49,7 +49,8 @@ uint64_t PsrTranslate(uint64_t guest) {
 		return guest;
 	}
 	uint64_t page = (guest >> PSR_PAGE_BITS) - g_page_first;
-	return PsrPageTable(g_page_table).page[uint(page)] +
+	// Bit 0 of an entry is the KYTY_BDA_ACCESS_TAGS accessed tag (BufferCache::BDA_ACCESSED).
+	return (PsrPageTable(g_page_table).page[uint(page)] & ~1ul) +
 	       (guest & ((1ul << PSR_PAGE_BITS) - 1ul));
 }
 

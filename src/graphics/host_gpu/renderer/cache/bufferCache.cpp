@@ -1353,6 +1353,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
+		ApplyBdaTags(pages.first, addresses, true); // KYTY_BDA_ACCESS_TAGS
 		EnsureBdaTableResident(pages.first, size_pages);
 		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
@@ -1721,6 +1722,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_bda_sparse = std::make_unique<SparsePageTable>(m_graphics, m_bda_pagetable_buffer.Handle(),
 		                                                 BDA_PAGETABLE_ALLOCATION);
 	}
+	CreateBdaTags(); // KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp)
 	// Buffers have their own switches: shaders reach guest memory through BDA pointers without a
 	// binding, which never touches a buffer's LRU entry, so "unused for N frames" can be wrong for a
 	// buffer only BDA code reads (its draws then fault until the buffer is recreated). The image

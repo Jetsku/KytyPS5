@@ -104,6 +104,12 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.srt_variant_reads ? 1u : 0u);
 	b.U8(options.srt_image_reach ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
+	if (options.bda_access_tags) {
+		b.Text("bda_access_tags"); // absent when off: fingerprints unchanged
+		if (options.bda_tags_gpu_count) {
+			b.Text("bda_tags_gpu_count");
+		}
+	}
 	b.U8(options.movrel_known_zeros ? 1u : 0u);
 	b.U8(options.movrel_switch ? 1u : 0u);
 	b.U8(options.uniform_lane_reads ? 1u : 0u);

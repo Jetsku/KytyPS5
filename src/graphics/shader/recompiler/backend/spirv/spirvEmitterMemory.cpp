@@ -193,6 +193,19 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
+// KYTY_BDA_TAGS_GPU_COUNT: one count in word BDA_TAG_COUNTER_WORD + index of the fault buffer.
+void CountBdaTagEvent(EmitterState& state, uint32_t index) {
+	if (!GetCodegenOptions().bda_tags_gpu_count) {
+		return;
+	}
+	const auto pointer = FaultElementPointer(
+	    state, ConstantU32(state, static_cast<uint32_t>(BufferCache::BDA_TAG_COUNTER_WORD + index)));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), result, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1));
+}
+
 uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 	auto&      state  = ctx.state;
 	const auto result = state.builder.AllocateId();
@@ -3029,6 +3042,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                          spv::FunctionControlMaskNone, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
+	CountBdaTagEvent(state, 0);
 
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, address,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
@@ -3057,19 +3071,36 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, fault_label);
 	EmitIfCondition(state, in_table, [&]() { RecordBdaFault(state, page); });
+	CountBdaTagEvent(state, 1);
 	const auto fault_exit = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);
 	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
 	                              ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
+	auto       available = Binary(state, spv::OpIAdd, type, base, offset);
+	if (GetCodegenOptions().bda_access_tags) {
+		// KYTY_BDA_ACCESS_TAGS (based on upstream KytyPS5 0ec2cd5d5): a backed page without the
+		// accessed tag is read as it is on the GPU and reported once through the fault bitmap; the
+		// host then tags it and synchronizes it from then on (bufferCacheTags.cpp).
+		const auto tag = Binary(state, spv::OpBitwiseAnd, type, base,
+		                        ConstantU64(state, BufferCache::BDA_ACCESSED));
+		EmitIfCondition(state,
+		                Binary(state, spv::OpIEqual, TypeBool(state), tag, ConstantU64(state, 0)),
+		                [&]() {
+			                RecordBdaFault(state, page);
+			                CountBdaTagEvent(state, 2);
+		                });
+		available = Binary(state, spv::OpISub, type, available, tag);
+		BufferCache::s_tag_hops.programs.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto available_exit = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, type, result, ConstantDeviceAddress(state, 0),
-	                          fault_exit, available, available_label);
+	                          fault_exit, available, available_exit);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }

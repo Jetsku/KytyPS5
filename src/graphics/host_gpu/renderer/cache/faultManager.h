@@ -73,6 +73,9 @@ private:
 	std::array<std::unique_ptr<Buffer>, BdaSlots> m_bda_downloads;
 	uint32_t                                   m_bda_next_slot = 0;
 	bool                                       m_bda_region_cleared = false;
+	// KYTY_BDA_TAGS_GPU_COUNT (diagnostic): the counters' copies per area and their last values.
+	std::unique_ptr<Buffer>                    m_tag_count_download;
+	std::array<uint32_t, 3>                    m_tag_count_last {};
 };
 
 } // namespace Libs::Graphics
