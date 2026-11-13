@@ -2158,6 +2158,24 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// KYTY_DEPTH_STENCIL_ALIAS (default off; =1 on; suspected of a device loss in UFC 5, unproven): a depth allocation used alternately as D32 and as
+// D32S8 (EA SPORTS UFC 5 switches its 1068x600 depth target every frame) keeps both images alive
+// as aliases instead of recreating, copying and freeing one each switch. Copies never include the
+// stencil aspect, so the stencil image keeps its own stencil while the depth aspect is synced from
+// whichever interpretation wrote last (PS5 depth and stencil are separate planes).
+static bool DepthStencilAliasEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_DEPTH_STENCIL_ALIAS");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Whether `image` may take part in alias syncing despite a stencil aspect.
+static bool StencilAliasAllowed(const Image& image) {
+	return !image.info.HasStencil() || (DepthStencilAliasEnabled() && image.info.IsDepth());
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -2297,7 +2315,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           cached.backing.samples, replacement.backing.samples);
 	}
 	if (keep_aliases && cached.backing.samples == replacement.backing.samples &&
-	    !cached.info.HasStencil() && !replacement.info.HasStencil()) {
+	    StencilAliasAllowed(cached) && StencilAliasAllowed(replacement)) {
 		// The replacement now holds the newest contents; the cached interpretation stays alive
 		// as a non-owner alias for the next switch back.
 		if (replacement.IsGpuModified()) {
@@ -4744,7 +4762,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 
 bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
 	return !AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	       image.info.HasStencil() || image.backing.image == nullptr;
+	       !StencilAliasAllowed(image) || image.backing.image == nullptr;
 }
 
 // Whether two images at the same guest range are interpretations of the same texel grid. Same
@@ -4787,7 +4805,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	auto& image = m_slot_images[id];
 	// TextureCache::SyncAliasReturnsAtOnce mirrors this condition.
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	    image.info.HasStencil() || image.backing.image == nullptr) {
+	    !StencilAliasAllowed(image) || image.backing.image == nullptr) {
 		return;
 	}
 	// A kept alias (same memory, another format) is stale when another interpretation wrote the
@@ -4796,7 +4814,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		const auto* other = m_slot_images.try_get(other_id);
 		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
 		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
-		    other->info.HasStencil() || other->info.data != image.info.data ||
+		    !StencilAliasAllowed(*other) || other->info.data != image.info.data ||
 		    !SameAliasGrid(other->info, image.info) ||
 		    other->backing.samples != image.backing.samples) {
 			continue;
