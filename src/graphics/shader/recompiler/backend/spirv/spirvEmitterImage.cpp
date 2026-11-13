@@ -1753,19 +1753,22 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			            	const auto& candidate      = ImageResourceAt(state, resource);
 			            	const auto& candidate_info = ImageDimensionInfoFor(candidate.dimension);
 			            	EXIT_IF(candidate.numeric_class != numeric_class);
-			            	const auto components = candidate_info.coordinate_components;
-			            	uint32_t   coord      = address_words[0];
-			            	if (components > 1u) {
+			            	// A 1D candidate is a host 2D image one texel high (upstream e6cc1ce30): its host row 0
+			            	// follows x, as CoordU32 builds it for a plain read.
+			            	std::array<uint32_t, 3> words {};
+			            	uint32_t                count = 0;
+			            	words[count++]                = address_words[0];
+			            	if (candidate_info.one_dimensional) {
+			            		words[count++] = ConstantU32(state, 0);
+			            	}
+			            	for (uint32_t c = 1; c < candidate_info.coordinate_components; c++) {
+			            		words[count++] = address_words[c];
+			            	}
+			            	uint32_t coord = words[0];
+			            	if (count > 1u) {
 			            		coord = state.builder.AllocateId();
-			            		if (components == 3u) {
-			            			state.builder.AddFunction(
-			            				spv::OpCompositeConstruct, TypeU32Vector(state, 3), coord,
-			            				address_words[0], address_words[1], address_words[2]);
-			            		} else {
-			            			state.builder.AddFunction(
-			            			spv::OpCompositeConstruct, TypeU32Vector(state, 2), coord,
-			            			address_words[0], address_words[1]);
-			            		}
+			            		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, count), coord,
+			            		                          std::span(words).first(count));
 			            	}
 			            	const auto descriptor = LoadImageDescriptor(state, resource);
 			            	const auto fetched    = state.builder.AllocateId();

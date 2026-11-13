@@ -53084,6 +53084,115 @@ GraphicsCase GraphicsFrontFaceBits(bool reversed, bool all_bits) {
   return test;
 }
 
+// KYTY_SAMPLED_TABLE_READS: an IMAGE_LOAD through a GPU-selected table whose candidates are 1D
+// images. A 1D image is a host 2D image one texel high (upstream e6cc1ce30), so every candidate's
+// OpImageFetch takes (x, 0); the table path once passed x alone, an invalid module a driver crashed
+// compiling. The module must validate and fetch with 2-component coordinates.
+void CheckIndirectImageTableRead1D() {
+  constexpr const char *name = "IndirectImageTableRead1D";
+  constexpr uint32_t mapping_capacity = 1793u;
+  using namespace ShaderRecompiler::IR;
+  const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+  auto options = saved_options;
+  options.sampled_table_reads = true;
+  ShaderRecompiler::SetCodegenOptions(options);
+
+  for (const auto dimension : {ShaderRecompiler::Decoder::ImageDimension::Dim1D,
+                               ShaderRecompiler::Decoder::ImageDimension::Dim1DArray}) {
+    const bool array = dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+    Program program{};
+    program.stage = ShaderType::Compute;
+    program.wave_size = 32;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    program.shader_info_complete = true;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.block_info.push_back({.id = 0});
+
+    auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+    auto &image =
+        block->AppendNewInst(ValueOpcode::GetImageResource,
+                             {Value(&key), Value(0u), Value(0u), Value(0u),
+                              Value(0u), Value(0u), Value(0u), Value(0u)});
+    image.SetFlags<uint32_t>(0u);
+    auto &address = block->AppendNewInst(
+        ValueOpcode::MakeImageAddress,
+        {Value(3u), Value(1u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u)});
+    MemoryInfo memory{};
+    memory.kind = ResourceKind::Image;
+    memory.resource = 0;
+    memory.dmask = 0xf;
+    memory.image_dimension = dimension;
+    memory.image_address_components = array ? 2u : 1u;
+    program.memory_info.push_back(memory);
+    const MemoryFlags memory_flags{0u, 0x10f0u};
+    uint64_t memory_flag_bits = 0;
+    std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
+    auto &read = block->AppendNewInst(ValueOpcode::ImageRead,
+                                      {Value(&image), Value(&address), Value(true)},
+                                      memory_flag_bits);
+    auto &read_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                        {Value(&read), Value(0u)});
+    block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&read_x)});
+
+    program.descriptor_sources.resize(1);
+    program.descriptor_sources[0].dword_count = 8;
+    program.descriptor_sources[0].indirect_descriptor =
+        DescriptorSource::IndirectDescriptor{
+            .selector = DescriptorSource::IndirectDescriptor::SelectorRead{
+                .source = 0, .stride = 224, .offset = 12},
+            .table_source = 0, .table_stride = 32};
+
+    ImageResource root{};
+    root.source = 0;
+    root.first_use_pc = 0x10f0u;
+    root.resource_class = ImageResourceClass::Sampled;
+    root.numeric_class = Prospero::TextureNumericClass::Float;
+    root.dimension = dimension;
+    root.read = true;
+    root.indirect_root = 0;
+    root.indirect_mapping_offset = 0;
+    root.indirect_search_iterations = std::bit_width(mapping_capacity);
+    root.indirect_resources = {0u, 1u};
+    auto candidate = root;
+    candidate.indirect_search_iterations = 0;
+    candidate.indirect_resources.clear();
+    program.info.images = {root, candidate};
+
+    AllocateBindings(program);
+    ShaderComputeInputInfo compute{};
+    const auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, spirv);
+    // Every OpImageFetch coordinate is a 2-component (1D) or 3-component (1D array) vector.
+    std::unordered_map<u32, u32> vector_sizes;  // type id -> component count
+    std::unordered_map<u32, u32> value_types;   // result id -> type id
+    u32 fetches = 0;
+    bool arity_ok = true;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpTypeVector) vector_sizes[words[1]] = words[3];
+      if (opcode == spv::OpCompositeConstruct) value_types[words[2]] = words[1];
+      if (opcode == spv::OpImageFetch) {
+        fetches++;
+        const auto type = value_types.find(words[4]);
+        const auto size = type == value_types.end() ? 0u : vector_sizes[type->second];
+        arity_ok = arity_ok && size == (array ? 3u : 2u);
+      }
+      offset += words.size();
+    }
+    Require(name, array ? "1D array table fetch coordinates" : "1D table fetch coordinates",
+            fetches >= 2u && arity_ok,
+            "a table read of 1D candidates did not fetch with the host row coordinate");
+  }
+  ShaderRecompiler::SetCodegenOptions(saved_options);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPixelFrontFaceModes() {
   constexpr const char *name = "PixelFrontFaceModes";
   static const std::array<u32, 1> code = {EncodeSopp(0x01)};
@@ -63327,6 +63436,7 @@ int main(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     CheckIndirectImageKeySwitch(vulkan);
+    CheckIndirectImageTableRead1D();
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -63610,6 +63720,7 @@ int main(int argc, char **argv) {
   CheckRectListShaders();
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
+  CheckIndirectImageTableRead1D();
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
