@@ -627,6 +627,11 @@ PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 }
 
 void CheckVulkanResult(VkResult result) {
+	// A lost device is reported (with its fault diagnostics) by the queue submission path; the
+	// overlay must not exit first and hide them.
+	if (result == VK_ERROR_DEVICE_LOST) {
+		return;
+	}
 	EXIT_IF(result != VK_SUCCESS);
 }
 
