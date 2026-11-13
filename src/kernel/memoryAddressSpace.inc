@@ -118,6 +118,10 @@ static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, 
 	    [&](uint64_t start, uint64_t bytes) { gap(start, destination + (start - vaddr), bytes); });
 }
 
+// KYTY_WRITE_WATCH: bumped by every private commit and release, so a write-watch consumer can tell
+// that memory under its shadows may have been replaced without a write (QueryAndResetWrittenPages).
+static std::atomic<uint64_t> g_private_commit_generation {0};
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -1462,9 +1466,18 @@ public:
 		                           : VirtualMemory::Mode::ReadWrite;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-		                          GetProtect(host_mode), nullptr, 0);
+		// KYTY_WRITE_WATCH=1: private (flexible) commits are write-watched, so the buffer cache's
+		// hot-page sync can ask GetWriteWatch which pages were written instead of comparing them
+		// all. Direct memory is a file-mapping view (aliased by the backing view and by every
+		// guest mapping of the same offset) and cannot be write-watched.
+		static const bool write_watch = [] {
+			const char* v = std::getenv("KYTY_WRITE_WATCH");
+			return v != nullptr && std::strcmp(v, "1") == 0;
+		}();
+		auto* ptr = VirtualAlloc2(
+		    GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
+		    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (write_watch ? MEM_WRITE_WATCH : 0),
+		    GetProtect(host_mode), nullptr, 0);
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
 				VirtualFree(ptr, 0, MEM_RELEASE);
@@ -1472,6 +1485,7 @@ public:
 			AddFreeUnlocked(vaddr, size);
 			return false;
 		}
+		g_private_commit_generation.fetch_add(1, std::memory_order_acq_rel);
 		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
 		return true;
 #else
@@ -1513,6 +1527,7 @@ public:
 			RestorePlaceholder(region_vaddr, region_size);
 		}
 #endif
+		g_private_commit_generation.fetch_add(1, std::memory_order_acq_rel);
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
 		AddFreeUnlocked(vaddr, size);
 		return true;

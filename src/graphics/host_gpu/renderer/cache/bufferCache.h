@@ -754,6 +754,7 @@ private:
 	// upload of the page erases the copy.
 	struct HotShadow {
 		std::unique_ptr<uint8_t[]> data;
+		uint64_t                   hash        = 0; // XXH3 of `data` (KYTY_HOT_PAGE_HASH)
 		uint32_t                   last_change = 0;
 		uint32_t                   last_use    = 0;
 		// Uploads in a row that found the page unchanged (KYTY_HOT_PAGE_CHECK_LIMIT).
@@ -761,6 +762,18 @@ private:
 	};
 	std::map<uint64_t, HotShadow>                     m_hot_shadows;
 	std::vector<uint8_t>                              m_hot_scratch;
+	// KYTY_WRITE_WATCH (CollectHotPages): the written pages of the current run, and running totals
+	// printed every 600 frames as a "WriteWatch:" stat line.
+	std::vector<uint64_t> m_ww_written;
+	struct WriteWatchTotals {
+		uint64_t visited        = 0;
+		uint64_t skips          = 0;
+		uint64_t unwatched      = 0;
+		uint64_t mismatches     = 0;
+		uint64_t last_log_frame = 0;
+	};
+	WriteWatchTotals m_ww_totals;
+	uint64_t         m_ww_commit_generation = UINT64_MAX;
 	uint32_t                                          m_hot_quiet_frames = 8;
 	// KYTY_HOT_PAGE_CHECK_LIMIT (default 64; 0 disables): a hot page that this many uploads in a
 	// row found unchanged returns to normal tracking as a clean, write-protected page

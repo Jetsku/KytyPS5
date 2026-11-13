@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -138,6 +140,13 @@ bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t
 // the process lifetime: reading it never faults, whatever the guest view's protection, and after
 // the guest unmaps the range it shows whatever that backing then holds. Any thread.
 [[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
+// KYTY_WRITE_WATCH=1: the pages of [vaddr, vaddr + size) written since the last reset of their
+// write-watch state, ascending, into `written`, and resets that state. False (nothing reset) when
+// the range is not write-watch memory (direct memory, or the switch is off) or spans allocations.
+// Changes whenever private guest memory is committed or released (a recommitted page reads zero
+// without having been written).
+uint64_t PrivateCommitGeneration();
+bool QueryAndResetWrittenPages(uint64_t vaddr, uint64_t size, std::vector<uint64_t>& written);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
 // draw-prep preparation the read is certified by that digest instead of its bytes
