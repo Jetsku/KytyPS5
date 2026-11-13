@@ -95,10 +95,13 @@ inline Commit g_commit;
 // - empty: outside slices, no submission queued at all (the game has not submitted);
 // - blocked: outside slices, submissions queued but every queue suspended (waits on GPU labels,
 //   memory, a blocked op);
-// - fence: outside slices, the next submission is held by the frame fence.
+// - fence: outside slices, the next submission is held by the frame fence;
+// - nowork: the thread sleeps in m_work_available.Wait with no submission and no service command
+//   (graphicsRun.cpp; wholecp measurement branch: not counted in the buckets above).
 struct CpIdle {
 	uint64_t starved = 0, starved_n = 0;
 	uint64_t empty = 0, blocked = 0, fence = 0;
+	uint64_t nowork = 0;
 };
 
 inline CpIdle g_cp_idle;

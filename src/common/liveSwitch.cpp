@@ -64,6 +64,7 @@ uint64_t g_cp_slice_start = 0; // 0: outside a slice
 
 std::atomic<void (*)(const std::string&)> g_log_sink {nullptr};
 std::atomic<GpuTotals (*)()>              g_gpu_totals {nullptr};
+std::atomic<CpIdleTotals (*)()>           g_cp_idle {nullptr};
 
 void WriteLog(const std::string& line) {
 	if (auto* sink = g_log_sink.load(std::memory_order_acquire); sink != nullptr) {
@@ -370,6 +371,11 @@ void Registry::Apply(uint64_t flip) {
 		                  totals.busy_ns / 1000u, totals.idle_ns / 1000u, totals.starved_ns / 1000u,
 		                  totals.cmdbufs);
 	}
+	if (auto* provider = g_cp_idle.load(std::memory_order_acquire); provider != nullptr) {
+		const auto i = provider();
+		gpu += fmt::format(" cpidle [tsc {}, nowork {}, empty {}, blocked {}, fence {}, starved {}]", i.tsc,
+		                   i.nowork, i.empty, i.blocked, i.fence, i.starved);
+	}
 	WriteLog(fmt::format("Live: seq {} applied at CP flip {} (t_ms {}, t_us {}, cp_busy_us {}){}: {}\n",
 	                     seq, flip, t_ms, now_ns / 1000u, busy_ns / 1000u, gpu,
 	                     changes.empty() ? std::string("no change") : changes));
@@ -401,6 +407,10 @@ int64_t ParseDefaultOff(const char* value) {
 
 bool Enabled() noexcept {
 	return g_enabled.load(std::memory_order_relaxed);
+}
+
+void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept {
+	g_cp_idle.store(provider, std::memory_order_release);
 }
 
 void SetGpuTotalsProvider(GpuTotals (*provider)()) noexcept {

@@ -116,6 +116,19 @@ struct GpuTotals {
 };
 void SetGpuTotalsProvider(GpuTotals (*provider)()) noexcept;
 
+// wholecp measurement: cumulative CP idle buckets in TSC ticks (PrepStats::CpIdle) plus the TSC at the
+// line, so a reader converts with the TSC rate between two lines:
+//   ... cpidle [tsc T, nowork N, empty E, blocked B, fence F, starved S]: ...
+struct CpIdleTotals {
+	uint64_t tsc     = 0;
+	uint64_t nowork  = 0;
+	uint64_t empty   = 0;
+	uint64_t blocked = 0;
+	uint64_t fence   = 0;
+	uint64_t starved = 0;
+};
+void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept;
+
 namespace Testing {
 // What the live-control thread does with the file's text: parse it and stage the changes.
 void StageText(std::string_view text);

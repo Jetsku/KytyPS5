@@ -2721,9 +2721,10 @@ void PrintPrepStats(uint64_t now_ns) {
 	static PrepStats::CpIdle last_i {};
 	const auto&              i = PrepStats::g_cp_idle;
 	std::printf("PrepStats cp idle %.0fs: starved %.2f ms/s (%.0f/s) | outside slices: empty %.2f blocked %.2f "
-	            "fence %.2f ms/s\n",
+	            "fence %.2f nowork %.2f ms/s\n",
 	            secs, ms(i.starved - last_i.starved), static_cast<double>(i.starved_n - last_i.starved_n) / secs,
-	            ms(i.empty - last_i.empty), ms(i.blocked - last_i.blocked), ms(i.fence - last_i.fence));
+	            ms(i.empty - last_i.empty), ms(i.blocked - last_i.blocked), ms(i.fence - last_i.fence),
+	            ms(i.nowork - last_i.nowork));
 	last_i = i;
 	static uint64_t last_seq = 0, last_rec = 0;
 	const auto      seq_spin = PrepStats::g_spin.sequencer.load(std::memory_order_relaxed);
