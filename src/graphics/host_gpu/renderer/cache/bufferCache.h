@@ -867,6 +867,7 @@ private:
 	// Dirty-log passes add the hot runs they find in the logged ranges.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
 	uint64_t                                          m_created_buffers = 0;
+	uint64_t                                          m_hot_compared_bytes = 0;
 	std::unordered_set<BdaHotKey, BdaHotKeyHash>      m_bda_hot_keys;
 	// KYTY_BDA_DIRTY_LOG (default on with KYTY_BDA_HOT_SYNC; =0 off). A BDA pass whose structure
 	// epoch is unchanged but whose fault epoch moved synchronizes only the ranges the tracker

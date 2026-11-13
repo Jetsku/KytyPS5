@@ -234,7 +234,8 @@ const char* const kItemNames[ItemCount] = {
     "set-repeated", "color-hit", "color-miss", "depth-hit",    "depth-miss",
     "target-repeat", "target-lookup", "descwrites", "transitions", "pipeline-new",
     "read-hits",  "read-misses", "log-entries", "cert-ranges",
-    "fb-bindings", "fb-creates", "bda-log", "bda-full", "bda-hot", "bda-upload-kib", "bda-hotruns"};
+    "fb-bindings", "fb-creates", "bda-log", "bda-full", "bda-hot", "bda-upload-kib", "bda-hotruns",
+    "bda-compare-kib", "bda-hot-deduped"};
 
 const char* const kStepNames[StepCount] = {
     "g.committail", "g.retire",      "g.opexit",     "g.loop",        "g.ophead",      "g.drawop",

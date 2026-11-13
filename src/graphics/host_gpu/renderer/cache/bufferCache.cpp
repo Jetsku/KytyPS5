@@ -1789,6 +1789,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			staged += TRACKER_PAGE_SIZE;
 		}
 	}
+	m_hot_compared_bytes += visited * TRACKER_PAGE_SIZE;
 	MemoryStats::Count(MemoryStats::Counter::HotUploadPages, visited);
 	MemoryStats::Count(MemoryStats::Counter::HotUploadSkipped, skipped);
 	if (settled != 0) {
@@ -5269,7 +5270,10 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto pass_start      = BufferLookupStats::Now();
 	gate_scope.Stop();
 	const auto uploaded_stat   = m_bda_pass_upload_bytes;
+	const auto compared_stat   = m_hot_compared_bytes;
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	CommitStats::StepItems(CommitStats::Item::BdaCompareKiB,
+	                       (m_hot_compared_bytes - compared_stat) >> 10u);
 	CommitStats::StepItems(CommitStats::Item::BdaUploadKiB,
 	                       (m_bda_pass_upload_bytes - uploaded_stat) >> 10u);
 	if (pass_start != 0) {
@@ -5488,14 +5492,18 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 }
 
-// KYTY_FINDBUF_FAST=1 (default off): faster bookkeeping on the run-start draws' FindBuffers/BDA
-// path with the same results (see the uses).
-static bool FindBufFastEnabled() {
-	static const bool enabled = [] {
+// KYTY_FINDBUF_FAST (default 0): faster work on the run-start draws' BDA path. 1: the dirty-log
+// pass merges found hot runs through a hash set. 2: also, the dirty-log pass skips re-examining a
+// recorded hot run that its logged ranges just synchronized (see the uses).
+static uint32_t FindBufFastLevel() {
+	static const uint32_t level = [] {
 		const auto* value = std::getenv("KYTY_FINDBUF_FAST");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
 	}();
-	return enabled;
+	return level;
+}
+static bool FindBufFastEnabled() {
+	return FindBufFastLevel() >= 1;
 }
 
 bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
@@ -5531,10 +5539,21 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 		log_scope.Stop();
 		const CommitStats::StepSubScope hot_scope(CommitStats::Sub::BdaLogHot);
 		BdaSyncStats hot_stats;
+		const bool   dedupe  = FindBufFastLevel() >= 2 && !m_bda_dirtied.Empty();
+		uint64_t     deduped = 0;
 		for (const auto& range: m_bda_hot_ranges) {
+			// KYTY_FINDBUF_FAST=2: a run inside one logged range that is mapped was synchronized
+			// (every buffer over it, hot pages compared with their shadows) by the loop above, in
+			// this same pass: a second look only repeats the compares.
+			if (dedupe && m_bda_dirtied.Contains(range.address, range.size) &&
+			    mapped_ranges.Contains(range.address, range.size)) {
+				deduped++;
+				continue;
+			}
 			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
 			                        false, &hot_stats);
 		}
+		CommitStats::StepItems(CommitStats::Item::BdaHotDeduped, deduped);
 		stats.upload_bytes += hot_stats.upload_bytes;
 		stats.upload_copies += hot_stats.upload_copies;
 	}

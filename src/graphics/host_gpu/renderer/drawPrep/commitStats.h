@@ -122,6 +122,8 @@ enum class Item : uint8_t {
 	BdaHotPasses,   // hot runs only
 	BdaUploadKiB,   // KiB the BDA passes uploaded
 	BdaHotRuns,     // recorded hot runs re-examined by the passes
+	BdaCompareKiB,  // KiB of hot pages the passes compared with their shadows
+	BdaHotDeduped,  // KYTY_FINDBUF_FAST=2: recorded hot runs a dirty-log pass skipped (synced already)
 	Count
 };
 
