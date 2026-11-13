@@ -3898,7 +3898,10 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		{
 			std::scoped_lock lock {m_lock};
 			// Bytes some image also covers are not proven to be this surface's CMASK.
-			if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
+			// Draw-expand mode: the target's registers name these bytes as its CMASK, which is
+			// what the hardware reads; a stale cached image over them does not change that.
+			if (!CmaskDrawExpandEnabled() &&
+			    !FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
 				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
 				ClearTrace("CMASK", "aliased", metadata.address, metadata.size, desc.info.data.address,
 				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
