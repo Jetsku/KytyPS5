@@ -1246,6 +1246,14 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}();
 		static std::atomic<uint64_t> flip_count {0};
 		const uint64_t               n = flip_count.fetch_add(1, std::memory_order_relaxed);
+		// KYTY_RD_CAPTURE_FLIP=<n> (with --rd): request a RenderDoc capture at guest flip n.
+		static const uint64_t rd_capture_flip = [] {
+			const char* v = std::getenv("KYTY_RD_CAPTURE_FLIP");
+			return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+		}();
+		if (rd_capture_flip != 0 && n == rd_capture_flip) {
+			Graphics::RenderDocRequestCapture();
+		}
 		if (flip_log && (n < 40 || n % 300 == 0)) {
 			char flip_buf[320];
 			std::snprintf(flip_buf, sizeof(flip_buf),

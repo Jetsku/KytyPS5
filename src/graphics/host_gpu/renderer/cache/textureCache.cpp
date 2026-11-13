@@ -3824,6 +3824,15 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): see FindImage's render-target path.
+static bool CmaskDrawExpandEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
+		return v == nullptr || std::strcmp(v, "0") != 0;
+	}();
+	return enabled;
+}
+
 void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
                                          uint32_t metadata_base_layer, MetadataNoop* noop) {
 	using Event = Profiler::FrameEvent;
@@ -3895,6 +3904,14 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 				continue;
 			}
+		}
+		// Draw-expand mode: the guest's own kernels fast-clear CMASK (and FindImage marks it
+		// expanded at every render-target bind), so the bytes are decided on the GPU, per tile,
+		// every time: tiles still marked cleared get the clear colour, as the hardware shows them.
+		if (CmaskDrawExpandEnabled()) {
+			native[slice] = 1;
+			provable      = false;
+			continue;
 		}
 		// The proof that every tile of the slice is fast-cleared: all CMASK bytes are 0. Guest
 		// memory holds bytes the GPU does not own. GPU-owned bytes are decided here only while a
@@ -4282,11 +4299,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	// target for rendering therefore marks its whole CMASK expanded on the GPU, in order with the
 	// draws (conservative: untouched tiles hold the materialized clear colour on the host).
 	if (desc.cmask.valid && desc.type == BindingType::RenderTarget && desc.cmask.range.Valid()) {
-		static const bool draw_expand = [] {
-			const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
-			return v == nullptr || std::strcmp(v, "0") != 0;
-		}();
-		if (draw_expand) {
+		if (CmaskDrawExpandEnabled()) {
 			m_buffer_cache.FillBuffer(desc.cmask.range.address, desc.cmask.range.size, UINT32_MAX,
 			                          false);
 			if (recording) {
