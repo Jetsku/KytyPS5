@@ -75,6 +75,8 @@ namespace Libs::Graphics {
 // A redirected page that becomes GPU-dirty, has a GPU-modified image over it, a pending backing
 // publication, or receives a BDA write falls back for good (its entries point at the cache buffer
 // again and the next pass scans fully). Imports are never freed (the alias outlives them).
+static_assert(BufferCache::CACHING_PAGEBITS == 14, "HostImportState::BackOff page size");
+
 // KYTY_UPLOAD_SOURCES=1 (default off): every 5 s the top 20 upload sources by bytes.
 namespace UploadSources {
 enum Path : uint32_t { BdaSync, ReadBinding, WrittenBinding, TexelRead, HotPage, StreamRead, Other, Count };
@@ -295,6 +297,14 @@ struct BufferCache::HostImportState {
 	};
 	std::unordered_map<uint64_t, Retry>    retry; // cache page -> back-off
 	std::array<uint64_t, ReasonCount>      fallback_pages {};
+	// Back-off for [begin, end) (cache pages) after a fallback or a failed import.
+	void BackOff(uint64_t begin, uint64_t end) {
+		for (uint64_t page = begin >> 14u; page < (end >> 14u); ++page) {
+			auto& entry  = retry[page];
+			entry.until  = frame + (retry_frames << std::min<uint32_t>(entry.repeat, 6u));
+			entry.repeat = std::min<uint32_t>(entry.repeat + 1, 30u);
+		}
+	}
 	uint64_t                               retry_frames = 60;
 	uint32_t                               log_left     = 0;
 	bool                                   upload_candidates_enabled = false;
@@ -6306,12 +6316,7 @@ void BufferCache::HostImportUnredirect(uint64_t vaddr, uint64_t size, uint32_t r
 		}
 		if (reason != HostImportState::Remap && reason != HostImportState::Eligible) {
 			state.fallbacks += pages;
-			for (uint64_t page = run_begin >> CACHING_PAGEBITS; page < (run_end >> CACHING_PAGEBITS);
-			     ++page) {
-				auto& retry  = state.retry[page];
-				retry.until  = state.frame + (state.retry_frames << std::min<uint32_t>(retry.repeat, 6u));
-				retry.repeat = std::min<uint32_t>(retry.repeat + 1, 30u);
-			}
+			state.BackOff(run_begin, run_end);
 		}
 	}
 	// The cache buffer skipped every upload of these pages: the next pass scans fully.
@@ -6370,7 +6375,15 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 		const auto* first = static_cast<const uint8_t*>(
 		    LibKernel::Memory::GuestBackingAlias(run, CACHING_PAGESIZE));
 		if (first == nullptr) {
-			state.excluded.Add(run, CACHING_PAGESIZE);
+			if (state.log_left != 0) {
+				state.log_left--;
+				std::printf("HostImport failure: 0x%010" PRIx64 " reason=not-direct frame=%" PRIu64
+				            " (alias of first 4 KiB: %s)\n",
+				            run, state.frame,
+				            LibKernel::Memory::GuestBackingAlias(run, 4096) != nullptr ? "yes" : "no");
+				std::fflush(stdout);
+			}
+			state.BackOff(run, run + CACHING_PAGESIZE);
 			state.failed_pages[HostImportState::NotDirect]++;
 			state.failures++;
 			run += CACHING_PAGESIZE;
@@ -6386,7 +6399,7 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 		if (HostImportRedirectRun(run, stop, first, failure)) {
 			any = true;
 		} else {
-			state.excluded.Add(run, stop - run);
+			state.BackOff(run, stop);
 			state.failed_pages[failure] += (stop - run) >> CACHING_PAGEBITS;
 			state.failures += (stop - run) >> CACHING_PAGEBITS;
 		}
@@ -6696,7 +6709,6 @@ void BufferCache::ReportUploadSources() {
 			const auto& state = *m_host_import;
 			status = state.redirected.Contains(entry.lo, span)     ? "imported"
 			         : state.redirected.Intersects(entry.lo, span) ? "partly-imported"
-			         : state.excluded.Intersects(entry.lo, span)   ? "failed"
 			         : const_cast<BufferCache*>(this)->HostImportPageReason(page >> CACHING_PAGEBITS) ==
 			                   HostImportState::Backoff
 			             ? "fallback-backoff"
