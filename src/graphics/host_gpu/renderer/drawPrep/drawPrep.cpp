@@ -2986,10 +2986,16 @@ void Engine::Commit(Slot& slot) {
 		m_after_commit(m_after_commit_context);
 	}
 	CommitStats::EndDraw();
-	PrintDrawPrepSummary();
-	DrawRun::PrintSummary();
-	TexelImageLookup::PrintSummary();
-	XFrameReuse::PrintSummary();
+	// The 10 s lines. KYTY_BK_HANDOVER: their four period checks every 256th commit (or at once when
+	// a live change closes the A/B slot's period), not after every draw.
+	static uint32_t printer_calls = 0; // (the commit thread only)
+	if (static_cast<Bookkeep::Mode>(g_bk_handover.Get()) == Bookkeep::Mode::Off ||
+	    (++printer_calls & 255u) == 0 || g_stats_due.load(std::memory_order_relaxed)) {
+		PrintDrawPrepSummary();
+		DrawRun::PrintSummary();
+		TexelImageLookup::PrintSummary();
+		XFrameReuse::PrintSummary();
+	}
 	CommitStats::StepMark(CommitStats::Step::GapCommitTail);
 }
 

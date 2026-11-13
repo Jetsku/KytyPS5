@@ -11,7 +11,8 @@
 //   attempt, the done check, the wait path and the lead statistics. Retire stays per draw (its
 //   store is the sequencer's wake handshake while KYTY_HANDOFF_LEAN is off). Verify: such a head's
 //   state word is checked to be Done for its position (what the per-draw protocol would have seen),
-//   and every mismatch is counted.
+//   and every mismatch is counted. Also with the switch: the four 10 s summary printers run their
+//   period checks every 256th commit instead of after every draw.
 // KYTY_BK_ADOPT (renderDraw.cpp, ApplyPreparedDraw): a kernel continuation's stage preparations are
 //   adopted by pointer (the draw state's stage runtimes point at the slot's preparations) instead of
 //   being swapped member by member into the draw state. Verify: adopted, plus a value copy taken at
