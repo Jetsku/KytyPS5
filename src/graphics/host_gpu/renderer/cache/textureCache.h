@@ -197,6 +197,12 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Images that turned GPU-modified so far (KYTY_HOST_IMPORT: BufferCache re-checks its
+	// redirected pages only after this moves).
+	[[nodiscard]] uint64_t GpuModifiedTransitions() const noexcept {
+		return m_gpu_modified_transitions.load(std::memory_order_acquire);
+	}
+	std::atomic<uint64_t> m_gpu_modified_transitions {0};
 	// Whether any cached image overlaps the range (RenderContext::UnmapMemory: CPU-only unmaps skip
 	// the GPU drain).
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);

@@ -67,6 +67,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// KYTY_HOST_IMPORT=1: VK_EXT_external_memory_host enabled (BufferCache host import).
+	bool                               external_memory_host_enabled          = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
 	// KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h): VK_AMD_buffer_marker enabled for breadcrumbs, and

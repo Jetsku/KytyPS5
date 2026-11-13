@@ -6279,6 +6279,7 @@ void TextureCache::MarkImageGpuModified(Image& image) {
 		}
 	}
 	if (!image.IsGpuModified()) {
+		m_gpu_modified_transitions.fetch_add(1, std::memory_order_acq_rel);
 		// The ownership predicate (IsRegionGpuModified) covers the registered range `live`.
 		InvalidateCleanImageProofs(image.live.address, image.live.size,
 		                           Coherence::Source::ImageGpuModified);
