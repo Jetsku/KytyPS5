@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
@@ -3178,6 +3179,15 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	                                      metadata_base_layer, values, decodable, false);
 }
 
+// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): see FindImage's render-target path.
+static bool CmaskDrawExpandEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
+		return v == nullptr || std::strcmp(v, "0") != 0;
+	}();
+	return enabled;
+}
+
 Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
     DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
     uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
@@ -3208,10 +3218,63 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	const auto slice_range = [&](uint32_t slice) {
 		return GuestRange {range.address + slice_size * (first + slice), slice_size};
 	};
+	// The guest's own kernel wrote these bytes (GPU-owned buffer memory, not an aliased image's
+	// contents): they are the target's current CMASK and safe to decide per tile.
+	const bool cmask_guest_written =
+	    cmask && m_buffer_cache.IsRegionGpuModified(range.address, range.size);
 	{
 		std::scoped_lock lock {m_lock};
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
-			return Event::DccFallbackMetadataAliased;
+		// Draw-expand mode: a guest-cleared CMASK is decided here even under a stale cached image
+		// (MaterializeCmaskClear); falling back to a readback would drain the GPU every frame.
+		static const bool ignore_alias = [] {
+			const char* v = std::getenv("KYTY_CMASK_NATIVE_IGNORE_ALIAS");
+			return v == nullptr || std::strcmp(v, "0") != 0;
+		}();
+		if (cmask && CmaskDrawExpandEnabled() && ignore_alias && std::getenv("KYTY_CMASK_ALIAS_LOG") != nullptr) {
+			static std::unordered_set<uint64_t> logged_alias;
+			const auto aliases = FindImagesInRegion(range.address, range.size, false);
+			if (!aliases.empty() && logged_alias.insert(range.address).second) {
+				std::string text = fmt::format("CmaskAlias: meta 0x{:x}+0x{:x} target 0x{:x} {}x{} fmt {}:",
+				                               range.address, range.size, desc.info.data.address,
+				                               desc.info.extent.width, desc.info.extent.height,
+				                               static_cast<int>(desc.info.pixel_format));
+				for (const auto other: aliases) {
+					if (const auto* img = m_slot_images.try_get(other)) {
+						text += fmt::format(" [0x{:x}+0x{:x} {}x{} fmt {} gpu_mod {} depth {}]",
+						                    img->info.data.address, img->info.data.size,
+						                    img->info.extent.width, img->info.extent.height,
+						                    static_cast<int>(img->backing.format), img->IsGpuModified() ? 1 : 0,
+						                    img->info.IsDepth() ? 1 : 0);
+					}
+				}
+				Log::WriteToConsoleAndLog(text + "\n");
+			}
+		}
+		{
+			const auto aliases = FindImagesInRegion(range.address, range.size, false);
+			// Stale aliases only (no GPU-written interpretation over the bytes): the buffer holds
+			// the target's current CMASK, so it is decided per tile on the GPU.
+			bool stale_only = true;
+			for (const auto other: aliases) {
+				const auto* image = m_slot_images.try_get(other);
+				if (image != nullptr && image->IsGpuModified()) {
+					stale_only = false;
+					break;
+				}
+			}
+			if (!aliases.empty() && cmask && CmaskDrawExpandEnabled() && ignore_alias &&
+			    !(cmask_guest_written || stale_only)) {
+				// GPU-written interpretations own some of the bytes: move them into the buffer on
+				// the GPU (in order, no CPU wait), so the inspection reads the current CMASK, as the
+				// readback fallback would after draining the GPU.
+				(void)MaterializeOwnedBytes(range, {}, id, "cmask-inspect");
+			} else if (!aliases.empty() && !(cmask && CmaskDrawExpandEnabled() && ignore_alias)) {
+				if (std::getenv("KYTY_CMASK_FALLBACK_LOG") != nullptr) {
+					std::printf("CmaskFallbackWhy: aliased (cmask=%d expand=%d ignore=%d)\n", cmask ? 1 : 0,
+					            CmaskDrawExpandEnabled() ? 1 : 0, ignore_alias ? 1 : 0);
+				}
+				return Event::DccFallbackMetadataAliased;
+			}
 		}
 		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
 		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
@@ -3235,12 +3298,19 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		}
 	}
 	if (ImageRangeOverlaps(range, desc.info.data)) {
+		if (std::getenv("KYTY_CMASK_FALLBACK_LOG") != nullptr) {
+			std::printf("CmaskFallbackWhy: metadata 0x%llx+0x%llx overlaps target data 0x%llx+0x%llx\n",
+			            (unsigned long long)range.address, (unsigned long long)range.size,
+			            (unsigned long long)desc.info.data.address, (unsigned long long)desc.info.data.size);
+		}
 		return Event::DccFallbackMetadataAliased;
 	}
 	// KYTY_DCC_GPU_REFRESH (textureCache.h): a DCC image that is registered, matches the view and
 	// is fully resident is accepted while waiting for a refresh or not GPU-owned; it is refreshed
 	// right before the inspection, as the CPU fallback's ClearImage refreshes it.
-	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
+	// Draw-expand CMASK targets take the same refresh: the alternative is a readback that drains
+	// the GPU every frame (UFC 5's UI target).
+	const bool refresh_allowed = m_dcc_gpu_refresh && (!cmask || CmaskDrawExpandEnabled());
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
 		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
@@ -3281,7 +3351,9 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			case Support::Format: return Event::DccFallbackFormat;
 			case Support::Unsupported: return Event::DccFallbackUnsupported;
 		}
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		// Draw-expand CMASK: aliases were handled above (their bytes moved into the buffer).
+		if (!(cmask && CmaskDrawExpandEnabled()) &&
+		    !FindImagesInRegion(range.address, range.size, false).empty()) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		return std::nullopt;
@@ -3824,14 +3896,6 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): see FindImage's render-target path.
-static bool CmaskDrawExpandEnabled() {
-	static const bool enabled = [] {
-		const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
-		return v == nullptr || std::strcmp(v, "0") != 0;
-	}();
-	return enabled;
-}
 
 void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
                                          uint32_t metadata_base_layer, MetadataNoop* noop) {
@@ -3848,6 +3912,13 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	if (!desc.cmask.valid || desc.type != BindingType::RenderTarget || !id) {
 		description_noop();
 		return;
+	}
+	// Draw-expand mode: CMASK still holding our expanded fill has nothing cleared to apply.
+	if (CmaskDrawExpandEnabled() && desc.cmask.range.Valid()) {
+		if (const auto fill = m_buffer_cache.KnownFill(desc.cmask.range.address, desc.cmask.range.size);
+		    fill && *fill == UINT32_MAX) {
+			return;
+		}
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	{
@@ -4022,6 +4093,18 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		                              : Event::CmaskFastClearInspectionReuses,
 		                          view.layer_count);
 		return;
+	}
+	if (std::getenv("KYTY_CMASK_FALLBACK_LOG") != nullptr) {
+		static std::unordered_set<uint64_t> fallback_logged;
+		const uint64_t key = desc.info.data.address ^ (uint64_t {static_cast<uint32_t>(outcome)} << 52u) ^
+		                     (uint64_t {static_cast<uint32_t>(m_image_state_reason)} << 44u);
+		if (fallback_logged.insert(key).second) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "CmaskFallback: target 0x{:x} {}x{} fmt {} meta 0x{:x}+0x{:x} outcome {} image_state {}\n",
+			    desc.info.data.address, desc.info.extent.width, desc.info.extent.height,
+			    static_cast<int>(view.format), range.address, range.size, static_cast<int>(outcome),
+			    static_cast<int>(m_image_state_reason)));
+		}
 	}
 	// No native inspection: read the undecided slices back, as the DCC CPU fallback does.
 	for (uint32_t slice = 0; slice < view.layer_count; slice++) {
