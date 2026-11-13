@@ -754,6 +754,7 @@ private:
 	// upload of the page erases the copy.
 	struct HotShadow {
 		std::unique_ptr<uint8_t[]> data;
+		uint64_t                   hash        = 0; // XXH3 of `data` (KYTY_HOT_PAGE_HASH)
 		uint32_t                   last_change = 0;
 		uint32_t                   last_use    = 0;
 		// Uploads in a row that found the page unchanged (KYTY_HOT_PAGE_CHECK_LIMIT).
