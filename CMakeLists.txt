@@ -2524,6 +2524,22 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
+# Linux x86-64: the patcher's multi-threaded function scan gives the same patched code as one thread.
+if(NOT WIN32 AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+	add_executable(guest_instruction_patch_scan_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/GuestInstructionPatchScanTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+		"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
+	)
+	target_link_libraries(guest_instruction_patch_scan_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+	target_include_directories(guest_instruction_patch_scan_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME guest_instruction_patch_scan COMMAND $<TARGET_FILE:guest_instruction_patch_scan_tests>)
+		set_tests_properties(guest_instruction_patch_scan PROPERTIES TIMEOUT 60)
+		add_dependencies(kyty_tests guest_instruction_patch_scan_tests)
+	endif()
+endif()
+
 # Windows: the runtime #UD emulator and the --amd-cpu patch against the AMD CPU (or the AMD manual),
 # CONTEXT write-back, and the guest red zone across a trap.
 if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
