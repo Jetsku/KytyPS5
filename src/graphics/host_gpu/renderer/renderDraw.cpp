@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/mtRecord.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
@@ -4771,6 +4772,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_GPU_OP_SITE("draw.index");
+	const MtRecord::CpDrawScope mt_scope;
 	KYTY_PROFILER_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndex);
 
@@ -4926,6 +4928,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_GPU_OP_SITE("draw.auto");
+	const MtRecord::CpDrawScope mt_scope;
 	KYTY_PROFILER_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawAuto);
 
@@ -5110,6 +5113,7 @@ private:
 bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffer,
                                         const DrawIndirectSource& source) {
 	KYTY_PROFILER_FUNCTION();
+	const MtRecord::CpDrawScope mt_scope;
 	EXIT_IF(buffer.IsInvalid() || source.args_addr == 0 || source.max_count == 0);
 	const auto& graphics = m_context.GetGraphics();
 	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;

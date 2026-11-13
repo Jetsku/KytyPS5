@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/mtRecord.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -410,6 +411,7 @@ bool GraphicContext::CreateSparseImage(const vk::ImageCreateInfo& info, uint32_t
 	image.layers           = sparse_info.arrayLayers;
 	image.mip_levels       = sparse_info.mipLevels;
 	image.samples          = static_cast<uint32_t>(sparse_info.samples);
+	MtRecord::NoteImage(image.image, sparse_info.samples);
 	image.usage            = sparse_info.usage;
 	image.flags            = sparse_info.flags;
 	image.state            = {.layout = sparse_info.initialLayout};
@@ -872,6 +874,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.layers     = image_info.arrayLayers;
 	image.mip_levels = image_info.mipLevels;
 	image.samples    = static_cast<uint32_t>(image_info.samples);
+	MtRecord::NoteImage(image.image, image_info.samples);
 	image.usage      = image_info.usage;
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};

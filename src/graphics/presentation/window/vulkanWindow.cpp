@@ -10,6 +10,7 @@
 #include "common/textureSparseResidency.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/mtRecord.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -2152,6 +2153,8 @@ void WindowContext::CreateVulkan() {
 	CommandRecorder::InstallVerifyHooks();
 	// KYTY_CMD_GUARD command-buffer state hooks wrap both.
 	CommandRecorder::InstallGuardHooks(graphic_ctx.device);
+	// KYTY_MT_RECORD: image-view formats for secondary command buffer inheritance.
+	MtRecord::InstallHooks();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.side_queue_index != 0) {

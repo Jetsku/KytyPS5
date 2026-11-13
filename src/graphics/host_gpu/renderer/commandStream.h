@@ -568,6 +568,17 @@ public:
 		}
 		return reinterpret_cast<const Header*>(m_data + (m_read & m_mask));
 	}
+	// The packet at `position` (>= ReadPosition()), or nullptr when it is not published yet
+	// (KYTY_MT_RECORD look-ahead; the region stays owned by the consumer until Release).
+	[[nodiscard]] const Header* PeekAt(uint64_t position) noexcept {
+		if (position >= m_published_cache) {
+			m_published_cache = m_published.load(std::memory_order_acquire);
+			if (position >= m_published_cache) {
+				return nullptr;
+			}
+		}
+		return reinterpret_cast<const Header*>(m_data + (position & m_mask));
+	}
 	void Advance(uint32_t bytes) noexcept { m_read += bytes; }
 	// Publishes the consumed position and wakes a producer waiting for it.
 	void                   Release(WaitStats& stats) noexcept;

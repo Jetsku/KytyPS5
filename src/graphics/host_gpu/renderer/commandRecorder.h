@@ -118,6 +118,13 @@ public:
 private:
 	struct NativeExecutor;
 	friend struct NativeExecutor;
+	// KYTY_MT_RECORD (mtRecord.h): parallel replay of render passes into secondary buffers.
+	struct MtState;
+	friend struct MtState;
+	// Called with the BeginRendering packet at the read position; true when the whole pass was
+	// replayed (and the read position advanced past its EndRendering).
+	bool MtTrySegment(const CommandStream::Header* begin);
+	void MtMaybePrintStats();
 
 	void Run(std::stop_token stop);
 	// Replays every published packet (recorder thread, or the CP in inline mode).
@@ -142,6 +149,7 @@ private:
 	CommandStream::WaitPolicy       m_drain_policy;
 	CommandStream::WaitPolicy       m_idle_policy;
 	std::unique_ptr<NativeExecutor> m_exec;
+	std::unique_ptr<MtState>        m_mt;
 
 	// Verify-hook registry slot (MaxRecorders when not registered).
 	size_t m_registry_slot = SIZE_MAX;
