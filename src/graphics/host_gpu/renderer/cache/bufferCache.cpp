@@ -1,3 +1,4 @@
+#include <execution>
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
@@ -1713,6 +1714,39 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	uint64_t   visited   = 0;
 	uint64_t   skipped   = 0;
 	uint64_t   settled   = 0;
+	// KYTY_HOT_PAGE_PARALLEL=1 (default off; measured slower in UFC 5: the per-pass thread-pool
+	// dispatch costs more than it saves): compare the live hot pages with their shadows
+	// on the worker threads first (nearly all are unchanged; each compare reads 8 KiB), then walk
+	// them in order with the answers. A write racing a compare is seen by the next upload, as
+	// before. UFC 5 fights spent ~20% of the GPU thread in these compares.
+	static const bool parallel_compare = [] {
+		const char* v = std::getenv("KYTY_HOT_PAGE_PARALLEL");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	std::vector<uint8_t> live_same;
+	if (parallel_compare && m_bda_hot_sync && hot_bytes / TRACKER_PAGE_SIZE >= 64) {
+		std::vector<std::pair<uint64_t, const uint8_t*>> work;
+		work.reserve(hot_bytes / TRACKER_PAGE_SIZE);
+		for (const auto& range: hot_ranges) {
+			auto next = m_hot_shadows.lower_bound(range.address);
+			for (auto page = range.address; page < range.End(); page += TRACKER_PAGE_SIZE) {
+				const uint8_t* shadow_data = nullptr;
+				if (next != m_hot_shadows.end() && next->first == page) {
+					shadow_data = next->second.data.get();
+					++next;
+				}
+				work.emplace_back(page, shadow_data);
+			}
+		}
+		live_same.assign(work.size(), 0);
+		std::for_each(std::execution::par, work.begin(), work.end(), [&](const auto& item) {
+			const auto index = static_cast<size_t>(&item - work.data());
+			live_same[index] = item.second != nullptr &&
+			                   std::memcmp(item.second, reinterpret_cast<const void*>(item.first),
+			                               TRACKER_PAGE_SIZE) == 0;
+		});
+	}
+	size_t live_index = 0;
 	for (const auto& range: hot_ranges) {
 		// The shadows of a run's pages, in address order: one lookup per run instead of one per
 		// page. `next` stays the first shadow above the current page (an emplace below inserts
@@ -1733,7 +1767,10 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			// (hot, hence never GPU-dirty and readable) page first and snapshot only one that
 			// differs. A write racing either compare is seen by the next upload, whose shadow still
 			// holds the old contents, exactly as a write landing right after a snapshot.
-			bool same = m_bda_hot_sync && unchanged(reinterpret_cast<const void*>(page));
+			bool same = m_bda_hot_sync &&
+			            (live_same.empty() ? unchanged(reinterpret_cast<const void*>(page))
+			                               : live_same[live_index] != 0);
+			live_index++;
 			if (!same) {
 				// Snapshot the (writable) page once: the compare, the shadow and the upload all use
 				// this copy, so the shadow always equals what the buffer receives.
