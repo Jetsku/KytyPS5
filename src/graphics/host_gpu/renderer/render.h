@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/texDelta.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -1582,6 +1583,7 @@ private:
 		uint64_t          key              = 0;
 		uint64_t          targets_key      = 0; // KYTY_DRAW_RUN_TARGETS
 		uint64_t          swap_key         = 0; // KYTY_DRAW_RUN_PIPESWAP
+		uint64_t          texfree_key      = 0; // KYTY_DRAW_RUN_TEXDELTA
 		uint64_t          activity         = 0;
 		vk::CommandBuffer command          = nullptr;
 		uint64_t          tick             = 0;
@@ -1662,7 +1664,8 @@ private:
 	                                           const vk::Rect2D*                  written) const;
 	// A continuation's kept textures and attachments are marked bound for the draw as their
 	// resolution marks them (BindImage, BindRenderTarget), before the draw's buffer work.
-	void                       DrawRunMarkBindings();
+	// attachments_only (KYTY_DRAW_RUN_TEXDELTA): the textures are resolved by the draw itself.
+	void                       DrawRunMarkBindings(bool attachments_only = false);
 	// Whether the committed draw continues the recorded run (the certificate without the images),
 	// PrepareDrawRenderState after the program refresh.
 	[[nodiscard]] bool DrawRunCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
@@ -1711,6 +1714,17 @@ private:
 	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)
 	uint64_t      m_run_swap_key       = 0;     // and the key without the vertex program (PIPESWAP)
 	bool          m_run_pipeswap       = false; // KYTY_DRAW_RUN_PIPESWAP: the continuation swaps
+	uint64_t      m_run_texfree_key    = 0;     // the key without the T#/S# words (TEXDELTA)
+	bool          m_run_texdelta       = false; // KYTY_DRAW_RUN_TEXDELTA: the continuation resolves its textures
+	bool          m_texdelta_verify    = false; // KYTY_DRAW_RUN_TEXDELTA=2: the draw would have been a delta
+	static void TexDeltaCount(DrawRun::TexDelta::Decision decision, bool taken = false);
+	void        DrawRunRecordTextures(std::span<PreparedBindings* const> stages);
+	// KYTY_DRAW_RUN_TEXDELTA: whether a delta's resolved textures may keep the record's acquisition.
+	[[nodiscard]] uint32_t TexDeltaTextureVerdict(std::span<PreparedBindings* const> stages) const;
+	// KYTY_DRAW_RUN_TEXDELTA=2: what a delta keeps against the normal path's results.
+	void TexDeltaVerify(const DrawRenderState& state, const RenderState& rendering,
+	                    vk::ImageAspectFlags feedback_aspects, bool dynamic_emitted,
+	                    std::span<PreparedBindings* const> stages);
 	// KYTY_CONT_KERNEL (renderDraw.cpp): what the draw that last recorded m_run (not through the
 	// kernel) resolved, which a kernel continuation of the same key and rendering instance reuses.
 	struct ContKernelRecord {

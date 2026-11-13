@@ -81,6 +81,7 @@ extern Live::Switch g_image_epoch; // KYTY_DRAW_RUN_IMAGE_EPOCH
 extern Live::Switch g_cont_eligible; // KYTY_DRAW_RUN_CONT_ELIGIBLE
 extern Live::Switch g_targets;       // KYTY_DRAW_RUN_TARGETS
 extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
+extern Live::Switch g_texdelta;      // KYTY_DRAW_RUN_TEXDELTA (texDelta.h)
 } // namespace Detail
 
 [[nodiscard]] inline Mode GetMode() {
@@ -230,6 +231,11 @@ extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
 // computed in full (not taken from the record, KYTY_DRAW_RUN_CONT_ELIGIBLE), and the record takes
 // the new vertex program and pipeline layout. Verify mode (KYTY_DRAW_RUN=verify) compares a would-be
 // swap's normal path with the record as for any continuation.
+// KYTY_DRAW_RUN_TEXDELTA (live, default 0; 1 on, 2 verify): texDelta.h.
+[[nodiscard]] inline int64_t TexDeltaMode() {
+	return Detail::g_texdelta.Get();
+}
+
 [[nodiscard]] inline bool PipeSwapEnabled() {
 	return Detail::g_pipeswap.On();
 }
@@ -266,10 +272,12 @@ void NoteForeignActivity(const char* what = "other") noexcept;
 // The structure key of a prepared draw (any thread; the preparing thread in parallel mode). 0 when
 // the preparation failed.
 // targets_key (optional): the hash of the registers alone (KYTY_DRAW_RUN_TARGETS); swap_key
-// (optional): the key without the vertex program (KYTY_DRAW_RUN_PIPESWAP); 0 with the key.
+// (optional): the key without the vertex program (KYTY_DRAW_RUN_PIPESWAP); texture_free_key (optional):
+// the key without the T#/S# words (KYTY_DRAW_RUN_TEXDELTA, texDelta.h); 0 with the key.
 [[nodiscard]] uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_config,
                                     const DrawPrep::PreparedDraw& prepared,
-                                    uint64_t* targets_key = nullptr, uint64_t* swap_key = nullptr);
+                                    uint64_t* targets_key = nullptr, uint64_t* swap_key = nullptr,
+                                    uint64_t* texture_free_key = nullptr);
 
 // Why a candidate did not continue its run (after the key matched).
 enum class Miss : uint8_t {

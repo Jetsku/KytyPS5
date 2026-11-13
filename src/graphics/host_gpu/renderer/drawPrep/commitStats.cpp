@@ -218,6 +218,10 @@ struct State {
 	std::array<std::array<uint64_t, CandidateCount>, ReasonCount> candidate {};
 	// Candidates without a record: why the previous draw left none, per class.
 	std::array<std::array<uint64_t, IneligCount>, ReasonCount> norecord {};
+	// Cross-frame per class: the previous frame's draw at the same position had the same complete binding
+	// inputs (pos-bind) / structure inputs (pos-struct); any draw of the previous frame had them (any-bind/-struct).
+	std::array<std::array<uint64_t, 4>, ReasonCount> xpos {};
+	std::vector<uint64_t> prev_frame_bind, prev_frame_struct;
 	// Interval.
 	uint64_t interval_ns  = 0;
 	uint64_t interval_tsc = 0;
@@ -477,7 +481,18 @@ void PrintMasks(State& s, double seconds, double ns_per_tick) {
 			line += ";";
 		}
 	}
+	line += " | xframe/f (pos-bind pos-struct any-bind any-struct)";
+	for (uint32_t r = 0; r < ReasonCount; r++) {
+		const auto& x = s.xpos[r];
+		if (x[0] + x[1] + x[2] + x[3] != 0) {
+			std::snprintf(text, sizeof(text), " %s: %.1f %.1f %.1f %.1f;", kReasonNames[r], static_cast<double>(x[0]) / frames,
+			              static_cast<double>(x[1]) / frames, static_cast<double>(x[2]) / frames,
+			              static_cast<double>(x[3]) / frames);
+			line += text;
+		}
+	}
 	std::printf("%s\n", line.c_str());
+	s.xpos      = {};
 	s.norecord  = {};
 	s.masks     = {};
 	s.kernel    = {};
@@ -834,6 +849,14 @@ void EndDraw() {
 		s.xf_struct_1 += s.struct_1.contains(b.struct_input) ? 1u : 0u;
 		s.xf_struct_12 +=
 		    s.struct_1.contains(b.struct_input) || s.struct_2.contains(b.struct_input) ? 1u : 0u;
+		{
+			const auto pos = s.frame_bind.size();
+			auto&      x   = s.xpos[reason];
+			x[0] += pos < s.prev_frame_bind.size() && s.prev_frame_bind[pos] == b.bind_input ? 1u : 0u;
+			x[1] += pos < s.prev_frame_struct.size() && s.prev_frame_struct[pos] == b.struct_input ? 1u : 0u;
+			x[2] += s.bind_1.contains(b.bind_input) ? 1u : 0u;
+			x[3] += s.struct_1.contains(b.struct_input) ? 1u : 0u;
+		}
 		s.frame_bind.push_back(b.bind_input);
 		s.frame_struct.push_back(b.struct_input);
 		s.bind_frame_set.insert(b.bind_input);
@@ -945,6 +968,8 @@ void OnFrameBoundary() {
 	s.struct_1.clear();
 	s.bind_1.insert(s.frame_bind.begin(), s.frame_bind.end());
 	s.struct_1.insert(s.frame_struct.begin(), s.frame_struct.end());
+	std::swap(s.prev_frame_bind, s.frame_bind);
+	std::swap(s.prev_frame_struct, s.frame_struct);
 	s.frame_bind.clear();
 	s.frame_struct.clear();
 	s.bind_frame_set.clear();

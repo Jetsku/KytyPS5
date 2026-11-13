@@ -2711,13 +2711,16 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	    (DrawRunCandidate(buffer, state, render_target_slice_offset) ||
 	     (DrawRun::RecallEnabled() &&
 	      DrawRunRecallCandidate(buffer, state, render_target_slice_offset)));
+	if (m_run_recall) {
+		m_texdelta_verify = false; // KYTY_DRAW_RUN_TEXDELTA=2: a recall is not compared
+	}
 	CommitStats::StepMark(CommitStats::Step::RunCandidate);
 	if (run_candidate) {
 		if (DrawRun::GetMode() == DrawRun::Mode::On) {
 			state.color_count         = m_run.color_count;
 			state.color_slots_written = m_run.color_slots;
 			m_run_active              = true;
-			DrawRunMarkBindings();
+			DrawRunMarkBindings(m_run_texdelta);
 			CommitStats::StepMark(CommitStats::Step::MarkBindings);
 			CommitStats::Mark(CommitStats::Phase::Targets);
 			return true;
@@ -2727,7 +2730,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::ResolveTargets");
 	// KYTY_DRAW_RUN_TARGETS (drawRun.h): the record's targets, when their inputs are the record's.
 	const auto targets_mode = DrawRun::TargetsKeepMode();
-	const bool keep_targets = targets_mode != 0 && !m_run_verify &&
+	const bool keep_targets = targets_mode != 0 && !m_run_verify && !m_texdelta_verify &&
 	                          DrawRunTargetsCandidate(buffer, state, render_target_slice_offset);
 	if (keep_targets) {
 		OwnedCounters::Add(DrawRun::GetTotals().targets_kept, 1);
@@ -3412,6 +3415,8 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_pipeswap       = false;
 	m_prepared_validated = false;
 	m_kernel_verify      = false;
+	m_run_texdelta       = false;
+	m_texdelta_verify    = false;
 	if (CommitStats::Enabled()) [[unlikely]] {
 		m_stats_kernel    = CommitStats::KernelOutcome::Off;
 		m_stats_candidate = CommitStats::CandidateOutcome::NotReached;
@@ -3610,9 +3615,12 @@ bool RenderExecutor::DrawRunImagesUnchanged(bool compare_serials, bool attachmen
 	return unchanged;
 }
 
-void RenderExecutor::DrawRunMarkBindings() {
+void RenderExecutor::DrawRunMarkBindings(bool attachments_only) {
 	auto& images = m_context.GetTextureCache().m_slot_images;
 	for (const auto& mark: m_run.images) {
+		if (attachments_only && mark.texture) {
+			continue; // KYTY_DRAW_RUN_TEXDELTA: the draw's own textures are bound by their resolution
+		}
 		auto* image = images.try_get(mark.id);
 		if (image == nullptr) {
 			continue; // the late check falls back
@@ -3717,6 +3725,127 @@ void RenderExecutor::DrawRunKeyDiagResolved(const CommandBuffer& buffer,
 	}
 }
 
+// KYTY_DRAW_RUN_TEXDELTA (drawPrep/texDelta.h): counters, one console line every 2^18 deltas taken
+// or verified ("TexDelta: ..."), the first verify mismatches by field.
+namespace TexDeltaStats {
+enum Field : uint32_t { Targets, Rendering, Feedback, AttachmentState, Transitions, Dynamic, FieldCount };
+constexpr const char* kFieldNames[FieldCount] = {"targets",     "rendering", "feedback", "attachments",
+                                                 "transitions", "dynamic"};
+enum Late : uint32_t { LateImages, LateAttachment, LateStorage, LateOverAttachment, LateCount };
+constexpr const char* kLateNames[LateCount] = {"images", "attachment", "storage", "overattachment"};
+struct Counters {
+	std::array<std::atomic<uint64_t>, 5>          decisions {}; // TexDelta::Decision
+	std::atomic<uint64_t>                         taken {0};
+	std::array<std::atomic<uint64_t>, LateCount>  late {};
+	std::atomic<uint64_t>                         verify_draws {0};
+	std::atomic<uint64_t>                         verify_fallback {0}; // would have fallen back late
+	std::atomic<uint64_t>                         verify_checks {0};
+	std::array<std::atomic<uint64_t>, FieldCount> mismatches {};
+};
+Counters g_counters;
+
+void Print() {
+	auto&       c    = g_counters;
+	std::string line = fmt::format(
+	    "TexDelta: candidates off {} keymatched {} other {} writes {} delta {} | taken {} late", c.decisions[0].load(),
+	    c.decisions[1].load(), c.decisions[2].load(), c.decisions[3].load(), c.decisions[4].load(), c.taken.load());
+	for (uint32_t i = 0; i < LateCount; i++) {
+		line += fmt::format(" {}={}", kLateNames[i], c.late[i].load());
+	}
+	line += fmt::format(" | verify draws {} fallback {} checks {} mismatches", c.verify_draws.load(),
+	                    c.verify_fallback.load(), c.verify_checks.load());
+	uint64_t total = 0;
+	for (uint32_t i = 0; i < FieldCount; i++) {
+		total += c.mismatches[i].load();
+		line += fmt::format(" {}={}", kFieldNames[i], c.mismatches[i].load());
+	}
+	line += fmt::format(" total={}", total);
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+}
+
+void Tick(uint64_t n) {
+	if ((n & 0x3ffffu) == 0) {
+		Print();
+	}
+}
+
+void Check(Field field, bool same) {
+	auto& c = g_counters;
+	c.verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (!same) {
+		if (c.mismatches[field].fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("TexDelta verify: %s mismatch\n", kFieldNames[field]);
+			std::fflush(stdout);
+		}
+	}
+}
+} // namespace TexDeltaStats
+
+void RenderExecutor::TexDeltaCount(DrawRun::TexDelta::Decision decision, bool taken) {
+	auto& c = TexDeltaStats::g_counters;
+	if (taken) {
+		TexDeltaStats::Tick(c.taken.fetch_add(1, std::memory_order_relaxed) + 1);
+		return;
+	}
+	c.decisions[static_cast<uint32_t>(decision)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// KYTY_DRAW_RUN_TEXDELTA: 0 when the delta's resolved textures may keep the record's acquisition,
+// else 1 + TexDeltaStats::Late (a texture is an attachment, a storage binding, or lies over an
+// attachment's memory).
+uint32_t RenderExecutor::TexDeltaTextureVerdict(std::span<PreparedBindings* const> stages) const {
+	using DrawRun::TexDelta::AttachmentFacts;
+	using DrawRun::TexDelta::TextureFacts;
+	const auto id_of = [](ImageId id) {
+		return id ? (static_cast<uint64_t>(id.generation) << 32u) | id.index : uint64_t {0};
+	};
+	static thread_local std::vector<AttachmentFacts> attachments;
+	static thread_local std::vector<TextureFacts>    textures;
+	attachments.clear();
+	textures.clear();
+	for (uint32_t i = m_run.attachments_begin; i < m_run.images.size(); i++) {
+		const auto& mark = m_run.images[i];
+		attachments.push_back({id_of(mark.id), mark.address, mark.size});
+	}
+	auto&            cache = m_context.GetTextureCache();
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto* stage: stages) {
+		for (const auto& binding: stage->images) {
+			TextureFacts facts;
+			facts.id      = id_of(binding.image_id);
+			facts.storage = binding.desc.type == TextureCache::BindingType::Storage;
+			if (const auto* image = cache.m_slot_images.try_get(binding.image_id); image != nullptr) {
+				facts.address = image->info.data.address;
+				facts.size    = image->info.data.size;
+			}
+			textures.push_back(facts);
+		}
+	}
+	const auto verdict = DrawRun::TexDelta::CheckTextures(textures, attachments);
+	// TextureVerdict Attachment/Storage/OverAttachment are TexDeltaStats::Late 1..3.
+	return verdict == DrawRun::TexDelta::TextureVerdict::Ok ? 0u : 1u + static_cast<uint32_t>(verdict);
+}
+
+// KYTY_DRAW_RUN_TEXDELTA=2: a would-be delta took the normal path (no target keep, no acquisition
+// reuse); what the delta keeps from the record must be what that path computed.
+void RenderExecutor::TexDeltaVerify(const DrawRenderState& state, const RenderState& rendering,
+                                    vk::ImageAspectFlags feedback_aspects, bool /*dynamic_emitted*/,
+                                    std::span<PreparedBindings* const> /*stages*/) {
+	using TexDeltaStats::Check;
+	const auto& run = m_run;
+	if (run.acquire_valid && run.depth.size() == 1 && run.colors.size() == run.color_count) {
+		bool same = state.color_count == run.color_count && state.color_slots_written == run.color_slots &&
+		            SameRenderDepthInfo(state.depth_info, run.depth[0]);
+		for (uint32_t i = 0; same && i < state.color_count; i++) {
+			same = SameRenderColorInfo(state.color_info[i], run.colors[i]);
+		}
+		Check(TexDeltaStats::Targets, same);
+	}
+	Check(TexDeltaStats::Rendering, rendering == run.rendering);
+	Check(TexDeltaStats::Feedback, !feedback_aspects);
+	Check(TexDeltaStats::AttachmentState, DrawRunImagesChange(false, true, false) == 0);
+}
 bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
                                       uint32_t render_target_slice_offset) {
 	using DrawRun::Miss;
@@ -3754,15 +3883,41 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		kd.last_key = m_run_key;
 	}
 	bool pipeswap = false;
+	bool texdelta = false;
 	if (!m_run_prev_valid || m_run_key == 0 || m_run_key != m_run.key) {
+		// KYTY_DRAW_RUN_TEXDELTA (texDelta.h): the key differs in the T#/S# words alone.
+		const auto td_mode = DrawRun::TexDeltaMode();
+		if (td_mode != 0 && DrawRun::GetMode() == DrawRun::Mode::On) {
+			DrawRun::TexDelta::Inputs in;
+			in.mode            = td_mode;
+			in.record_valid    = m_run_prev_valid;
+			in.key             = m_run_key;
+			in.record_key      = m_run.key;
+			in.free_key        = m_run_texfree_key;
+			in.record_free_key = m_run.texfree_key;
+			in.record_writes   = m_run.writes;
+			auto decision      = DrawRun::TexDelta::Decide(in);
+			if (decision == DrawRun::TexDelta::Decision::Delta) {
+				const auto writes = [](const ShaderStageRuntime& runtime) {
+					return !DrawRunProgramEligible(*runtime.program, false, g_draw_run_fault_buffer.On());
+				};
+				in.draw_writes = writes(state.vertex_info[0].stage) ||
+				                 (state.ps_active && writes(state.ps_input_info.stage));
+				decision       = DrawRun::TexDelta::Decide(in);
+			}
+			TexDeltaCount(decision);
+			texdelta = decision == DrawRun::TexDelta::Decision::Delta;
+		}
 		// KYTY_DRAW_RUN_PIPESWAP: the key differs in the vertex program alone.
-		if (!m_run_prev_valid || m_run_key == 0 || m_run_swap_key == 0 ||
-		    m_run_swap_key != m_run.swap_key || !DrawRun::PipeSwapEnabled()) {
+		if (!texdelta && (!m_run_prev_valid || m_run_key == 0 || m_run_swap_key == 0 ||
+		                  m_run_swap_key != m_run.swap_key || !DrawRun::PipeSwapEnabled())) {
 			note(m_run_prev_valid && m_run_key != 0 ? Cand::Key : Cand::NoRecord);
 			return false;
 		}
-		pipeswap = true;
-		OwnedCounters::Add(totals.swap_matches, 1);
+		if (!texdelta) {
+			pipeswap = true;
+			OwnedCounters::Add(totals.swap_matches, 1);
+		}
 	} else {
 		OwnedCounters::Add(totals.key_matches, 1);
 	}
@@ -3844,6 +3999,15 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 					return false;
 			}
 		}
+	}
+	if (texdelta) {
+		// KYTY_DRAW_RUN_TEXDELTA=2: the normal path runs and is compared (TexDeltaVerify).
+		if (DrawRun::TexDeltaMode() == 2) {
+			m_texdelta_verify = true;
+			return false;
+		}
+		m_run_texdelta = true;
+		TexDeltaCount(DrawRun::TexDelta::Decision::Delta, true);
 	}
 	note(Cand::Continued);
 	OwnedCounters::Add(totals.continued, 1);
@@ -4166,6 +4330,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.key              = m_run_key;
 	run.targets_key      = m_run_targets_key;
 	run.swap_key         = m_run_swap_key;
+	run.texfree_key      = m_run_texfree_key;
 	run.activity         = DrawRun::ActivityEpoch();
 	run.command          = buffer.Identity();
 	run.tick             = m_context.GetCommandScheduler().CurrentTick();
@@ -4179,6 +4344,12 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 			run.vertex_program = state.vertex_info[0].stage.program;
 			run.push_valid     = pipeline.uses_push_descriptors;
 			run.push_layout    = pipeline.pipeline_layout;
+		}
+		if (m_run_texdelta) {
+			// KYTY_DRAW_RUN_TEXDELTA: the record's attachments stay; its textures are the draw's.
+			run.push_valid  = pipeline.uses_push_descriptors;
+			run.push_layout = pipeline.pipeline_layout;
+			DrawRunRecordTextures(stages);
 		}
 		run.valid = true;
 		return;
@@ -4290,6 +4461,32 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.valid = true;
 }
 
+// KYTY_DRAW_RUN_TEXDELTA: a delta's record keeps its attachment marks and takes the draw's texture
+// marks; the image epoch is proven again over all marks (as a full record does). The record is not
+// recalled later (its recall copies would be the previous textures').
+void RenderExecutor::DrawRunRecordTextures(std::span<PreparedBindings* const> stages) {
+	auto&                                     run = m_run;
+	static thread_local std::vector<DrawRunImage> textures;
+	textures.clear();
+	std::scoped_lock lock {m_context.GetTextureCache().m_lock};
+	const auto       epoch = ImageStateEpoch();
+	for (const auto* stage: stages) {
+		for (const auto& binding: stage->images) {
+			textures.push_back(MakeDrawRunImage(binding.image_id, true));
+		}
+	}
+	run.attachments_begin = DrawRun::TexDelta::ReplaceTextureMarks<DrawRunImage>(run.images, run.attachments_begin, textures);
+	bool clean = true;
+	for (const auto& mark: run.images) {
+		const auto* image = m_context.GetTextureCache().m_slot_images.try_get(mark.id);
+		clean = clean && image != nullptr && !image->binding.needs_rebind &&
+		        (image->info.data.Empty() || (image->registered && !image->IsCpuDirty() && !image->IsBufferModified())) &&
+		        (!mark.texture || DrawRunTextureReady(*image));
+	}
+	run.image_epoch  = clean ? epoch : 0;
+	run.recall_valid = false;
+	run.verify_valid = false;
+}
 // KYTY_DRAW_RUN=verify: a draw that would have continued the run took the normal path; what the
 // continuation would have reused must be what it computed.
 void RenderExecutor::DrawRunVerify(const DrawRenderState& state, const RenderState& rendering,
@@ -6003,14 +6200,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			// KYTY_UNNORMALIZED_FIX: a hull shader's normalized-LOD copy binds normalized samplers.
 			bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i],
-			                plan_stages ? &plan->vertex : nullptr, m_run_active);
+			                plan_stages ? &plan->vertex : nullptr, m_run_active && !m_run_texdelta);
 			descriptor_stages[stage_count++] = &bindings.vertex[i];
 		}
 		if (!m_kernel && state.ps_active) {
 			if (!bindings.pixel) bindings.pixel.emplace();
 			PrepareBindings(state.ps_input_info.stage, *bindings.pixel,
 			                plan_stages && plan->pixel_active ? &plan->pixel : nullptr,
-			                m_run_active);
+			                m_run_active && !m_run_texdelta);
 			descriptor_stages[stage_count++] = &*bindings.pixel;
 		}
 		if (m_kernel_verify && m_run_active && !m_run_pipeswap) {
@@ -6029,7 +6226,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareGraphicsBindings");
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
-		                        m_run_active);
+		                        m_run_active && !m_run_texdelta);
 	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
@@ -6107,14 +6304,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_run_targets_kept = false;
 		OwnedCounters::Add(DrawRun::GetTotals().targets_late, 1);
 	}
-	if (targets_late || (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
-	                                      run_indirect_barrier))) {
+	// KYTY_DRAW_RUN_TEXDELTA: a delta's textures are its own (resolved above); the record's attachments
+	// must be unchanged and no texture may be an attachment, a storage binding or over one.
+	uint32_t texdelta_late = 0;
+	if (m_run_active && m_run_texdelta) {
+		texdelta_late = !DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true, true) || run_indirect_barrier
+		                    ? 1u + TexDeltaStats::LateImages
+		                    : TexDeltaTextureVerdict(stages);
+	}
+	if (targets_late ||
+	    (m_run_active && (m_run_texdelta ? texdelta_late != 0
+	                                     : (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
+	                                        run_indirect_barrier)))) {
 		const CommitStats::SubScope late_scope(CommitStats::Sub::LateFallback);
 		if (!targets_late) {
 			DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
 			DrawRun::CountMiss(DrawRun::Miss::Images);
 		}
-		m_run_active = false;
+		if (texdelta_late != 0) {
+			TexDeltaStats::g_counters.late[texdelta_late - 1].fetch_add(1, std::memory_order_relaxed);
+		}
+		m_run_texdelta = false;
+		m_run_active   = false;
 		if (std::exchange(m_kernel, false)) {
 			ContKernel::g_counters.left.fetch_add(1, std::memory_order_relaxed);
 			if (CommitStats::Enabled()) [[unlikely]] {
@@ -6187,6 +6398,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		DrawRun::CountMiss(DrawRun::Miss::Images);
 		m_run_verify = false;
 		DrawRunRecallFallback();
+	}
+	// KYTY_DRAW_RUN_TEXDELTA=2: whether the would-be delta would have passed its late check (the normal
+	// path resolved its textures above). One that would have fallen back is not compared.
+	bool texdelta_compare = false;
+	if (m_texdelta_verify) {
+		TexDeltaStats::Tick(TexDeltaStats::g_counters.verify_draws.fetch_add(1, std::memory_order_relaxed) + 1);
+		texdelta_compare = DrawRunCommandUnchanged(buffer) && DrawRunImagesUnchanged(true, true) &&
+		                   !run_indirect_barrier && TexDeltaTextureVerdict(stages) == 0;
+		if (!texdelta_compare) {
+			TexDeltaStats::g_counters.verify_fallback.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 	CommitStats::StepMark(CommitStats::Step::LateCheck);
 
@@ -6350,7 +6572,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// (Verify mode checks a would-be continuation's acquisition as the continuation's.)
 		CommitStats::SubScope candidate_scope(CommitStats::Sub::AcqCandidate);
 		const bool acquire_reuse =
-		    DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify &&
+		    DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify && !m_texdelta_verify &&
 		    DrawRunAcquireCandidate(buffer, state, stages, bounded ? &written : nullptr);
 		candidate_scope.Stop();
 		if (acquire_reuse) {
@@ -6361,7 +6583,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_depth_feedback.valid = false;
 		} else {
 			const auto acquire_transitions =
-			    acquire_reuse ? Image::RecordedTransitions() : uint64_t {0};
+			    acquire_reuse || texdelta_compare ? Image::RecordedTransitions() : uint64_t {0};
 			rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 			                                 state.depth_info, feedback_aspects, stages,
 			                                 bounded ? &written : nullptr);
@@ -6378,6 +6600,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				if (const auto change = DrawRunImagesChange(false, true, true); change != 0) {
 					DrawRun::ReportMismatch("reused acquisition's attachment state", change);
 				}
+			}
+			if (texdelta_compare) {
+				TexDeltaStats::Check(TexDeltaStats::Transitions, Image::RecordedTransitions() == acquire_transitions);
+				TexDeltaVerify(state, rendering, feedback_aspects, false, stages);
 			}
 			if (run_verify_images) {
 				if (const auto change = DrawRunImagesChange(false, false, true); change != 0) {
@@ -6439,7 +6665,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
 		const CommitStats::SubScope push_scope(CommitStats::Sub::Push);
-		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active && !m_run_texdelta);
 	}
 	if (run_verify_push) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
@@ -6463,7 +6689,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// vertex program as the previous draw's, which recorded it into this command buffer; the
 	// shadow shows nothing replaced it since (another pipeline bind or command buffer).
 	// A recall records it again: the draws in between left their own.
-	const bool run_dynamic = (m_run_active || m_run_verify) && !m_run_recall && !m_run_pipeswap &&
+	const bool run_dynamic = (m_run_active || m_run_verify || texdelta_compare) && !m_run_recall && !m_run_pipeswap &&
 	                         DynamicStateShadowEnabled() &&
 	                         m_dynamic_state.valid && m_dynamic_state.command == vk_buffer.Identity() &&
 	                         m_dynamic_state.pipeline != nullptr &&
@@ -6496,6 +6722,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				g_dynamic_state_emitted++;
 			}
 		}
+	}
+	if (texdelta_compare && run_dynamic) {
+		TexDeltaStats::Check(TexDeltaStats::Dynamic, g_dynamic_state_emitted == run_dynamic_emitted);
 	}
 	if (m_run_verify && run_verify_images && run_dynamic &&
 	    g_dynamic_state_emitted != run_dynamic_emitted) {
@@ -6906,7 +7135,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		// KYTY_DRAW_RUN_CONT_ELIGIBLE (drawRun.h): a continuation's per-stage part is its record's.
 		const auto cont_mode  = DrawRun::ContEligibleMode();
-		const bool cont_known = cont_mode != 0 && m_run_active && !m_run_pipeswap &&
+		const bool cont_known = cont_mode != 0 && m_run_active && !m_run_pipeswap && !m_run_texdelta &&
 		                        m_run.record_writes_ok == writes_ok;
 		const auto stages_eligible = [&] {
 			bool ok = true;

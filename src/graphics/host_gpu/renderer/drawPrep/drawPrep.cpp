@@ -1429,6 +1429,8 @@ struct Engine::Slot {
 	uint64_t run_targets_key = 0;
 	// KYTY_DRAW_RUN_PIPESWAP: the key without the vertex program.
 	uint64_t run_swap_key = 0;
+	// KYTY_DRAW_RUN_TEXDELTA: the key without the T#/S# words (texDelta.h).
+	uint64_t run_texfree_key = 0;
 	// KYTY_DRAW_RUN_KEY_DIAG: the key's part hashes (only while the switch is on).
 	DrawRun::KeyParts run_parts {};
 	bool              run_parts_valid = false;
@@ -1445,10 +1447,12 @@ void HashForRepeatTrace(Engine::Slot& slot) {
 	}
 	slot.run_targets_key = 0;
 	slot.run_swap_key    = 0;
+	slot.run_texfree_key = 0;
 	slot.run_key = DrawRun::Enabled() ? DrawRun::StructureKey(slot.registers.context,
 	                                                          slot.registers.user_config,
 	                                                          slot.prepared, &slot.run_targets_key,
-	                                                          &slot.run_swap_key)
+	                                                          &slot.run_swap_key,
+	                                                          DrawRun::TexDeltaMode() != 0 ? &slot.run_texfree_key : nullptr)
 	                                  : 0;
 	slot.run_parts_valid = slot.run_key != 0 && DrawRun::KeyDiagEnabled();
 	if (slot.run_parts_valid) [[unlikely]] {
@@ -2099,6 +2103,7 @@ void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& dra
 	executor.m_run_key             = commit ? slot.run_key : 0;
 	executor.m_run_targets_key     = commit ? slot.run_targets_key : 0;
 	executor.m_run_swap_key        = commit ? slot.run_swap_key : 0;
+	executor.m_run_texfree_key     = commit ? slot.run_texfree_key : 0;
 	executor.m_run_parts           = commit && slot.run_parts_valid ? &slot.run_parts : nullptr;
 	executor.m_in_engine_commit    = commit;
 	{
@@ -2111,6 +2116,7 @@ void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& dra
 	executor.m_run_key          = 0;
 	executor.m_run_targets_key  = 0;
 	executor.m_run_swap_key     = 0;
+	executor.m_run_texfree_key  = 0;
 	executor.m_run_parts        = nullptr;
 	if (slot.plan.valid) {
 		CountCommittedPlan(executor.m_binding_plan_active);
@@ -2310,6 +2316,7 @@ void Engine::Commit(Slot& slot) {
 	executor.m_run_key          = slot.run_key;
 	executor.m_run_targets_key  = slot.run_targets_key;
 	executor.m_run_swap_key     = slot.run_swap_key;
+	executor.m_run_texfree_key  = slot.run_texfree_key;
 	executor.m_run_parts        = slot.run_parts_valid ? &slot.run_parts : nullptr;
 	executor.m_in_engine_commit = true;
 	CommitStats::StepMark(CommitStats::Step::BindRegs);
@@ -2323,6 +2330,7 @@ void Engine::Commit(Slot& slot) {
 	executor.m_run_key          = 0;
 	executor.m_run_targets_key  = 0;
 	executor.m_run_swap_key     = 0;
+	executor.m_run_texfree_key  = 0;
 	executor.m_run_parts        = nullptr;
 	if (slot.plan.valid) {
 		CountCommittedPlan(executor.m_binding_plan_active);
