@@ -1,4 +1,4 @@
-#ifndef EMULATOR_SRC_COMMON_LIVESWITCH_H_
+﻿#ifndef EMULATOR_SRC_COMMON_LIVESWITCH_H_
 #define EMULATOR_SRC_COMMON_LIVESWITCH_H_
 
 #include <atomic>
@@ -128,6 +128,10 @@ struct CpIdleTotals {
 	uint64_t starved = 0;
 };
 void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept;
+
+// wholecp measurement: extra log lines written right after every application line (argument: the
+// line's live sequence number), e.g. the KYTY_HLE_WAIT_STATS per-thread totals.
+void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept;
 
 namespace Testing {
 // What the live-control thread does with the file's text: parse it and stage the changes.

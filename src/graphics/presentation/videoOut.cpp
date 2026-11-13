@@ -1,3 +1,4 @@
+#include "common/hleWaitStats.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -1774,6 +1775,7 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 }
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
+	HleWait::Scope hle_wait_scope(HleWait::FlipSubmit); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	auto&     driver     = DriverState();

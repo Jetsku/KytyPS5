@@ -1,4 +1,4 @@
-#include "common/liveSwitch.h"
+﻿#include "common/liveSwitch.h"
 
 #include "common/cpuPlacement.h"
 #include "common/hangTrace.h"
@@ -65,6 +65,7 @@ uint64_t g_cp_slice_start = 0; // 0: outside a slice
 std::atomic<void (*)(const std::string&)> g_log_sink {nullptr};
 std::atomic<GpuTotals (*)()>              g_gpu_totals {nullptr};
 std::atomic<CpIdleTotals (*)()>           g_cp_idle {nullptr};
+std::atomic<std::string (*)(uint64_t)>    g_extra_lines {nullptr};
 
 void WriteLog(const std::string& line) {
 	if (auto* sink = g_log_sink.load(std::memory_order_acquire); sink != nullptr) {
@@ -379,6 +380,11 @@ void Registry::Apply(uint64_t flip) {
 	WriteLog(fmt::format("Live: seq {} applied at CP flip {} (t_ms {}, t_us {}, cp_busy_us {}){}: {}\n",
 	                     seq, flip, t_ms, now_ns / 1000u, busy_ns / 1000u, gpu,
 	                     changes.empty() ? std::string("no change") : changes));
+	if (auto* extra = g_extra_lines.load(std::memory_order_acquire); extra != nullptr) {
+		if (auto lines = extra(staged.seq.value_or(0)); !lines.empty()) {
+			WriteLog(lines);
+		}
+	}
 	for (const auto& key: unknown) {
 		WriteLog(fmt::format("Live: seq {}: {} is not a live switch in this build (ignored)\n", seq,
 		                     key));
@@ -407,6 +413,10 @@ int64_t ParseDefaultOff(const char* value) {
 
 bool Enabled() noexcept {
 	return g_enabled.load(std::memory_order_relaxed);
+}
+
+void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept {
+	g_extra_lines.store(provider, std::memory_order_release);
 }
 
 void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept {

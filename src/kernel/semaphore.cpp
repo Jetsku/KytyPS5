@@ -1,3 +1,4 @@
+﻿#include "common/hleWaitStats.h"
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
@@ -325,6 +326,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	HleWait::Scope hle_wait_scope(HleWait::Sema); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -669,6 +671,7 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	HleWait::Scope hle_wait_scope(HleWait::Sema); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -742,6 +745,7 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	HleWait::Scope hle_wait_scope(HleWait::Sema); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }

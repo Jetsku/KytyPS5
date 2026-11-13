@@ -1,3 +1,4 @@
+#include "common/hleWaitStats.h"
 #include "libs/agc.h"
 
 #include "common/assert.h"
@@ -1746,6 +1747,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 }
 
 int KYTY_SYSV_ABI AgcSuspendPoint() {
+	HleWait::Scope hle_wait_scope(HleWait::AgcSuspend); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
@@ -4396,6 +4398,7 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
+	HleWait::Scope hle_wait_scope(HleWait::AgcSubmit); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
@@ -4412,6 +4415,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
+	HleWait::Scope hle_wait_scope(HleWait::AgcSubmit); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	AgcTrace("\t count = %" PRIu32 "\n", count);
@@ -4473,6 +4477,7 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
+	HleWait::Scope hle_wait_scope(HleWait::AgcSubmit); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
@@ -4498,6 +4503,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
                                                      uint32_t* const* command_buffers,
                                                      const uint32_t*  sizes_in_dwords,
                                                      uint32_t         count) {
+	HleWait::Scope hle_wait_scope(HleWait::AgcSubmit); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
