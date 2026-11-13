@@ -3912,6 +3912,11 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		// expanded at every render-target bind), so the bytes are decided on the GPU, per tile,
 		// every time: tiles still marked cleared get the clear colour, as the hardware shows them.
 		if (CmaskDrawExpandEnabled()) {
+			// Still our own expanded fill (no guest write since): nothing is cleared.
+			if (const auto fill = m_buffer_cache.KnownFill(metadata.address, metadata.size);
+			    fill && *fill == UINT32_MAX) {
+				continue;
+			}
 			native[slice] = 1;
 			provable      = false;
 			continue;
@@ -4302,7 +4307,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	// target for rendering therefore marks its whole CMASK expanded on the GPU, in order with the
 	// draws (conservative: untouched tiles hold the materialized clear colour on the host).
 	if (desc.cmask.valid && desc.type == BindingType::RenderTarget && desc.cmask.range.Valid()) {
-		if (CmaskDrawExpandEnabled()) {
+		const auto fill = m_buffer_cache.KnownFill(desc.cmask.range.address, desc.cmask.range.size);
+		if (CmaskDrawExpandEnabled() && !(fill && *fill == UINT32_MAX)) {
 			m_buffer_cache.FillBuffer(desc.cmask.range.address, desc.cmask.range.size, UINT32_MAX,
 			                          false);
 			if (recording) {
