@@ -138,8 +138,8 @@ uint64_t BufferCache::SynchronizeBdaReach(std::span<const std::pair<uint64_t, ui
 					const auto* entry = m_page_table.Find(pages[first + k]);
 					if (entry != nullptr && *entry) {
 						const auto& buffer = m_slot_buffers[*entry];
-						addresses[k]       = buffer.BufferDeviceAddress() +
-						               ((pages[first + k] - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS);
+						addresses[k]       = TaggedBdaEntry(pages[first + k], buffer.BufferDeviceAddress() +
+						               ((pages[first + k] - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS));
 					}
 				}
 				WriteDataBuffer(m_bda_pagetable_buffer, pages[first] * sizeof(vk::DeviceAddress), addresses.data(),
@@ -227,8 +227,8 @@ void BufferCache::RestoreBdaReachTraps(bool keep_verifying) {
 			const auto* entry = m_page_table.Find(pages[k]);
 			if (entry != nullptr && *entry) {
 				const auto& buffer   = m_slot_buffers[*entry];
-				addresses[k - first] = buffer.BufferDeviceAddress() +
-				                       ((pages[k] - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS);
+				addresses[k - first] = TaggedBdaEntry(pages[k], buffer.BufferDeviceAddress() +
+				                       ((pages[k] - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS));
 			}
 			// A trapped page is CPU-dirty: a later scan may trap it again.
 			if (state.active) {

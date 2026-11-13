@@ -53,8 +53,10 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BdaWritesEnabled() ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
-                                        : BufferCache::CACHING_NUMPAGES / 8),
+                     ShaderRecompiler::GetCodegenOptions().bda_tags_gpu_count
+                         ? BufferCache::BDA_TAG_COUNTER_WORD * sizeof(uint32_t) + 16 // KYTY_BDA_TAGS_GPU_COUNT
+                     : BdaWritesEnabled() ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
+                                          : BufferCache::CACHING_NUMPAGES / 8),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -154,10 +156,43 @@ void FaultManager::ProcessFaultBuffer() {
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
+	// KYTY_BDA_TAGS_GPU_COUNT (diagnostic): a copy of the get_bda_pointer counters per area.
+	const bool gpu_count = ShaderRecompiler::GetCodegenOptions().bda_tags_gpu_count;
+	if (gpu_count) {
+		if (m_tag_count_download == nullptr) {
+			m_tag_count_download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+			                                                AllFlags, MaxPendingFaults * 16);
+		}
+		vk::BufferMemoryBarrier2 count_barrier {};
+		count_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		count_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+		count_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		count_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		count_barrier.buffer        = m_fault_buffer.Handle();
+		count_barrier.offset        = BufferCache::BDA_TAG_COUNTER_WORD * sizeof(uint32_t);
+		count_barrier.size          = 16;
+		dependency.pBufferMemoryBarriers = &count_barrier;
+		command.pipelineBarrier2(dependency);
+		const vk::BufferCopy copy {BufferCache::BDA_TAG_COUNTER_WORD * sizeof(uint32_t), m_current_area * 16u, 16};
+		command.copyBuffer(m_fault_buffer.Handle(), m_tag_count_download->Handle(), 1, &copy);
+	}
 
 	const auto area = m_current_area;
+	BufferCache::s_tag_hops.scans.fetch_add(1, std::memory_order_relaxed);
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+		BufferCache::s_tag_hops.scans_read.fetch_add(1, std::memory_order_relaxed);
+		if (m_tag_count_download != nullptr) {
+			m_tag_count_download->Invalidate(area * 16u, 16);
+			uint32_t now[3] {};
+			std::memcpy(now, m_tag_count_download->Mapped().data() + area * 16u, sizeof(now));
+			auto& hops = BufferCache::s_tag_hops;
+			std::atomic<uint64_t>* totals[3] {&hops.gpu_calls, &hops.gpu_zero, &hops.gpu_untagged};
+			for (int k = 0; k < 3; ++k) {
+				totals[k]->fetch_add(static_cast<uint32_t>(now[k] - m_tag_count_last[k]), std::memory_order_relaxed);
+				m_tag_count_last[k] = now[k];
+			}
+		}
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		// The parser counts every faulting page but stores at most MaxPageFaults - 1 records
@@ -166,15 +201,19 @@ void FaultManager::ProcessFaultBuffer() {
 		// out stay set in the bitmap for the next scan (fd04c3fa9).
 		const auto count = static_cast<uint32_t>(
 		    std::min<uint64_t>(static_cast<uint32_t>(faults[0]), MaxPageFaults - 1));
+		BufferCache::s_tag_hops.records.fetch_add(count, std::memory_order_relaxed);
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+			if (!m_buffer_cache.BdaAccessTagsBuilt()) { // tags: most reports are untagged backed pages
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+			}
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 			m_buffer_cache.NoteBdaFault(start, end - start);
 			m_buffer_cache.NoteBdaReachFault(start, end - start); // KYTY_BDA_REACH=verify
+			m_buffer_cache.NoteBdaTagFault(start, end - start);   // KYTY_BDA_ACCESS_TAGS
 		});
 		m_fault_areas[area] = 0;
 	});

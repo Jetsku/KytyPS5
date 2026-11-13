@@ -693,7 +693,20 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
+	// KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp): 1 = only the pages DMA shaders accessed and new
+	// buffers; verify = the full pass plus the record of what 1 would have skipped.
+	const auto tags = m_buffer_cache.BdaAccessTagsMode();
+	BufferCache::s_tag_hops.prepares.fetch_add(1, std::memory_order_relaxed);
+	if (tags == 1) {
+		(void)m_buffer_cache.SynchronizeBdaTagged(m_mapped_ranges);
+	} else {
+		if (tags == 2) {
+			m_buffer_cache.PrepareBdaTagVerify();
+		}
+		m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
+		m_buffer_cache.NoteBdaTagFullPass(); // registrations so far are uploaded
+	}
+	m_buffer_cache.ReportBdaTags();
 	m_fault_process_pending = true;
 }
 

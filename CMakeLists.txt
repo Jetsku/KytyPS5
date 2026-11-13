@@ -1922,6 +1922,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-per-submission-only)
 	set_tests_properties(bda_sync_per_submission_incremental PROPERTIES
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	# KYTY_BDA_ACCESS_TAGS (the check sets the codegen option and the live policy itself): plain and
+	# incremental passes.
+	add_test(NAME bda_access_tags
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-access-tags-only)
+	add_test(NAME bda_access_tags_incremental
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-access-tags-only)
+	set_tests_properties(bda_access_tags_incremental PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	add_test(NAME bda_access_tags_shader
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-access-tags-shader-only)
 	# KYTY_BDA_DIRTY_LOG (with incremental BDA synchronization): verify mode and off.
 	add_test(NAME bda_sync_dirty_log_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)

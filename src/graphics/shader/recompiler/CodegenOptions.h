@@ -636,6 +636,16 @@ struct CodegenOptions {
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
 	// renderer/meshIndirect.h). Unset, 0 or "empty": the dwords are only ever pushed.
 	bool mesh_indirect_params = false;
+	// KYTY_BDA_ACCESS_TAGS=1|verify (any value but 0; default off; based on upstream KytyPS5 0ec2cd5d5):
+	// get_bda_pointer also records a page fault for a backed page whose page-table entry lacks the
+	// accessed tag (bit 0, BufferCache::BDA_ACCESSED) and strips the tag from the pointer. The host
+	// tags the pages DMA shaders reported (bufferCacheTags.cpp). The live value of the same switch
+	// picks the synchronization policy.
+	bool bda_access_tags = false;
+	// KYTY_BDA_TAGS_GPU_COUNT=1 (diagnostic, with bda_access_tags): get_bda_pointer also counts its
+	// calls, the calls on a zero entry and the calls on an untagged entry in three words after the
+	// fault buffer layout (BufferCache::BDA_TAG_COUNTER_WORD); the BdaTags line prints them.
+	bool bda_tags_gpu_count = false;
 	// KYTY_REALTIME_CLOCK=0: S_MEMREALTIME returns the placeholder UINT64_MAX (the behaviour before
 	// the real clock) instead of the host GPU clock. With the placeholder a guest spin-wait timed by
 	// S_MEMREALTIME never times out, and only a GPU reset ends it. The emitter reads the clock the

@@ -88,6 +88,21 @@ struct BufferContentRevision {
 	bool operator==(const BufferContentRevision&) const noexcept = default;
 };
 
+// KYTY_BDA_ACCESS_TAGS diagnostics, one counter per hop of a report (printed with BdaTags):
+// programs emitted with the tag check, fault-buffer scans recorded and read back on the host,
+// fault records read, and PrepareBda calls (operations that read through device addresses).
+struct BdaTagHops {
+	std::atomic<uint64_t> programs {0};
+	std::atomic<uint64_t> scans {0};
+	std::atomic<uint64_t> scans_read {0};
+	std::atomic<uint64_t> records {0};
+	std::atomic<uint64_t> prepares {0};
+	// KYTY_BDA_TAGS_GPU_COUNT: the GPU counters, accumulated from their readbacks.
+	std::atomic<uint64_t> gpu_calls {0};
+	std::atomic<uint64_t> gpu_zero {0};
+	std::atomic<uint64_t> gpu_untagged {0};
+};
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -114,6 +129,9 @@ public:
 	static constexpr uint64_t BDA_STORE_LOG_BYTES     = (4 + 4 * BDA_STORE_LOG_ENTRIES) * sizeof(uint32_t);
 	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE =
 	    BDA_STORE_LOG_WORD * sizeof(uint32_t) + BDA_STORE_LOG_BYTES;
+	// KYTY_BDA_TAGS_GPU_COUNT: get_bda_pointer calls, zero-entry calls, untagged-entry calls (u32,
+	// wrapping) after the largest layout; the fault buffer grows by 16 bytes for them.
+	static constexpr uint64_t BDA_TAG_COUNTER_WORD = BDA_WRITES_FAULT_BUFFER_SIZE / sizeof(uint32_t);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -435,6 +453,37 @@ public:
 	[[nodiscard]] BdaReachVerifyTotals GetBdaReachVerifyTotals() const;
 	// FaultManager: a page fault the GPU recorded at [start, start + size).
 	void               NoteBdaReachFault(uint64_t start, uint64_t size);
+	// KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp; based on upstream KytyPS5 0ec2cd5d5): bit 0 of a
+	// page-table entry tags a page a DMA shader accessed (shaders built with the codegen option
+	// report untagged pages through the fault bitmap). Live policy, only with that codegen option:
+	// 0 = the full BDA pass; 1 = the full pass uploads only tagged pages and buffers registered
+	// since the last pass; verify = the full pass, plus the miss count described in
+	// bufferCacheTags.cpp.
+	static constexpr vk::DeviceAddress BDA_ACCESSED = 1;
+	[[nodiscard]] int64_t BdaAccessTagsMode() const;
+	[[nodiscard]] bool    BdaAccessTagsBuilt() const { return m_bda_tags != nullptr; }
+	// The 10 s console line (BdaTags) while the codegen option is on. GPU thread.
+	void               ReportBdaTags();
+	// The tagged pass (mode 1) over the GPU mappings. Returns the upload bytes. GPU thread.
+	uint64_t           SynchronizeBdaTagged(const RangeSet& mapped_ranges);
+	// Mode verify, before the full pass: records the CPU-dirty pages the tagged pass would skip.
+	void               PrepareBdaTagVerify();
+	// After a full pass (modes 0 and verify): the buffers registered so far are uploaded, so they
+	// leave the pending set (verify then models a tagged pass that ran at the same points).
+	void               NoteBdaTagFullPass();
+	// FaultManager: pages a DMA shader reported (after FindBuffer made them backed where possible).
+	void               NoteBdaTagFault(uint64_t start, uint64_t size);
+	struct BdaTagTotals {
+		uint64_t tagged_pages   = 0; // pages tagged so far
+		uint64_t tagged_passes  = 0; // mode 1 passes
+		uint64_t tagged_bytes   = 0; // their uploads
+		uint64_t verify_passes  = 0; // mode verify passes
+		uint64_t would_skip     = 0; // pages a verify pass found the tagged pass would leave stale
+		uint64_t misses         = 0; // such pages a DMA shader then reported (must be 0)
+		uint64_t log_overflows  = 0; // reach-log losses during verify
+	};
+	[[nodiscard]] BdaTagTotals GetBdaTagTotals() const;
+	inline static BdaTagHops s_tag_hops; // KYTY_BDA_ACCESS_TAGS diagnostics (above the class)
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
 	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
@@ -1044,6 +1093,15 @@ private:
 	struct BdaReachVerify;
 	// shared_ptr: the type is complete only in bufferCacheReach.cpp.
 	std::shared_ptr<BdaReachVerify>                   m_bda_reach;
+	// KYTY_BDA_ACCESS_TAGS state (bufferCacheTags.cpp), created when the codegen option is on.
+	struct BdaTags;
+	std::shared_ptr<BdaTags>                          m_bda_tags;
+	void CreateBdaTags();
+	// ChangeRegister: tags the accessed pages among `entries` (page-table entries from first_page)
+	// and queues a registered range for the next tagged pass.
+	void ApplyBdaTags(uint64_t first_page, std::span<vk::DeviceAddress> entries, bool insert);
+	// The entry of `page` with its accessed tag (0 stays 0).
+	[[nodiscard]] vk::DeviceAddress TaggedBdaEntry(uint64_t page, vk::DeviceAddress entry) const;
 	// ChangeRegister: page-table entries of [first_page, last_page) were rewritten.
 	void NoteBdaReachRegister(uint64_t first_page, uint64_t last_page, bool insert);
 	RangeSet                                          m_gpu_modified_ranges;

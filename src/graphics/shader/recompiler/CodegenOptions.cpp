@@ -246,6 +246,11 @@ CodegenOptions FromEnvironment() {
 		    std::strcmp(mode, "on") == 0 || std::strcmp(mode, "verify") == 0 ||
 		    std::strcmp(mode, "exit") == 0;
 	}
+	{
+		const auto* mode        = std::getenv("KYTY_BDA_ACCESS_TAGS");
+		options.bda_access_tags = mode != nullptr && mode[0] != '\0' && std::strcmp(mode, "0") != 0;
+		options.bda_tags_gpu_count = options.bda_access_tags && EnvFlag("KYTY_BDA_TAGS_GPU_COUNT", false);
+	}
 	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
 	options.fract_clamp  = EnvFlag("KYTY_FRACT_CLAMP", options.fract_clamp);
 	if (const auto* mode = std::getenv("KYTY_RT_SOFTWARE");

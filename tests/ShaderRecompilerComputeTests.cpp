@@ -1897,6 +1897,9 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
+  // KYTY_BDA_ACCESS_TAGS (upstream KytyPS5 0ec2cd5d5): with the codegen option, a load from an
+  // unaccessed mapping must record its first page in the fault bitmap.
+  bool accessed = true;
 };
 
 struct TestCase {
@@ -9260,6 +9263,193 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "BDA-submission direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp; based on upstream KytyPS5 0ec2cd5d5 and its test):
+  // with the codegen option, policy 1 uploads a new buffer, then only pages a DMA shader reported;
+  // a report tags the page-table entry and queues the page. verify runs the full pass and counts
+  // a report of a page the tagged pass would have left stale as a miss; 0 is the full pass again.
+  void CheckBdaAccessTags() {
+    constexpr const char *name = "BdaAccessTags";
+    constexpr uintptr_t base = 0x0000000207200000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t buffer_offset = 0x20000;
+    constexpr uint64_t buffer_size = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+
+    EnsureRuntimeContext();
+    const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+    auto options = saved_options;
+    options.bda_access_tags = true;
+    ShaderRecompiler::SetCodegenOptions(options);
+    const auto set_tags = [](const char *text) {
+      Live::Testing::StageText(text);
+      Live::OnCpFlip();
+    };
+    set_tags("KYTY_BDA_ACCESS_TAGS=1\n");
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "BDA-tags direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "BDA-tags fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 29 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      Require(name, "tags built", cache.BdaAccessTagsBuilt() && cache.BdaAccessTagsMode() == 1,
+              "the codegen option did not create the tag state, or the live policy is not 1");
+      context.MapMemory(base, allocation_size);
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      const auto dirty = [&](uint64_t offset) {
+        return OnGpuThread(context, [&] { return cache.IsRegionCpuModified(base + offset, sizeof(uint32_t)); });
+      };
+      const auto [buffer, offset] = OnGpuThread(context, [&] {
+        return cache.ObtainBuffer(base + buffer_offset, buffer_size, false, false);
+      });
+      const uint64_t a = buffer_offset, b = buffer_offset + page, c = buffer_offset + 2 * page;
+
+      // 1: the new buffer is uploaded; then a write to a page no shader reported stays dirty.
+      OnGpuThread(context, [&] { context.PrepareBda(); });
+      Require(name, "new buffer", !dirty(a) && !dirty(b), "the tagged pass did not upload a new buffer");
+      cpu_write(a + 0x40, 0x7a6a5a4au);
+      OnGpuThread(context, [&] { context.PrepareBda(); });
+      Require(name, "unaccessed write", dirty(a), "the tagged pass uploaded a page no DMA shader accessed");
+      // A report tags the page and the next pass uploads it.
+      OnGpuThread(context, [&] {
+        cache.NoteBdaTagFault(base + a, 1);
+        context.PrepareBda();
+      });
+      Require(name, "accessed page", !dirty(a), "a DMA access report did not queue its page");
+      const auto after_tag = cache.GetBdaTagTotals();
+      Require(name, "tag count", after_tag.tagged_pages == 1 && after_tag.tagged_passes == 3,
+              "the tag or pass counts are wrong");
+
+      // verify: the full pass uploads; a later report of a would-skip page is a miss.
+      set_tags("KYTY_BDA_ACCESS_TAGS=verify\n");
+      cpu_write(a + 0x80, 0x01020304u); // tagged: not a would-skip page
+      cpu_write(b + 0x80, 0x05060708u); // untagged: would skip
+      // A write fault can dirty more than its page (the tracker unprotects a whole protection
+      // granule, 64 KiB here): every CPU-dirty untagged page of the buffer is a would-skip page.
+      uint64_t expected_skip = 0;
+      for (uint64_t k = 1; k < buffer_size / page; k++) {
+        expected_skip += dirty(a + k * page) ? 1 : 0;
+      }
+      Require(name, "verify dirty", dirty(b) && expected_skip >= 1, "the CPU write did not dirty page b");
+      OnGpuThread(context, [&] { SyncEpoch::Advance(); context.PrepareBda(); });
+      Require(name, "verify full pass", !dirty(a) && !dirty(b), "verify did not run the full pass");
+      OnGpuThread(context, [&] { cache.NoteBdaTagFault(base + b, 1); });
+      const auto verified = cache.GetBdaTagTotals();
+      std::printf("BdaAccessTags: would-skip %llu -> %llu, misses %llu -> %llu, tagged %llu -> %llu, verify passes %llu\n",
+                  static_cast<unsigned long long>(after_tag.would_skip), static_cast<unsigned long long>(verified.would_skip),
+                  static_cast<unsigned long long>(after_tag.misses), static_cast<unsigned long long>(verified.misses),
+                  static_cast<unsigned long long>(after_tag.tagged_pages), static_cast<unsigned long long>(verified.tagged_pages),
+                  static_cast<unsigned long long>(verified.verify_passes));
+      Require(name, "verify miss", verified.would_skip == after_tag.would_skip + expected_skip &&
+                                       verified.misses == after_tag.misses + 1,
+              "verify did not count the untagged CPU-dirty pages, or the report of page b as a miss");
+
+      // 0: the full pass again.
+      set_tags("KYTY_BDA_ACCESS_TAGS=0\n");
+      cpu_write(c + 0x80, 0x0d0c0b0au);
+      OnGpuThread(context, [&] { SyncEpoch::Advance(); context.PrepareBda(); });
+      Require(name, "off", !dirty(c), "policy 0 did not run the full pass");
+
+      // A buffer registered before a full pass is uploaded by it: a later verify pass counts its
+      // untagged CPU-dirty pages (it is no longer pending for the tagged pass).
+      constexpr uint64_t second_offset = 0x80000;
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + second_offset, buffer_size, false, false); });
+      OnGpuThread(context, [&] { SyncEpoch::Advance(); context.PrepareBda(); });
+      Require(name, "second buffer", !dirty(second_offset), "policy 0 did not upload a new buffer");
+      set_tags("KYTY_BDA_ACCESS_TAGS=verify\n");
+      cpu_write(second_offset + 0x80, 0x11223344u);
+      uint64_t second_dirty = 0;
+      for (uint64_t k = 0; k < buffer_size / page; k++) {
+        second_dirty += dirty(second_offset + k * page) ? 1 : 0;
+      }
+      const auto before_second = cache.GetBdaTagTotals();
+      OnGpuThread(context, [&] { SyncEpoch::Advance(); context.PrepareBda(); });
+      const auto after_second = cache.GetBdaTagTotals();
+      Require(name, "verify after full pass",
+              second_dirty >= 1 && after_second.would_skip == before_second.would_skip + second_dirty,
+              "verify left out the dirty pages of a buffer a full pass had already uploaded");
+      set_tags("KYTY_BDA_ACCESS_TAGS=0\n");
+
+      // The tagged entries of pages a and b, the untagged entry of page c, and the bytes.
+      const auto entry_of = [&](uint64_t at) {
+        return buffer->BufferDeviceAddress() + (base + at - buffer->CpuAddress());
+      };
+      auto entries = CreateHostBuffer(name, 3 * sizeof(uint64_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+      auto readback = CreateHostBuffer(name, buffer_size, vk::BufferUsageFlagBits::eTransferDst, {0});
+      OnGpuThread(context, [&] {
+        auto *table = cache.GetBdaPageTableBuffer();
+        for (uint32_t k = 0; k < 3; k++) {
+          const vk::BufferCopy copy{((base + a + k * page) >> BufferCache::CACHING_PAGEBITS) * sizeof(uint64_t),
+                                    k * sizeof(uint64_t), sizeof(uint64_t)};
+          scheduler.Current().Handle().copyBuffer(table->Handle(), entries.buffer, 1, &copy);
+        }
+        const vk::BufferCopy copy{offset, 0, buffer_size};
+        scheduler.Current().Handle().copyBuffer(buffer->Handle(), readback.buffer, 1, &copy);
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 1,
+                                                     &barrier, 0, nullptr, 0, nullptr);
+        scheduler.Finish();
+      });
+      const auto entry_words = ReadBuffer(name, entries, 6);
+      const auto words = ReadBuffer(name, readback, static_cast<uint32_t>(buffer_size / 4));
+      DestroyBuffer(&entries);
+      DestroyBuffer(&readback);
+      const auto entry = [&](uint32_t k) {
+        return entry_words[2 * k] | (static_cast<uint64_t>(entry_words[2 * k + 1]) << 32u);
+      };
+      Require(name, "page-table tags",
+              entry(0) == (entry_of(a) | BufferCache::BDA_ACCESSED) &&
+                  entry(1) == (entry_of(b) | BufferCache::BDA_ACCESSED) && entry(2) == entry_of(c),
+              "page-table entries have wrong accessed tags");
+      Require(name, "GPU contents", std::memcmp(words.data(), memory + buffer_offset, buffer_size) == 0,
+              "the GPU copy differs from guest memory after the passes");
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA-tags direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "BDA-tags direct-memory allocation release failed");
+    set_tags("KYTY_BDA_ACCESS_TAGS=\n");
+    ShaderRecompiler::SetCodegenOptions(saved_options);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -29578,7 +29768,7 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing] : test.bda_mappings) {
+      for (const auto &[guest_base, backing, accessed] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
@@ -29588,7 +29778,10 @@ public:
         const auto pages =
             (bytes + BufferCache::CACHING_PAGESIZE - 1) /
             BufferCache::CACHING_PAGESIZE;
-        auto address = buffer.device_address + backing - page_offset;
+        auto address = buffer.device_address + backing - page_offset +
+                       (accessed && ShaderRecompiler::GetCodegenOptions().bda_access_tags
+                            ? BufferCache::BDA_ACCESSED
+                            : 0);
         auto page = guest_base >> BufferCache::CACHING_PAGEBITS;
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
@@ -29661,7 +29854,45 @@ public:
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
+    // KYTY_BDA_ACCESS_TAGS: the fault bitmap word of the first unaccessed mapping (or of the
+    // first mapping, which must stay clear when every mapping is tagged).
+    Buffer tag_fault_result;
+    u32 tag_expected_fault = 0;
+    const bool tag_check = uses_bda && ShaderRecompiler::GetCodegenOptions().bda_access_tags &&
+                           !test.bda_mappings.empty();
+    if (tag_check) {
+      auto fault_address = test.bda_mappings.front().guest_base;
+      for (const auto &mapping : test.bda_mappings) {
+        if (!mapping.accessed) {
+          fault_address = mapping.guest_base;
+          tag_expected_fault = 1u << ((fault_address >> BufferCache::CACHING_PAGEBITS) & 31u);
+          break;
+        }
+      }
+      tag_fault_result = CreateHostBuffer(test.name, sizeof(u32),
+                                          vk::BufferUsageFlagBits::eTransferDst, {0});
+      vk::MemoryBarrier ready{};
+      ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      ready.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0,
+                          nullptr);
+      const vk::BufferCopy region{((fault_address >> BufferCache::CACHING_PAGEBITS) >> 5u) * sizeof(u32),
+                                  0, sizeof(u32)};
+      cmd.copyBuffer(m_fault_buffer.buffer, tag_fault_result.buffer, 1, &region);
+      vk::MemoryBarrier readable{};
+      readable.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      readable.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                          {}, 1, &readable, 0, nullptr, 0, nullptr);
+    }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (tag_check) {
+      Require(test.name, "accessed-tag fault",
+              ReadBuffer(test.name, tag_fault_result, 1)[0] == tag_expected_fault,
+              "a load recorded a tagged page, or missed an unaccessed one");
+      DestroyBuffer(&tag_fault_result);
+    }
     if (elapsed_us != nullptr) {
       std::array<uint64_t, 2> stamps{};
       RequireVk(test.name, "timestamps",
@@ -48134,6 +48365,15 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   return test;
 }
 
+// KYTY_BDA_ACCESS_TAGS (upstream KytyPS5 0ec2cd5d5): a load from a page without the accessed
+// tag reads it and records a fault.
+TestCase GlobalLoadRecordsUnaccessedPage() {
+  auto test = GlobalSignedImmediateRebasesBeforeSaddr();
+  test.name = "GlobalLoadRecordsUnaccessedPage";
+  test.bda_mappings.front().accessed = false;
+  return test;
+}
+
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   using O = ShaderOpcode;
 
@@ -63173,6 +63413,22 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaSyncEpoch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-access-tags-shader-only") == 0) {
+    const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+    auto options = saved_options;
+    options.bda_access_tags = true;
+    ShaderRecompiler::SetCodegenOptions(options);
+    VulkanHarness vulkan;
+    RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr()); // tagged: no fault
+    RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());         // untagged: read and reported
+    ShaderRecompiler::SetCodegenOptions(saved_options);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-access-tags-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaAccessTags();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-per-submission-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaSyncPerSubmission();
@@ -63772,6 +64028,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferRangeMemo();
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBdaSyncPerSubmission();
+  vulkan.CheckBdaAccessTags();
   vulkan.CheckBindingEpochMemo();
   vulkan.CheckBindingMemoLookup();
   vulkan.CheckWrittenSyncSkip();
