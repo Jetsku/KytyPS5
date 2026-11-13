@@ -143,6 +143,8 @@ public:
 	// write fault's flush, a side readback) changed it: the full lookup raced the check.
 	[[nodiscard]] bool          RepeatGpuRangesLost(const RepeatLookup& record);
 	void                        UpdateImage(ImageId id);
+	// Debug (KYTY_PRESENT_DEBUG): one line per image overlapping [address, address+size).
+	[[nodiscard]] std::string   DebugDescribeRegion(uint64_t address, uint64_t size, ImageId chosen);
 	// buffer_sync: the caller copies the image into the buffer at its own range (texel reads),
 	// where GPU-dirty bytes it supersedes do not block it (SafeToSyncIntoBuffer).
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,

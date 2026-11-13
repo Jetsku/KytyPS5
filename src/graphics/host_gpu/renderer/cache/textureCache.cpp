@@ -4257,6 +4257,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	const bool recording = record != nullptr && record->valid;
 	MaterializeDccClear(result, desc, metadata_base_layer, recording ? &record->dcc : nullptr);
 	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
+	// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): the colour block marks every CMASK tile it
+	// writes as expanded. The host renders uncompressed and never updates CMASK, so a guest that
+	// fast-clears CMASK with its own kernel and later reads it as data (Frostbite builds its UI
+	// tile mask from the UI target's CMASK) sees every tile as still cleared. Binding a CMASK
+	// target for rendering therefore marks its whole CMASK expanded on the GPU, in order with the
+	// draws (conservative: untouched tiles hold the materialized clear colour on the host).
+	if (desc.cmask.valid && desc.type == BindingType::RenderTarget && desc.cmask.range.Valid()) {
+		static const bool draw_expand = [] {
+			const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
+			return v == nullptr || std::strcmp(v, "0") != 0;
+		}();
+		if (draw_expand) {
+			m_buffer_cache.FillBuffer(desc.cmask.range.address, desc.cmask.range.size, UINT32_MAX,
+			                          false);
+			if (recording) {
+				record->cmask.provable = false;
+			}
+		}
+	}
 	if (recording) {
 		record->valid = record->dcc.provable && record->cmask.provable;
 		if (!record->valid) {
@@ -4414,6 +4433,32 @@ void TextureCache::EraseSurfaceMeta(uint64_t address) {
 		NoteSurfaceMetaChange();
 	}
 	memo = {address, m_surface_meta_inserts};
+}
+
+std::string TextureCache::DebugDescribeRegion(uint64_t address, uint64_t size, ImageId chosen) {
+	std::scoped_lock lock {m_lock};
+	std::string      out;
+	char             line[320];
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		std::snprintf(line, sizeof(line),
+		              "  %s img %u: 0x%016llx+0x%llx %ux%u fmt=%d tile=%d samples=%u reg=%d gpu_mod=%d "
+		              "buf_mod=%d cpu_dirty=%d depth=%d vo=%d tick_last=%llu\n",
+		              id == chosen ? "*" : " ", id.index,
+		              static_cast<unsigned long long>(image->info.data.address),
+		              static_cast<unsigned long long>(image->info.data.size), image->info.extent.width,
+		              image->info.extent.height, static_cast<int>(image->backing.format),
+		              static_cast<int>(image->info.tile_mode), image->backing.samples,
+		              image->registered ? 1 : 0, image->IsGpuModified() ? 1 : 0,
+		              image->IsBufferModified() ? 1 : 0, image->IsDefinitelyCpuDirty() ? 1 : 0,
+		              image->info.IsDepth() ? 1 : 0, image->usage.video_out ? 1 : 0,
+		              static_cast<unsigned long long>(image->tick_accessed_last));
+		out += line;
+	}
+	return out;
 }
 
 void TextureCache::UpdateImage(ImageId id) {
