@@ -83,6 +83,18 @@ struct BufferCache::HostImportState {
 		uint64_t          guest_end   = 0;
 		const uint8_t*    alias       = nullptr;
 		vk::DeviceAddress address     = 0;
+		// The import as a cache-style buffer for read bindings (CpuAddress = guest_begin).
+		std::shared_ptr<Buffer> view;
+	};
+	enum Failure : uint32_t {
+		NotDirect,   // no direct-memory backing alias for the page (flexible memory, unmapped)
+		Limit,       // KYTY_HOST_IMPORT_MAX_MB or the import count
+		Alignment,   // alias or size not at minImportedHostPointerAlignment
+		HostPointer, // vkGetMemoryHostPointerPropertiesEXT failed
+		Requirements,
+		Allocate,
+		Other,
+		FailureCount,
 	};
 	struct Seen {
 		uint64_t last_frame = UINT64_MAX;
@@ -126,13 +138,20 @@ struct BufferCache::HostImportState {
 	HostImportState& operator=(const HostImportState&) = delete;
 
 	// The import of the backing of guest [begin, end) (one mapping, page aligned), or nullopt.
-	std::optional<uint32_t> Create(uint64_t begin, uint64_t end, const uint8_t* alias) {
+	std::optional<uint32_t> Create(uint64_t begin, uint64_t end, const uint8_t* alias,
+	                               Failure& failure) {
 		auto&      d    = VULKAN_HPP_DEFAULT_DISPATCHER;
 		const auto size = end - begin;
-		if (reinterpret_cast<uintptr_t>(alias) % alignment != 0 || size % alignment != 0 ||
-		    imported_bytes + size > max_bytes || imports.size() >= MaxImports) {
+		failure         = Other;
+		if (imported_bytes + size > max_bytes || imports.size() >= MaxImports) {
+			failure = Limit;
 			return std::nullopt;
 		}
+		if (reinterpret_cast<uintptr_t>(alias) % alignment != 0 || size % alignment != 0) {
+			failure = Alignment;
+			return std::nullopt;
+		}
+		failure = HostPointer;
 		VkMemoryHostPointerPropertiesEXT pointer_props {};
 		pointer_props.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
 		if (d.vkGetMemoryHostPointerPropertiesEXT(
@@ -140,6 +159,7 @@ struct BufferCache::HostImportState {
 		        &pointer_props) != VK_SUCCESS) {
 			return std::nullopt;
 		}
+		failure = Other;
 		VkExternalMemoryBufferCreateInfo external {};
 		external.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
 		external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -148,7 +168,9 @@ struct BufferCache::HostImportState {
 		buffer_info.pNext = &external;
 		buffer_info.size  = size;
 		buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-		                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+		                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+		                    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 		buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 		Import imp;
 		if (d.vkCreateBuffer(device, &buffer_info, nullptr, &imp.buffer) != VK_SUCCESS) {
@@ -158,6 +180,7 @@ struct BufferCache::HostImportState {
 		d.vkGetBufferMemoryRequirements(device, imp.buffer, &requirements);
 		const auto bits = requirements.memoryTypeBits & pointer_props.memoryTypeBits;
 		if (bits == 0 || size % requirements.alignment != 0) {
+			failure = Requirements;
 			d.vkDestroyBuffer(device, imp.buffer, nullptr);
 			return std::nullopt;
 		}
@@ -174,6 +197,7 @@ struct BufferCache::HostImportState {
 		allocate.pNext           = &flags;
 		allocate.allocationSize  = size;
 		allocate.memoryTypeIndex = static_cast<uint32_t>(std::countr_zero(bits));
+		failure = Allocate;
 		if (d.vkAllocateMemory(device, &allocate, nullptr, &imp.memory) != VK_SUCCESS) {
 			d.vkDestroyBuffer(device, imp.buffer, nullptr);
 			return std::nullopt;
@@ -192,7 +216,7 @@ struct BufferCache::HostImportState {
 		imp.guest_begin     = begin;
 		imp.guest_end       = end;
 		imp.alias           = alias;
-		imports.push_back(imp);
+		imports.push_back(std::move(imp));
 		imported_bytes += size;
 		return static_cast<uint32_t>(imports.size() - 1);
 	}
@@ -215,6 +239,10 @@ struct BufferCache::HostImportState {
 	uint64_t                               failures            = 0;
 	uint64_t                               skipped_bytes       = 0;
 	uint64_t                               validated_structure = 0;
+	uint64_t                               validated_images    = UINT64_MAX;
+	std::array<uint64_t, FailureCount>     failed_pages {};
+	uint64_t                               bound_reads         = 0;
+	uint64_t                               bound_bytes         = 0;
 	std::chrono::steady_clock::time_point  report_time;
 };
 
@@ -3835,6 +3863,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	if (!is_written && !is_texel_buffer && m_host_import != nullptr) {
+		if (const auto imported = HostImportReadBinding(vaddr, size)) {
+			return *imported;
+		}
+	}
 	if (!is_written && !is_texel_buffer && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
 	    GuestGpu::IsGpuThread()) {
 		return ObtainReadBinding(vaddr, size, id);
@@ -6206,14 +6239,45 @@ bool BufferCache::HostImportPageEligible(uint64_t page) {
 }
 
 bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
-	// [begin, end): cache pages, every one eligible.
-	auto&      state = *m_host_import;
-	const auto alias = static_cast<const uint8_t*>(
-	    LibKernel::Memory::GuestBackingAlias(begin, end - begin));
-	if (alias == nullptr) {
-		return false;
+	// [begin, end): cache pages, every one eligible. Split where the backing alias is not
+	// contiguous (several mappings) or missing (not direct memory).
+	auto&    state = *m_host_import;
+	bool     any   = false;
+	uint64_t run   = begin;
+	while (run < end) {
+		const auto* first = static_cast<const uint8_t*>(
+		    LibKernel::Memory::GuestBackingAlias(run, CACHING_PAGESIZE));
+		if (first == nullptr) {
+			state.excluded.Add(run, CACHING_PAGESIZE);
+			state.failed_pages[HostImportState::NotDirect]++;
+			state.failures++;
+			run += CACHING_PAGESIZE;
+			continue;
+		}
+		// Grow while one mapping holds the whole run.
+		uint64_t stop = run + CACHING_PAGESIZE;
+		while (stop < end &&
+		       LibKernel::Memory::GuestBackingAlias(run, stop + CACHING_PAGESIZE - run) == first) {
+			stop += CACHING_PAGESIZE;
+		}
+		uint32_t failure = HostImportState::Other;
+		if (HostImportRedirectRun(run, stop, first, failure)) {
+			any = true;
+		} else {
+			state.excluded.Add(run, stop - run);
+			state.failed_pages[failure] += (stop - run) >> CACHING_PAGEBITS;
+			state.failures += (stop - run) >> CACHING_PAGEBITS;
+		}
+		run = stop;
 	}
-	std::optional<uint32_t> index;
+	return any;
+}
+
+bool BufferCache::HostImportRedirectRun(uint64_t begin, uint64_t end, const uint8_t* alias,
+                                        uint32_t& failure_out) {
+	auto&                    state   = *m_host_import;
+	HostImportState::Failure failure = HostImportState::Other;
+	std::optional<uint32_t>  index;
 	for (uint32_t i = 0; i < state.imports.size(); ++i) {
 		const auto& imp = state.imports[i];
 		if (imp.guest_begin <= begin && end <= imp.guest_end &&
@@ -6223,22 +6287,28 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 		}
 	}
 	if (!index) {
-		// Padded, so that neighbouring runs share an import and a multi-dword access running
-		// past a redirected page reads the next page's guest bytes.
+		// Padded, so that neighbouring runs share an import, a multi-dword access running past a
+		// redirected page reads the next page's guest bytes, and read bindings fit in one import.
 		constexpr uint64_t Pad          = uint64_t {1} << 20u;
 		const auto         padded_begin = Common::AlignDown(begin > Pad ? begin - Pad : 0, Pad);
 		const auto         padded_end   = Common::AlignUp(end + Pad, Pad);
 		const auto*        padded_alias = static_cast<const uint8_t*>(
             LibKernel::Memory::GuestBackingAlias(padded_begin, padded_end - padded_begin));
 		if (padded_alias != nullptr && padded_alias + (begin - padded_begin) == alias) {
-			index = state.Create(padded_begin, padded_end, padded_alias);
+			index = state.Create(padded_begin, padded_end, padded_alias, failure);
 		}
 		if (!index) {
-			index = state.Create(begin, end, alias);
+			index = state.Create(begin, end, alias, failure);
 		}
 		if (!index) {
+			failure_out = failure;
 			return false;
 		}
+		auto& created = state.imports[*index];
+		created.view  = std::make_shared<Buffer>(m_graphics, m_scheduler, vk::Buffer(created.buffer),
+		                                         created.guest_begin,
+		                                         created.guest_end - created.guest_begin,
+		                                         created.address);
 	}
 	state.redirected.Add(begin, end - begin);
 	for (uint64_t page = begin >> CACHING_PAGEBITS; page < (end >> CACHING_PAGEBITS); ++page) {
@@ -6248,20 +6318,55 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 	return true;
 }
 
+std::optional<std::pair<Buffer*, uint64_t>> BufferCache::HostImportReadBinding(uint64_t vaddr,
+                                                                                uint64_t size) {
+	// A read binding wholly inside redirected pages of one import reads guest memory through the
+	// import: no synchronization, upload or protection of the cache buffer.
+	auto& state = *m_host_import;
+	if (state.redirected.Empty() || !state.redirected.Contains(vaddr, size)) {
+		return std::nullopt;
+	}
+	const auto first = vaddr >> CACHING_PAGEBITS;
+	const auto last  = (vaddr + size - 1) >> CACHING_PAGEBITS;
+	const auto found = state.page_import.find(first);
+	if (found == state.page_import.end()) {
+		return std::nullopt;
+	}
+	for (uint64_t page = first + 1; page <= last; ++page) {
+		const auto other = state.page_import.find(page);
+		if (other == state.page_import.end() || other->second != found->second) {
+			return std::nullopt;
+		}
+	}
+	auto& imp = state.imports[found->second];
+	if (imp.view == nullptr || vaddr < imp.guest_begin || vaddr + size > imp.guest_end) {
+		return std::nullopt;
+	}
+	state.bound_reads++;
+	state.bound_bytes += size;
+	return std::make_pair(imp.view.get(), vaddr - imp.guest_begin);
+}
+
 void BufferCache::HostImportValidate() {
 	auto& state = *m_host_import;
 	if (state.redirected.Empty()) {
 		return;
 	}
 	// A redirected page must not hold GPU-owned bytes: the cache buffer (or an image) is then
-	// newer than guest memory. Checked before every BDA pass, skipped or not.
-	const auto structure   = m_bda_structure_epoch.load(std::memory_order_acquire);
-	const bool check_alias = structure != state.validated_structure;
+	// newer than guest memory. Checked before every BDA pass, skipped or not. The buffer side is
+	// a range-set query; images are queried only after one turned GPU-modified, and the alias
+	// only after the buffer structure or GPU mappings changed.
+	const auto structure    = m_bda_structure_epoch.load(std::memory_order_acquire);
+	const bool check_alias  = structure != state.validated_structure;
+	const auto images       = m_texture_cache.GpuModifiedTransitions();
+	const bool check_images = images != state.validated_images;
+	const bool publications = m_backing_publication_count.load(std::memory_order_acquire) != 0;
 	std::vector<std::pair<uint64_t, uint64_t>> fallback;
 	std::vector<std::pair<uint64_t, uint64_t>> remapped;
 	state.redirected.ForEach([&](uint64_t begin, uint64_t end) {
-		if (HasGpuDirtyBytes(begin, end - begin) || HasPendingBackingPublication(begin, end - begin) ||
-		    m_texture_cache.IsRegionGpuModified(begin, end - begin)) {
+		if (HasGpuDirtyBytes(begin, end - begin) ||
+		    (publications && HasPendingBackingPublication(begin, end - begin)) ||
+		    (check_images && m_texture_cache.IsRegionGpuModified(begin, end - begin))) {
 			for (uint64_t page = begin; page < end; page += CACHING_PAGESIZE) {
 				if (!HostImportPageEligible(page >> CACHING_PAGEBITS)) {
 					fallback.emplace_back(page, page + CACHING_PAGESIZE);
@@ -6274,10 +6379,10 @@ void BufferCache::HostImportValidate() {
 		// The guest may have remapped the range (other backing): runs of one import at a time.
 		uint64_t run = begin;
 		while (run < end) {
-			const auto index = state.page_import.at(run >> CACHING_PAGEBITS);
-			const auto& imp  = state.imports[index];
-			const auto  last = std::min(end, imp.guest_end);
-			uint64_t    stop = run + CACHING_PAGESIZE;
+			const auto  index = state.page_import.at(run >> CACHING_PAGEBITS);
+			const auto& imp   = state.imports[index];
+			const auto  last  = std::min(end, imp.guest_end);
+			uint64_t    stop  = run + CACHING_PAGESIZE;
 			while (stop < last && state.page_import.at(stop >> CACHING_PAGEBITS) == index) {
 				stop += CACHING_PAGESIZE;
 			}
@@ -6295,6 +6400,7 @@ void BufferCache::HostImportValidate() {
 		HostImportUnredirect(begin, end - begin, false);
 	}
 	state.validated_structure = m_bda_structure_epoch.load(std::memory_order_acquire);
+	state.validated_images    = images;
 }
 
 void BufferCache::HostImportUpdate() {
@@ -6345,9 +6451,8 @@ void BufferCache::HostImportUpdate() {
 			if (eligible) {
 				continue;
 			}
-			if (run < page && !HostImportTryRedirect(run, page)) {
-				state.excluded.Add(run, page - run);
-				state.failures += (page - run) >> CACHING_PAGEBITS;
+			if (run < page) {
+				(void)HostImportTryRedirect(run, page);
 			}
 			run = page + CACHING_PAGESIZE;
 		}
@@ -6368,14 +6473,25 @@ void BufferCache::HostImportAdvanceFrame() {
 		redirected += end - begin;
 		runs++;
 	});
+	const auto&      f   = state.failed_pages;
+	constexpr double MiB = 1024.0 * 1024.0;
 	std::printf("HostImport: %zu regions, %.1f MiB imported, %.1f MiB redirected in %zu runs, %" PRIu64
-	            " fallback pages, %" PRIu64 " failed pages, %.1f MiB/s BDA sync skipped\n",
-	            state.imports.size(), static_cast<double>(state.imported_bytes) / (1024.0 * 1024.0),
-	            static_cast<double>(redirected) / (1024.0 * 1024.0), runs, state.fallbacks,
-	            state.failures,
-	            static_cast<double>(state.skipped_bytes) / (1024.0 * 1024.0) / elapsed);
+	            " fallback pages, %" PRIu64 " failed pages (not-direct %" PRIu64 ", limit %" PRIu64
+	            ", align %" PRIu64 ", hostptr %" PRIu64 ", reqs %" PRIu64 ", alloc %" PRIu64
+	            ", other %" PRIu64 "), %.1f MiB/s BDA sync skipped, %.0f read bindings/s (%.1f MiB/s) "
+	            "through imports\n",
+	            state.imports.size(), static_cast<double>(state.imported_bytes) / MiB,
+	            static_cast<double>(redirected) / MiB, runs, state.fallbacks, state.failures,
+	            f[HostImportState::NotDirect], f[HostImportState::Limit],
+	            f[HostImportState::Alignment], f[HostImportState::HostPointer],
+	            f[HostImportState::Requirements], f[HostImportState::Allocate],
+	            f[HostImportState::Other], static_cast<double>(state.skipped_bytes) / MiB / elapsed,
+	            static_cast<double>(state.bound_reads) / elapsed,
+	            static_cast<double>(state.bound_bytes) / MiB / elapsed);
 	std::fflush(stdout);
 	state.skipped_bytes = 0;
+	state.bound_reads   = 0;
+	state.bound_bytes   = 0;
 	state.report_time   = now;
 }
 

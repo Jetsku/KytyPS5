@@ -201,7 +201,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, vk::Buffer external,
+               uint64_t cpu_address, uint64_t size, vk::DeviceAddress device_address)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Upload),
+      m_cpu_address(cpu_address), m_device_address(device_address), m_buffer(external),
+      m_size(size), m_coherent(true), m_external(true) {}
+
 Buffer::~Buffer() {
+	if (m_external) {
+		return;
+	}
 	if (m_vram_bytes != 0) {
 		VramStats::Note(static_cast<VramStats::Kind>(m_vram_kind), m_vram_device_local,
 		                -static_cast<int64_t>(m_vram_bytes));

@@ -336,6 +336,10 @@ private:
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> HostImportRedirectedRuns(uint64_t vaddr,
 	                                                                                 uint64_t size) const;
 	[[nodiscard]] bool HostImportTryRedirect(uint64_t begin, uint64_t end);
+	[[nodiscard]] bool HostImportRedirectRun(uint64_t begin, uint64_t end, const uint8_t* alias,
+	                                         uint32_t& failure_out);
+	[[nodiscard]] std::optional<std::pair<Buffer*, uint64_t>> HostImportReadBinding(uint64_t vaddr,
+	                                                                                 uint64_t size);
 	[[nodiscard]] bool HostImportPageEligible(uint64_t page);
 	void HostImportWriteEntries(uint64_t first_page, uint64_t last_page, bool redirect);
 	// A run of hot pages a full BDA pass found inside one scanned buffer (KYTY_BDA_HOT_SYNC).

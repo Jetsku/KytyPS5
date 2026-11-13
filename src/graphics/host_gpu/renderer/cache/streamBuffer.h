@@ -47,6 +47,10 @@ public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
 	       bool transfer_shared = false, bool host_cached = false, bool sparse_residency = false);
+	// A view of a buffer its owner created and destroys (KYTY_HOST_IMPORT: imported host memory,
+	// coherent; BufferCache). Not mapped, not counted in VRAM statistics.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, vk::Buffer external,
+	       uint64_t cpu_address, uint64_t size, vk::DeviceAddress device_address);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -107,6 +111,7 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	bool                          m_sparse   = false;
+	bool                          m_external = false;
 	std::span<uint8_t>            m_mapped;
 	// KYTY_VRAM_STATS (vramStats.h): what this buffer was counted as (0 bytes: not counted).
 	uint64_t                      m_vram_bytes        = 0;
