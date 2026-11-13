@@ -104,6 +104,12 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 		                           "KYTY_DISPATCHER_CAP",
 		                           cap)
 		             : std::string("no transition cap, KYTY_DISPATCHER_CAP=0")));
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader: CFG dispatcher #{} detail: phase={} block={} pc=0x{:08x}..0x{:08x} preds={} "
+		    "succs={} blocks={} loops={} back_edges={} reason={}\n",
+		    count, phase, cfg.failure_block, start, end, predecessors, successors,
+		    cfg.blocks.size(), cfg.natural_loops.size(), cfg.back_edges.size(),
+		    cfg.unsupported_reason));
 	}
 }
 
