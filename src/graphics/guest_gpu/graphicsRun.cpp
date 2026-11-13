@@ -4176,6 +4176,10 @@ static void NoteLoopGuardHits(RenderContext& renderer) {
 		    "Loop guard: {} invocations of the guarded shaders exhausted the {}-iteration loop "
 		    "budget (KYTY_LOOP_GUARD); last one in shader 0x{:016x}\n",
 		    hits, options.loop_guard_budget, hash));
+		uint32_t gds_head[4] = {};
+		std::memcpy(gds_head, mapped.data(), sizeof(gds_head));
+		Log::WriteToConsoleAndLog(fmt::format("Loop guard: GDS[0..3] = {:#x} {:#x} {:#x} {:#x}\n",
+		                                      gds_head[0], gds_head[1], gds_head[2], gds_head[3]));
 	}
 }
 

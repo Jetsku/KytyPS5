@@ -1869,11 +1869,22 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
 	                                   EmitSubgroupLocalInvocationId(state), source_lane);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
+	// RDNA2 does not clamp LDS addresses with M0 (GFX9 dropped the M0 LDS limit): an LDS
+	// DS_APPEND/DS_CONSUME with M0 = 0 is a valid counter update. EA SPORTS UFC 5 allocates the
+	// nodes of its per-tile light lists that way; with the old M0 size check every append returned
+	// 0, the nodes overwrote each other, the lists became cycles and the GPU hung walking them.
+	// KYTY_LDS_APPEND_M0_BOUNDS=1 restores the M0 size check for LDS.
+	static const bool lds_m0_bounds = [] {
+		const char* v = std::getenv("KYTY_LDS_APPEND_M0_BOUNDS");
+		return v != nullptr && v[0] == '1';
+	}();
 	const auto m0_bounds =
 	    mem.kind == IR::ResourceKind::Gds
 	        ? Binary(state, spv::OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
-	        : Binary(state, spv::OpULessThan, TypeBool(state),
-	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
+	        : lds_m0_bounds
+	              ? Binary(state, spv::OpULessThan, TypeBool(state),
+	                       ConstantU32(state, ctx.Memory(inst).offset + 3u), size)
+	              : ConstantBool(state, true);
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
