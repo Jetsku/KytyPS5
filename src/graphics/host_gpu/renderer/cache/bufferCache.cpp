@@ -4512,11 +4512,67 @@ std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) co
 	return KnownFillLocked(vaddr, size);
 }
 
+namespace {
+// KYTY_FAST_COMMIT=1: per-thread memo of KnownFill answers keyed by (cache, range, generation).
+// Every change of m_known_fills advances m_known_fill_generation under the mutex, so an entry
+// computed under the lock at generation G answers exactly as a fresh scan would while the
+// generation is still G.
+bool FastCommitKnownFill() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAST_COMMIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+struct KnownFillMemo {
+	const void*             owner      = nullptr;
+	uint64_t                vaddr      = 0;
+	uint64_t                size       = 0;
+	uint64_t                generation = 0;
+	std::optional<uint32_t> value;
+};
+constexpr uint32_t                         KnownFillMemoSize = 16;
+thread_local KnownFillMemo                 g_known_fill_memo[KnownFillMemoSize];
+std::atomic<uint64_t>                      g_known_fill_memo_hits {0};
+std::atomic<uint64_t>                      g_known_fill_memo_misses {0};
+std::atomic<uint64_t>                      g_known_fill_memo_last_log {0};
+} // namespace
+
 std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size,
                                                uint64_t& generation) const {
-	std::scoped_lock lock(m_known_fill_mutex);
-	generation = m_known_fill_generation.load(std::memory_order_relaxed);
-	return KnownFillLocked(vaddr, size);
+	if (!FastCommitKnownFill()) {
+		std::scoped_lock lock(m_known_fill_mutex);
+		generation = m_known_fill_generation.load(std::memory_order_relaxed);
+		return KnownFillLocked(vaddr, size);
+	}
+	const uint64_t current = m_known_fill_generation.load(std::memory_order_acquire);
+	auto&          memo    = g_known_fill_memo[((vaddr >> 8u) ^ (size >> 4u)) % KnownFillMemoSize];
+	if (memo.owner == this && memo.vaddr == vaddr && memo.size == size && memo.generation == current) {
+		generation = current;
+		g_known_fill_memo_hits.fetch_add(1, std::memory_order_relaxed);
+		return memo.value;
+	}
+	std::optional<uint32_t> value;
+	{
+		std::scoped_lock lock(m_known_fill_mutex);
+		generation = m_known_fill_generation.load(std::memory_order_relaxed);
+		value      = KnownFillLocked(vaddr, size);
+	}
+	memo = {this, vaddr, size, generation, value};
+	const auto misses = g_known_fill_memo_misses.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (misses % 4096 == 0) {
+		const auto now  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count());
+		auto       last = g_known_fill_memo_last_log.load(std::memory_order_relaxed);
+		if (now >= last + 10 && g_known_fill_memo_last_log.compare_exchange_strong(last, now)) {
+			const auto hits = g_known_fill_memo_hits.load(std::memory_order_relaxed);
+			std::printf("FastCommit: KnownFill memo %llu hits, %llu misses (%.1f%% hit)\n",
+			            static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses),
+			            100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses));
+		}
+	}
+	return value;
 }
 
 std::optional<uint32_t> BufferCache::KnownFillLocked(uint64_t vaddr, uint64_t size) const {
