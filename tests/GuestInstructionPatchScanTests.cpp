@@ -26,6 +26,8 @@ constexpr size_t FunctionSize    = 32;
 constexpr size_t FunctionCount   = 2048;
 constexpr size_t CodeSize        = FunctionSize * FunctionCount;
 constexpr size_t TrampolineSize  = 1024 * 1024;
+constexpr size_t SwitchFunction  = 1009;  // and its jump table in function 1010
+constexpr size_t RedZoneFunction = 1013;
 
 // 2048 small functions; every 7th uses VRSQRTPS, every 11th EXTRQ, every 13th INSERTQ, every 17th
 // MFENCE (CLWB's opcode, register form: filtered out).
@@ -47,6 +49,28 @@ std::vector<uint8_t> MakeCode() {
 		}
 		std::memcpy(f, body.data(), body.size());
 	}
+	// A switch whose jump table lies in the next function's bytes; its VRSQRTPS is reachable only
+	// through the table (the parallel pass decodes such a function again in address order).
+	const std::vector<uint8_t> switch_body {
+	    0x83, 0xff, 0x01,                          // cmp edi, 1
+	    0x77, 0x15,                                // ja default
+	    0x48, 0x8d, 0x0d, 0x14, 0x00, 0x00, 0x00,  // lea rcx, [rip + table] (the next function)
+	    0x48, 0x63, 0x04, 0xb9,                    // movsxd rax, dword [rcx + rdi*4]
+	    0x48, 0x01, 0xc8,                          // add rax, rcx
+	    0xff, 0xe0,                                // jmp rax
+	    0xc5, 0xf8, 0x52, 0xc1,                    // case 0: vrsqrtps xmm0, xmm1
+	    0xc3,                                      // ret
+	    0xc3};                                     // case 1, default: ret
+	const std::vector<uint8_t> table {0xf5, 0xff, 0xff, 0xff, 0xfa, 0xff, 0xff, 0xff};  // -11, -6
+	std::memcpy(code.data() + SwitchFunction * FunctionSize, switch_body.data(), switch_body.size());
+	std::memset(code.data() + (SwitchFunction + 1) * FunctionSize, 0xcc, FunctionSize);
+	std::memcpy(code.data() + (SwitchFunction + 1) * FunctionSize, table.data(), table.size());
+	// Red-zone stores and loads, for the red-zone protection pass.
+	const std::vector<uint8_t> red_zone_body {0x48, 0x89, 0x44, 0x24, 0xf8,   // mov [rsp - 8], rax
+	                                          0x48, 0x8b, 0x4c, 0x24, 0xf8,   // mov rcx, [rsp - 8]
+	                                          0xc3};                          // ret
+	std::memset(code.data() + RedZoneFunction * FunctionSize, 0xcc, FunctionSize);
+	std::memcpy(code.data() + RedZoneFunction * FunctionSize, red_zone_body.data(), red_zone_body.size());
 	return code;
 }
 
@@ -56,7 +80,7 @@ struct Run {
 	Loader::GuestInstructionPatchResult result {};
 };
 
-Run Patch(uint8_t* area, const std::vector<uint8_t>& code, size_t threads) {
+Run Patch(uint8_t* area, const std::vector<uint8_t>& code, size_t threads, bool protect_memory) {
 	std::memset(area, 0xcc, CodeSize + TrampolineSize);
 	std::memcpy(area, code.data(), code.size());
 	Loader::RegisterGuestInstructionPatchModule(area, CodeSize, area + CodeSize, TrampolineSize);
@@ -67,7 +91,8 @@ Run Patch(uint8_t* area, const std::vector<uint8_t>& code, size_t threads) {
 	Loader::SetGuestInstructionPatchScanThreads(threads);
 	const Loader::GuestInstructionHostFeatures intel {false, false, false};
 	Run run;
-	run.result = Loader::PatchGuestInstructions(reinterpret_cast<uintptr_t>(area), CodeSize, starts, false, true, intel);
+	run.result = Loader::PatchGuestInstructions(reinterpret_cast<uintptr_t>(area), CodeSize, starts,
+	                                            protect_memory, true, intel);
 	Loader::SetGuestInstructionPatchScanThreads(0);
 	Loader::UnregisterGuestInstructionPatchModule(area);
 	run.code.assign(area, area + CodeSize);
@@ -141,22 +166,30 @@ int main() {
 	}
 	CheckByteFilter();
 	const auto code   = MakeCode();
-	const Run  serial = Patch(area, code, 1);
-	Check(serial.result.function_count == FunctionCount, "every function is scanned");
-	Check(serial.result.reciprocal_sqrt.found == (FunctionCount + 6) / 7, "every VRSQRTPS is found");
 	size_t extrq = 0, insertq = 0;
 	for (size_t i = 0; i < FunctionCount; ++i) {
 		extrq += i % 7 != 0 && i % 11 == 0;
 		insertq += i % 7 != 0 && i % 11 != 0 && i % 13 == 0;
 	}
-	Check(serial.result.extrq.found == extrq && serial.result.insertq.found == insertq,
-	      "every EXTRQ and INSERTQ is found");
-	Check(serial.code != code, "the serial pass patches the code");
-	for (const size_t threads: std::array<size_t, 3> {2, 5, 16}) {
-		const Run parallel = Patch(area, code, threads);
-		Check(parallel.code == serial.code, "parallel scan: same patched code");
-		Check(parallel.trampolines == serial.trampolines, "parallel scan: same trampolines");
-		Check(SameResult(parallel.result, serial.result), "parallel scan: same counters");
+	Run serial;
+	// AMD instructions, without and with red-zone protection.
+	for (const bool protect_memory: {false, true}) {
+		serial = Patch(area, code, 1, protect_memory);
+		Check(serial.result.function_count == FunctionCount, "every function is scanned");
+		Check(serial.result.reciprocal_sqrt.found == (FunctionCount + 6) / 7 + 1,
+		      "every VRSQRTPS is found, also behind a jump table in another function");
+		Check(serial.result.extrq.found == extrq && serial.result.insertq.found == insertq,
+		      "every EXTRQ and INSERTQ is found");
+		Check(serial.code != code, "the serial pass patches the code");
+		if (protect_memory) {
+			Check(serial.result.red_zone_function_count != 0, "the red-zone function is analyzed");
+		}
+		for (const size_t threads: std::array<size_t, 3> {2, 5, 16}) {
+			const Run parallel = Patch(area, code, threads, protect_memory);
+			Check(parallel.code == serial.code, "parallel scan: same patched code");
+			Check(parallel.trampolines == serial.trampolines, "parallel scan: same trampolines");
+			Check(SameResult(parallel.result, serial.result), "parallel scan: same counters");
+		}
 	}
 	munmap(area, CodeSize + TrampolineSize);
 	if (g_failures != 0) {

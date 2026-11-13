@@ -127,6 +127,11 @@ struct DecodedFunction {
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
+	// The hull of the jump-table bytes read outside the function's own bytes (empty: none).
+	// PatchGuestInstructions decodes a function again in address order when another function's
+	// patch may write there.
+	uintptr_t                                   outside_table_begin = UINTPTR_MAX;
+	uintptr_t                                   outside_table_end   = 0;
 };
 
 enum class InstructionReplacement {
@@ -323,7 +328,8 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 std::optional<std::vector<uintptr_t>>
 ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
                         uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
-                        uintptr_t segment_end) {
+                        uintptr_t segment_end, uintptr_t& outside_table_begin,
+                        uintptr_t& outside_table_end) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
@@ -518,6 +524,11 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 			continue;
 		}
 
+		const uintptr_t table_end = table_address + *table_size * sizeof(s32);
+		if (table_address < function_start || table_end > function_end) {
+			outside_table_begin = std::min(outside_table_begin, table_address);
+			outside_table_end   = std::max(outside_table_end, table_end);
+		}
 		std::vector<uintptr_t> targets;
 		targets.reserve(*table_size);
 		bool valid = true;
@@ -648,8 +659,9 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			if (resolved_indirect_branches.contains(branch_address)) {
 				continue;
 			}
-			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			const auto targets = ResolveBoundedJumpTable(
+			    function, branch_address, function_start, function_end, segment_start, segment_end,
+			    function.outside_table_begin, function.outside_table_end);
 			if (!targets) {
 				continue;
 			}
@@ -1743,6 +1755,11 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		       MayContainAmdInstruction(reinterpret_cast<const uint8_t*>(function_start),
 		                                reinterpret_cast<const uint8_t*>(function_end));
 	};
+	// A jump table of the function lies in the patched segment outside its own bytes, where another
+	// function's patch may write: a worker may have read it before or after that patch.
+	const auto reads_patched_bytes = [&](const DecodedFunction& function) {
+		return function.outside_table_begin < segment_end && segment_addr < function.outside_table_end;
+	};
 	// Decodes and analyzes one function and collects its rewrite sites. Reads guest code only.
 	const auto analyze = [&](size_t function_index, GuestInstructionPatchResult& counts,
 	                         DecodedFunction&                         function,
@@ -1826,7 +1843,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 					DecodedFunction                         function;
 					std::map<uintptr_t, InstructionRewrite> rewrite_sites;
 					analyze(function_index, counts, function, rewrite_sites);
-					if (rewrite_sites.empty()) {
+					if (rewrite_sites.empty() && !reads_patched_bytes(function)) {
 						AddPatchCounts(scan_counts[worker], counts);
 					} else {
 						scan_candidates[worker].push_back(function_index);
@@ -1909,13 +1926,19 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 				decoded_changed.wait(decoded_lock, [&] { return slot != nullptr; });
 				function = std::move(slot);
 			}
-			AddPatchCounts(result, function->counts);
-			if (!function->rewrite_sites.empty()) {
-				RejectionMap rejections;
-				RelocateGuestInstructions(module, function->function, function->rewrite_sites,
-				                          rejections, result);
-				TrapUnrelocatedInstructions(*module, function->function, function->rewrite_sites,
-				                            rejections, result);
+			if (reads_patched_bytes(function->function)) {
+				// Decode it again now, after the functions before it are patched and before those
+				// after it, as a single-threaded pass does.
+				patch(candidates[candidate_index]);
+			} else {
+				AddPatchCounts(result, function->counts);
+				if (!function->rewrite_sites.empty()) {
+					RejectionMap rejections;
+					RelocateGuestInstructions(module, function->function, function->rewrite_sites,
+					                          rejections, result);
+					TrapUnrelocatedInstructions(*module, function->function,
+					                            function->rewrite_sites, rejections, result);
+				}
 			}
 			{
 				std::lock_guard decoded_lock(decoded_mutex);
