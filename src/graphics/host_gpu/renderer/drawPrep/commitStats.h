@@ -79,6 +79,19 @@ enum class Sub : uint8_t {
 	ReadSig,      // of which: the range signature read (MemoryTracker::RangeSignature)
 	ValLog,       // DrawPrep::Validate: the coherence log check
 	ValClean,     // DrawPrep::Validate: the clean verdicts after it
+	// KYTY_CP_COMMIT_STATS=steps: the "findbuf" phase (FindBuffers of every stage + PrepareBda).
+	FbDecode,     // FindBuffers: V# decode / plan range, clamp, out-of-bounds notes
+	FbPrefetch,   // FindBuffers: BufferCache::PrefetchReadBinding
+	FbLookup,     // FindBuffers: BufferCache::FindBuffer, page-table hits
+	FbCreate,     // FindBuffers: BufferCache::FindBuffer calls that created a buffer (with joins)
+	BdaGate,      // PrepareBda: lock, epoch/submission gate, pass selection, fault flag
+	BdaTake,      // BDA pass: MemoryTracker::TakeDirtiedRanges
+	BdaLogSync,   // dirty-log pass: the logged ranges' SynchronizeBuffersInRange
+	BdaLogHot,    // dirty-log pass: the recorded hot runs' SynchronizeBuffer
+	BdaLogMerge,  // dirty-log pass: hot-run validation and the found/recorded merge
+	BdaHotPass,   // hot-runs-only pass
+	BdaFull,      // full scan of every mapped buffer
+	BdaVerify,    // the verify modes' extra scans
 	Count
 };
 // Per-draw counts (averaged per draw of the class): "items[...]".
@@ -102,6 +115,15 @@ enum class Item : uint8_t {
 	ReadMisses,     // and misses
 	LogEntries,     // KYTY_CP_COMMIT_STATS=steps: coherence log entries a certificate check read
 	CertRanges,     // and the certificate's ranges
+	FbBindings,     // KYTY_CP_COMMIT_STATS=steps: FindBuffers bindings looked up
+	FbCreates,      // and FindBuffer calls that created a buffer
+	BdaLogPasses,   // BDA passes run: dirty-log
+	BdaFullPasses,  // full scans
+	BdaHotPasses,   // hot runs only
+	BdaUploadKiB,   // KiB the BDA passes uploaded
+	BdaHotRuns,     // recorded hot runs re-examined by the passes
+	BdaCompareKiB,  // KiB of hot pages the passes compared with their shadows
+	BdaHotDeduped,  // KYTY_FINDBUF_FAST=2: recorded hot runs a dirty-log pass skipped (synced already)
 	Count
 };
 
@@ -286,6 +308,33 @@ private:
 	Sub      m_sub;
 	uint64_t m_start;
 };
+
+// A sub-phase timed only with KYTY_CP_COMMIT_STATS=steps (finer splits that would otherwise cost
+// two TSC reads on every call). Retarget() moves the time measured so far to another sub.
+class StepSubScope {
+public:
+	explicit StepSubScope(Sub sub): m_sub(sub), m_start(StepsEnabled() ? Now() : 0) {}
+	~StepSubScope() { Stop(); }
+	void Retarget(Sub sub) { m_sub = sub; }
+	void Stop() {
+		if (m_start != 0) {
+			AddSub(m_sub, Now() - m_start);
+			m_start = 0;
+		}
+	}
+	StepSubScope(const StepSubScope&)            = delete;
+	StepSubScope& operator=(const StepSubScope&) = delete;
+
+private:
+	Sub      m_sub;
+	uint64_t m_start;
+};
+
+inline void StepItems(Item item, uint64_t count) {
+	if (StepsEnabled()) [[unlikely]] {
+		AddItems(item, count);
+	}
+}
 
 // Hash helpers for building a DrawShape.
 [[nodiscard]] uint64_t Hash(const void* data, uint64_t size, uint64_t seed = 0);

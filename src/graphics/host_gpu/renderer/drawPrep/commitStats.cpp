@@ -226,12 +226,16 @@ const char* const kSubNames[SubCount]     = {
     "acqdepth",    "push",      "dynamic",   "begin",    "acqcand",  "runrecord",
     "prefetch",    "latefallback", "vtxcommit", "transitions", "descbuild", "pushconst",
     "descpush",    "descset",   "bindpipe",  "barriers", "drawcmd",
-    "readhit",     "readmiss",  "readsig",  "vallog",   "valclean"};
+    "readhit",     "readmiss",  "readsig",  "vallog",   "valclean",
+    "fb-decode",   "fb-prefetch", "fb-lookup", "fb-create", "bda-gate", "bda-take",
+    "bda-logsync", "bda-loghot", "bda-logmerge", "bda-hotpass", "bda-full", "bda-verify"};
 const char* const kItemNames[ItemCount] = {
     "textures",  "samplers",   "set-current", "set-history",   "set-miss",
     "set-repeated", "color-hit", "color-miss", "depth-hit",    "depth-miss",
     "target-repeat", "target-lookup", "descwrites", "transitions", "pipeline-new",
-    "read-hits",  "read-misses", "log-entries", "cert-ranges"};
+    "read-hits",  "read-misses", "log-entries", "cert-ranges",
+    "fb-bindings", "fb-creates", "bda-log", "bda-full", "bda-hot", "bda-upload-kib", "bda-hotruns",
+    "bda-compare-kib", "bda-hot-deduped"};
 
 const char* const kStepNames[StepCount] = {
     "g.committail", "g.retire",      "g.opexit",     "g.loop",        "g.ophead",      "g.drawop",

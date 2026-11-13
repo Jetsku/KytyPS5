@@ -1789,6 +1789,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			staged += TRACKER_PAGE_SIZE;
 		}
 	}
+	m_hot_compared_bytes += visited * TRACKER_PAGE_SIZE;
 	MemoryStats::Count(MemoryStats::Counter::HotUploadPages, visited);
 	MemoryStats::Count(MemoryStats::Counter::HotUploadSkipped, skipped);
 	if (settled != 0) {
@@ -3058,6 +3059,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::CreateBuffer);
+	m_created_buffers++;
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -5230,6 +5232,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	// it), or a change of the registered buffers or GPU mappings, which moves the BDA structure
 	// epoch. Everything the command processor orders before later draws (packets writing memory,
 	// waits, cache invalidations, service commands) advances the epoch first.
+	CommitStats::StepSubScope gate_scope(CommitStats::Sub::BdaGate);
 	const auto sync_epoch = SyncEpoch::Current();
 	const auto submission = SyncEpoch::CurrentSubmission();
 	const auto structure  = m_bda_structure_epoch.load(std::memory_order_acquire);
@@ -5239,6 +5242,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochSkips);
 		m_bda_epoch_totals.skips++;
 		if (m_bda_epoch_verify != 0) {
+			gate_scope.Retarget(CommitStats::Sub::BdaVerify);
 			VerifyBdaEpochSkip(mapped_ranges);
 		}
 		return;
@@ -5264,7 +5268,14 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto uploaded_before = m_bda_pass_upload_bytes;
 	m_bda_count_uploads        = same_submission;
 	const auto pass_start      = BufferLookupStats::Now();
+	gate_scope.Stop();
+	const auto uploaded_stat   = m_bda_pass_upload_bytes;
+	const auto compared_stat   = m_hot_compared_bytes;
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	CommitStats::StepItems(CommitStats::Item::BdaCompareKiB,
+	                       (m_hot_compared_bytes - compared_stat) >> 10u);
+	CommitStats::StepItems(CommitStats::Item::BdaUploadKiB,
+	                       (m_bda_pass_upload_bytes - uploaded_stat) >> 10u);
 	if (pass_start != 0) {
 		BufferLookupStats::AddPart(static_cast<BufferLookupStats::Part>(m_bda_pass_kind),
 		                           BufferLookupStats::Now() - pass_start);
@@ -5364,6 +5375,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	uint64_t fault_epoch  = 0;
 	bool     log_complete = false;
 	if (m_bda_dirty_log) {
+		const CommitStats::StepSubScope take_scope(CommitStats::Sub::BdaTake);
 		log_complete = m_memory_tracker.TakeDirtiedRanges(m_bda_dirtied, fault_epoch);
 		if (!log_complete) {
 			m_bda_log_totals.overflows++;
@@ -5392,7 +5404,12 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		}
 		BdaSyncStats stats;
 		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaHot);
-		if (SynchronizeBdaHotRanges(stats)) {
+		CommitStats::StepSubScope hot_scope(CommitStats::Sub::BdaHotPass);
+		CommitStats::StepItems(CommitStats::Item::BdaHotRuns, m_bda_hot_ranges.size());
+		const bool hot_done = SynchronizeBdaHotRanges(stats);
+		hot_scope.Stop();
+		if (hot_done) {
+			CommitStats::StepItems(CommitStats::Item::BdaHotPasses, 1);
 			FaultCost::NoteBdaPass(1, stats.upload_bytes);
 			m_bda_pass_upload_bytes += stats.upload_bytes;
 			if (collect) {
@@ -5404,6 +5421,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 				                          stats.upload_copies);
 			}
 			if (BdaHotSyncVerifyEnabled()) {
+				const CommitStats::StepSubScope verify_scope(CommitStats::Sub::BdaVerify);
 				VerifyBdaHotPass(mapped_ranges, cpu_epoch, structure_epoch);
 			}
 			return;
@@ -5414,8 +5432,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	           (m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaLog),
 	            SynchronizeBdaDirtied(mapped_ranges))) {
 		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
+		CommitStats::StepItems(CommitStats::Item::BdaLogPasses, 1);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
 		if (m_bda_log_verify != 0) {
+			const CommitStats::StepSubScope verify_scope(CommitStats::Sub::BdaVerify);
 			m_bda_log_totals.verify_checks++;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogVerifyChecks);
 			const auto missed = VerifyBdaFullScan(mapped_ranges, cpu_epoch, structure_epoch);
@@ -5447,7 +5467,9 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		stats.hot_ranges = &m_bda_hot_ranges;
 	}
 	const bool keep_stats = collect || m_bda_hot_sync || m_bda_count_uploads;
+	CommitStats::StepItems(CommitStats::Item::BdaFullPasses, 1);
 	{
+		const CommitStats::StepSubScope full_scope(CommitStats::Sub::BdaFull);
 		// Only uploads are recorded while scanning: all of them share one barrier pair.
 		const UploadBatch upload_batch(*this);
 		mapped_ranges.ForEach([this, keep_stats, &stats](uint64_t start, uint64_t end) {
@@ -5470,18 +5492,35 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 }
 
+// KYTY_FINDBUF_FAST (default 0): faster work on the run-start draws' BDA path. 1: the dirty-log
+// pass merges found hot runs through a hash set. 2: also, the dirty-log pass skips re-examining a
+// recorded hot run that its logged ranges just synchronized (see the uses).
+static uint32_t FindBufFastLevel() {
+	static const uint32_t level = [] {
+		const auto* value = std::getenv("KYTY_FINDBUF_FAST");
+		return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return level;
+}
+static bool FindBufFastEnabled() {
+	return FindBufFastLevel() >= 1;
+}
+
 bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	// A hot run grows at most a few entries per pass; past this, rebuild the list in a full scan.
 	constexpr size_t MaxHotRanges = 4096;
 	if (m_bda_hot_ranges.size() > MaxHotRanges) {
 		return false;
 	}
+	CommitStats::StepSubScope merge_scope(CommitStats::Sub::BdaLogMerge);
 	for (const auto& range: m_bda_hot_ranges) {
 		const auto* buffer = m_slot_buffers.try_get(range.id);
 		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(range.address, range.size)) {
 			return false;
 		}
 	}
+	merge_scope.Stop();
+	CommitStats::StepItems(CommitStats::Item::BdaHotRuns, m_bda_hot_ranges.size());
 	// The logged ranges report the hot runs they turn up (new hot pages, which a write fault
 	// logged when it promoted them); the recorded runs are re-examined as in a hot pass.
 	std::vector<BdaHotRange> found;
@@ -5490,29 +5529,63 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	uint64_t logged  = 0;
 	{
 		const UploadBatch upload_batch(*this);
+		CommitStats::StepSubScope log_scope(CommitStats::Sub::BdaLogSync);
 		m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
 			logged++;
 			mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
 				SynchronizeBuffersInRange(start, finish - start, &stats);
 			});
 		});
+		log_scope.Stop();
+		const CommitStats::StepSubScope hot_scope(CommitStats::Sub::BdaLogHot);
 		BdaSyncStats hot_stats;
+		const bool   dedupe  = FindBufFastLevel() >= 2 && !m_bda_dirtied.Empty();
+		uint64_t     deduped = 0;
 		for (const auto& range: m_bda_hot_ranges) {
+			// KYTY_FINDBUF_FAST=2: a run inside one logged range that is mapped was synchronized
+			// (every buffer over it, hot pages compared with their shadows) by the loop above, in
+			// this same pass: a second look only repeats the compares.
+			if (dedupe && m_bda_dirtied.Contains(range.address, range.size) &&
+			    mapped_ranges.Contains(range.address, range.size)) {
+				deduped++;
+				continue;
+			}
 			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
 			                        false, &hot_stats);
 		}
+		CommitStats::StepItems(CommitStats::Item::BdaHotDeduped, deduped);
 		stats.upload_bytes += hot_stats.upload_bytes;
 		stats.upload_copies += hot_stats.upload_copies;
 	}
 	m_bda_pass_upload_bytes += stats.upload_bytes;
-	for (const auto& range: found) {
-		const bool known =
-		    std::any_of(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(), [&](const auto& other) {
-			    return other.id == range.id && other.address == range.address &&
-			           other.size == range.size;
-		    });
-		if (!known) {
-			m_bda_hot_ranges.push_back(range);
+	const CommitStats::StepSubScope merge_tail_scope(CommitStats::Sub::BdaLogMerge);
+	if (FindBufFastEnabled() && !found.empty()) {
+		// KYTY_FINDBUF_FAST: the same merge (append each found run not yet recorded, in order,
+		// duplicates within `found` included only once) through a hash set instead of a linear
+		// search of up to 4096 recorded runs per found run.
+		const auto key_of = [](const BdaHotRange& r) {
+			return BdaHotKey {r.id.index, r.id.generation, r.address, r.size};
+		};
+		m_bda_hot_keys.clear();
+		m_bda_hot_keys.reserve(m_bda_hot_ranges.size() + found.size());
+		for (const auto& range: m_bda_hot_ranges) {
+			m_bda_hot_keys.insert(key_of(range));
+		}
+		for (const auto& range: found) {
+			if (m_bda_hot_keys.insert(key_of(range)).second) {
+				m_bda_hot_ranges.push_back(range);
+			}
+		}
+	} else {
+		for (const auto& range: found) {
+			const bool known =
+			    std::any_of(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(), [&](const auto& other) {
+				    return other.id == range.id && other.address == range.address &&
+				           other.size == range.size;
+			    });
+			if (!known) {
+				m_bda_hot_ranges.push_back(range);
+			}
 		}
 	}
 	m_bda_log_totals.passes++;

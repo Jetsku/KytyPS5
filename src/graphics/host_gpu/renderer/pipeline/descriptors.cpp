@@ -1861,7 +1861,9 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	    uint64_t {256} * 1024 * 1024,
 	    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 	        (graphics.StorageMinAlignment() - 1));
+	CommitStats::StepItems(CommitStats::Item::FbBindings, program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		CommitStats::StepSubScope decode_scope(CommitStats::Sub::FbDecode);
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		if (use_plan) {
@@ -1938,12 +1940,20 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			// decode the V# here, so the plan and serial ranges above stay as they are.
 			size = unbounded_read_limit;
 		}
+		decode_scope.Stop();
 		if (const auto& resource = program.info.buffers[i]; !resource.written && !resource.formatted) {
 			// KYTY_CP_BINDING_BATCH_PREFETCH=find (BufferCache::PrefetchReadBinding).
+			const CommitStats::StepSubScope prefetch_scope(CommitStats::Sub::FbPrefetch);
 			cache.PrefetchReadBinding(address, size, true);
 		}
+		CommitStats::StepSubScope lookup_scope(CommitStats::Sub::FbLookup);
+		const auto created_before = cache.CreatedBufferCount();
 		BufferLookupStats::PartScope find_scope(BufferLookupStats::Part::FindCall);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		if (cache.CreatedBufferCount() != created_before) {
+			lookup_scope.Retarget(CommitStats::Sub::FbCreate);
+			CommitStats::StepItems(CommitStats::Item::FbCreates, 1);
+		}
 	}
 }
 

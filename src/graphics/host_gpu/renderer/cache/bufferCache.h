@@ -23,6 +23,7 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -153,6 +154,8 @@ public:
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Buffers CreateBuffer made so far (diagnostics: FindBuffers' sub-timers).
+	[[nodiscard]] uint64_t CreatedBufferCount() const noexcept { return m_created_buffers; }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -325,6 +328,22 @@ private:
 		BufferId id;
 		uint64_t address = 0;
 		uint64_t size    = 0;
+	};
+	// KYTY_FINDBUF_FAST: a recorded hot run's identity (BufferId with its generation).
+	struct BdaHotKey {
+		uint32_t index      = 0;
+		uint32_t generation = 0;
+		uint64_t address    = 0;
+		uint64_t size       = 0;
+		bool     operator==(const BdaHotKey&) const noexcept = default;
+	};
+	struct BdaHotKeyHash {
+		size_t operator()(const BdaHotKey& k) const noexcept {
+			uint64_t h = (static_cast<uint64_t>(k.index) << 32u) ^ k.generation;
+			h ^= k.address + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
+			h ^= k.size + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
+			return static_cast<size_t>(h * 0xff51afd7ed558ccdull);
+		}
 	};
 	struct BdaSyncStats {
 		uint64_t scanned_buffers = 0;
@@ -847,6 +866,9 @@ private:
 	// write fault, which changes the fault epoch, and buffers only change with the structure one.
 	// Dirty-log passes add the hot runs they find in the logged ranges.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
+	uint64_t                                          m_created_buffers = 0;
+	uint64_t                                          m_hot_compared_bytes = 0;
+	std::unordered_set<BdaHotKey, BdaHotKeyHash>      m_bda_hot_keys;
 	// KYTY_BDA_DIRTY_LOG (default on with KYTY_BDA_HOT_SYNC; =0 off). A BDA pass whose structure
 	// epoch is unchanged but whose fault epoch moved synchronizes only the ranges the tracker
 	// logged since the last pass (MemoryTracker::TakeDirtiedRanges, taken with the epoch they
