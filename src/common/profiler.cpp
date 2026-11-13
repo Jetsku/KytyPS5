@@ -34,6 +34,7 @@
 #include <share.h>
 #include <sys/stat.h>
 #else
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -1286,6 +1287,15 @@ void EndBlock() {
 
 void SetThreadName(const char* name) {
 	if (name != nullptr) HangWatchdog::SetThreadName(name);
+#if defined(__linux__)
+	// Name the OS thread too, so perf, ftrace and top tell the emulator's threads apart. The main
+	// thread keeps its name: it is the process name that ps and pgrep show.
+	if (name != nullptr && gettid() != getpid()) {
+		char os_name[16] {};
+		std::strncpy(os_name, name, sizeof(os_name) - 1);
+		pthread_setname_np(pthread_self(), os_name);
+	}
+#endif
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

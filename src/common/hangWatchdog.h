@@ -80,6 +80,8 @@ void DebugDelay(const char* site, uint64_t key = 0);
 struct StallDetector {
 	uint64_t flips = 0, submissions = 0, idle_since_ms = 0;
 	bool     armed = false, fired = false;
+	// Armed from the first poll rather than after the first flip and submission.
+	bool     arm_at_start = false;
 	bool Poll(uint64_t now_ms, uint64_t new_flips, uint64_t new_submissions, uint64_t timeout_ms);
 };
 std::string SnapshotForTest();

@@ -872,6 +872,7 @@ static Live::Switch g_present_abs_vblank("KYTY_PRESENT_ABS_VBLANK", Live::ParseD
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
 	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
+	KYTY_PROFILER_THREAD("VideoOut flips");
 	Common::RaiseServiceThreadPriority();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
@@ -2053,6 +2054,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
+
+	LOGF("\t resolution   = %" PRIu32 "\n"
+	     "\t dynamicRange = %" PRIu32 "\n"
+	     "\t refreshRate  = %" PRIu64 "\n",
+	     status->resolution, status->dynamicRange, status->refreshRate);
 
 	return OK;
 }

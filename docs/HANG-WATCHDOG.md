@@ -4,6 +4,9 @@
 occurred, the watchdog writes one report if neither counter advances for five seconds. It checks
 once a second, so detection can take approximately five to six seconds. It does not recover,
 time out, reorder, or skip guest or GPU work. A long legitimate loading stall can also trigger it.
+`KYTY_HANG_WATCHDOG_STARTUP=1` also arms it at startup, so a stall before the first flip and
+submission (while loading) is also reported; `KYTY_HANG_WATCHDOG_MS` sets the stall time (default
+5000, 1000 to 600000). A loading screen that legitimately makes no progress for that long triggers it.
 
 The report is `watchdog.txt` in the active hang-trace directory. With tracing disabled, it is in
 `_HangTrace/watchdog-<timestamp>-pid<PID>/` beside the emulator on Windows. An explicit

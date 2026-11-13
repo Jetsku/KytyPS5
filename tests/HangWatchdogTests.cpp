@@ -29,6 +29,12 @@ void Decisions() {
   Check(!d.Poll(40000, 2, 2, 5000), "flip progress cancels stall");
   Check(d.Poll(45000, 2, 2, 5000), "exactly five seconds fires");
   Check(!d.Poll(99999, 2, 2, 5000), "only once");
+
+  HangWatchdog::StallDetector loading;
+  loading.arm_at_start = true;
+  Check(!loading.Poll(0, 0, 0, 5000), "startup arming starts the clock without firing");
+  Check(!loading.Poll(3000, 0, 1, 5000), "a submission while loading cancels the stall");
+  Check(loading.Poll(8000, 0, 1, 5000), "a stall before the first flip fires");
 }
 void ConcurrentSnapshot() {
   std::atomic<bool> ready{false}, release{false};

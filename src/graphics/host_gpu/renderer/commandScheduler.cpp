@@ -452,6 +452,7 @@ void CommandScheduler::SetProgressHook(ProgressHook hook, void* context) {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GPU completions");
 	// It blocks on the operation queue and on the timeline semaphore; the CP waits for it
 	// (WaitPriorityOperations) and so does the guest (end-of-pipe interrupts, flips, readbacks).
 	Common::RaiseServiceThreadPriority();
