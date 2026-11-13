@@ -26,6 +26,13 @@
 #include <immintrin.h>
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <cstdint>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace Common {
 
 bool ShortSleepsBlock() {
@@ -268,6 +275,49 @@ static void RaiseCurrentThreadPriorityLevel(int level) {
 	throttling.StateMask   = 0;
 	(void)SetThreadInformation(thread, ThreadPowerThrottling, &throttling, sizeof(throttling));
 }
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+// struct sched_attr of sched_setattr(2) (SCHED_ATTR_SIZE_VER1); older glibc headers lack it.
+struct SchedAttr {
+	uint32_t size;
+	uint32_t sched_policy;
+	uint64_t sched_flags;
+	int32_t  sched_nice;
+	uint32_t sched_priority;
+	uint64_t sched_runtime;
+	uint64_t sched_deadline;
+	uint64_t sched_period;
+	uint32_t sched_util_min;
+	uint32_t sched_util_max;
+};
+
+// Both levels alike: Linux's fair scheduler has no strict priority. Unprivileged, CPU share
+// unchanged.
+static void RaiseCurrentThreadPriorityLevel(int level) {
+	if (level == 0) {
+		return;
+	}
+	SchedAttr attr {};
+	if (::syscall(SYS_sched_getattr, 0, &attr, sizeof(attr), 0) != 0 ||
+	    attr.sched_policy != SCHED_OTHER) {
+		return;
+	}
+	attr.size = sizeof(attr);
+	// A woken thread preempts a running one that has a longer slice (EEVDF, Linux 6.12+) instead of
+	// waiting for that slice to end (the base slice is ~3 ms with 14 CPUs) when all CPUs are busy.
+	attr.sched_runtime = 100'000;
+	// Like the EcoQoS opt-out: a minimum utilization clamp keeps the thread on performance cores at
+	// a high clock, which energy-aware scheduling would otherwise move to efficiency cores.
+	constexpr uint64_t UtilClampMin = 0x20; // SCHED_FLAG_UTIL_CLAMP_MIN
+	// Threads it creates start with the defaults, as Windows priorities are not inherited. Not at a
+	// negative nice (renice, GameMode): the reset would also drop the children's nice to 0.
+	constexpr uint64_t ResetOnFork = 0x01; // SCHED_FLAG_RESET_ON_FORK
+	attr.sched_flags |= UtilClampMin | (attr.sched_nice >= 0 ? ResetOnFork : 0);
+	attr.sched_util_min = 1024;
+	if (::syscall(SYS_sched_setattr, 0, &attr, 0) != 0) {
+		attr.sched_flags &= ~UtilClampMin; // a kernel without utilization clamping
+		(void)::syscall(SYS_sched_setattr, 0, &attr, 0);
+	}
+}
 #endif
 
 static int PriorityLevelFromEnv(const char* name, int fallback) {
@@ -276,7 +326,7 @@ static int PriorityLevelFromEnv(const char* name, int fallback) {
 }
 
 void RaiseCurrentThreadPriority() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	static const int level = PriorityLevelFromEnv("KYTY_CP_PRIORITY", 1);
 	RaiseCurrentThreadPriorityLevel(level);
 #endif
@@ -288,7 +338,7 @@ int ServiceThreadPriorityLevel() {
 }
 
 void RaiseServiceThreadPriority() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	RaiseCurrentThreadPriorityLevel(ServiceThreadPriorityLevel());
 #endif
 }

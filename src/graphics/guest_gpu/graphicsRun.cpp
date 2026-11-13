@@ -1536,7 +1536,7 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
-/// Body of the GPU thread. Raises the thread's host priority on Windows, then takes queued commands
+/// Body of the GPU thread. Raises the thread's host priority, then takes queued commands
 /// and submissions one at a time and runs them until the GPU is told to stop.
 /// @param data the GuestGpu that owns the queues
 void GuestGpu::ThreadRun(void* data) {
