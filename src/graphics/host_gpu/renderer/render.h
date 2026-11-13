@@ -1175,19 +1175,15 @@ public:
 	// CommitBindings' cache and barrier work, which runs ahead of its encode (descriptors.cpp).
 	void CommitBindingsSideEffects(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
 	                               std::span<PreparedBindings* const> bindings, bool keep_images);
-	// The encode after the side effects: as it was (KYTY_ENC_BUILDER=0, temporary) and through the
-	// builder (descriptorEncode.h) into any sink and shadow.
+	// The encode after the side effects, through the builder (descriptorEncode.h).
 	void CommitBindingsEncode(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                          const PipelineCache::Pipeline&     pipeline,
 	                          std::span<PreparedBindings* const> bindings, bool keep_images);
-	void CommitBindingsEncodeOld(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
-	                             const PipelineCache::Pipeline&     pipeline,
-	                             std::span<PreparedBindings* const> bindings, bool keep_images);
 	template <typename Sink>
-	bool EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, CommandBuffer& buffer,
+	void EncodeCommit(Sink& sink, DrawEncode::Shadow& shadow, CommandBuffer& buffer,
 	                  vk::PipelineBindPoint point, const PipelineCache::Pipeline& pipeline,
 	                  std::span<PreparedBindings* const> stages, bool partial,
-	                  DrawEncode::DescriptorScratch& scratch, DrawEncode::BuiltDescriptors& built, bool real);
+	                  DrawEncode::DescriptorScratch& scratch, DrawEncode::BuiltDescriptors& built);
 	[[nodiscard]] DrawEncode::DescriptorEnv MakeDescriptorEnv(std::span<PreparedBindings* const> stages);
 	void NoteDescriptorOffsetAudit(const PipelineCache::Pipeline&          pipeline,
 	                               std::span<const vk::WriteDescriptorSet> writes);
@@ -1475,14 +1471,6 @@ private:
 	// The descriptor writes the last CommitBindings built (drawEncode.h).
 	DrawEncode::DescriptorScratch m_descriptor_scratch;
 	DrawEncode::BuiltDescriptors  m_built_descriptors;
-	// KYTY_ENC_BUILDER verify: the builder's encode goes to this capture (consumed at once).
-	struct EncCapture {
-		CommandStream::Ring          ring {1u << 20u};
-		CommandStream::Encoder       encoder {ring, CommandStream::Encoder::Options {}};
-		DrawEncode::DescriptorScratch scratch;
-		DrawEncode::BuiltDescriptors  built;
-	};
-	std::unique_ptr<EncCapture> m_enc_capture;
 	// KYTY_ENC_OFFLOAD (renderDraw.cpp, encodeOffload.h).
 	struct OffloadJob;
 	struct OffloadState;

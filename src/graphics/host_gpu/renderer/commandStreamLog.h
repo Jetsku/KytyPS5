@@ -3,7 +3,7 @@
 
 // A Replay executor (commandStream.h) that records each replayed command as (op, VerifyHash of its
 // arguments): a canonical form of a packet sequence that ignores packet padding, site blocks and
-// verify sequence numbers. Used to compare two encodes of the same commands (KYTY_ENC_BUILDER
+// verify sequence numbers. Used to compare two encodes of the same commands (the step-2 builder
 // verify, KYTY_ENC_OFFLOAD verify) and by the unit tests.
 
 #include "graphics/host_gpu/renderer/commandStream.h"
