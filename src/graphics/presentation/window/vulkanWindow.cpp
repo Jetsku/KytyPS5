@@ -83,12 +83,12 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputLayer         = VK_TRUE;
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
-	features.shaderBufferInt64Atomics  = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	// shaderStorageBufferArrayNonUniformIndexing (required upstream since fd66f580b) is enabled
 	// when supported (GraphicContext::storage_buffer_array_non_uniform_indexing_enabled) instead
-	// of being required.
+	// of being required. So is shaderBufferInt64Atomics: the first shader that needs it stops the
+	// emulator (SetHostBufferInt64Atomics).
 	return features;
 }
 
@@ -306,8 +306,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.shaderOutputViewportIndex);
 		check_feature(features12.bufferDeviceAddress, "bufferDeviceAddress",
 		              required_features12.bufferDeviceAddress);
-		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
-		              required_features12.shaderBufferInt64Atomics);
+		if (features12.shaderBufferInt64Atomics != VK_TRUE) {
+			LOGF("shaderBufferInt64Atomics is not supported\n");
+		}
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing",
 		              required_features12.shaderSampledImageArrayNonUniformIndexing);
@@ -328,13 +329,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.samplerAnisotropy, "samplerAnisotropy");
 		check_feature(device_features2.features.robustBufferAccess, "robustBufferAccess");
-#if defined(__APPLE__)
+		// Optional: the first draw that needs it stops the emulator (PipelineCache).
 		if (device_features2.features.depthBounds != VK_TRUE) {
 			LOGF("depthBounds is not supported\n");
 		}
-#else
-		check_feature(device_features2.features.depthBounds, "depthBounds");
-#endif
 		check_feature(device_features2.features.shaderStorageImageWriteWithoutFormat,
 		              "shaderStorageImageWriteWithoutFormat");
 
@@ -899,6 +897,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering == VK_TRUE;
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	features12.shaderBufferInt64Atomics = supported_features12.shaderBufferInt64Atomics;
+	ShaderRecompiler::SetHostBufferInt64Atomics(features12.shaderBufferInt64Atomics == VK_TRUE);
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
@@ -1206,7 +1206,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
 #if !defined(__APPLE__)
-	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
+	device_features.depthBounds = supported_features2.features.depthBounds; // not on MoltenVK
+	graphics.depth_bounds_enabled = device_features.depthBounds == VK_TRUE;
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
@@ -2083,6 +2084,8 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		graphic_ctx.depth_range_unrestricted_enabled =
+		    HasExtension(available_extensions, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 #if !defined(__APPLE__)
 		// Dynamic colour-write enables and the depth-clip switch: without them (older drivers) the
 		// renderer uses its MoltenVK path (GraphicContext::color_write_enable_enabled and

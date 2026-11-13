@@ -418,6 +418,10 @@ void               SetHostComputeSubgroups32(bool fixed_32);
 // Spirv::SetHostBufferRobustness for IR::UniformBufferResources).
 void               SetHostUniformBufferRobust(bool robust);
 [[nodiscard]] bool GetHostUniformBufferRobust();
+// Whether the device has shaderBufferInt64Atomics. Without it, emitting a program that needs it
+// stops the emulator.
+void               SetHostBufferInt64Atomics(bool supported);
+[[nodiscard]] bool GetHostBufferInt64Atomics();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
 // while no shader is being compiled.
 void SetCodegenOptions(const CodegenOptions& options);

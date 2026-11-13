@@ -24,6 +24,19 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
 	return !has_stencil || htile_stencil_disabled || has_htile;
 }
 
+// Whether a depth-bounds test can reject a sample. A depth attachment stores values in [0, 1]:
+// UNORM formats by definition, float formats unless VK_EXT_depth_range_unrestricted is enabled.
+// Bounds that contain [0, 1] therefore reject nothing, and the test is left out. Astro Bot enables
+// it with bounds [0, 1] on its 3D draws; GPUs without the depthBounds feature (Apple M1-M4) need
+// that to run them.
+inline bool depth_bounds_test_effective(bool enable, float min_bounds, float max_bounds,
+                                        vk::Format format, bool depth_range_unrestricted) {
+	const bool float_depth =
+	    format == vk::Format::eD32Sfloat || format == vk::Format::eD32SfloatS8Uint;
+	const bool unit_range = !float_depth || !depth_range_unrestricted;
+	return enable && !(unit_range && min_bounds <= 0.0f && max_bounds >= 1.0f);
+}
+
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;

@@ -82,6 +82,9 @@ struct GraphicContext {
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               precise_occlusion_enabled             = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
+	bool                               depth_bounds_enabled                  = false;
+	// VK_EXT_depth_range_unrestricted: float depth attachments can hold values outside [0, 1].
+	bool                               depth_range_unrestricted_enabled      = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;

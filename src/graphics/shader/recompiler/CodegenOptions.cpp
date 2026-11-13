@@ -178,6 +178,18 @@ bool GetHostUniformBufferRobust() {
 	return g_host_uniform_buffer_robust.load(std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<bool> g_host_buffer_int64_atomics {true};
+} // namespace
+
+void SetHostBufferInt64Atomics(bool supported) {
+	g_host_buffer_int64_atomics.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostBufferInt64Atomics() {
+	return g_host_buffer_int64_atomics.load(std::memory_order_relaxed);
+}
+
 const CodegenOptions& GetCodegenOptions() {
 	return Storage();
 }
