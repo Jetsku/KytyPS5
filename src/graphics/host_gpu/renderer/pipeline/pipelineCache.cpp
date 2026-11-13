@@ -2817,6 +2817,17 @@ struct PipelineCache::ProgramCache {
 		// VK_KHR_maintenance8 (upstream 460a196fc): SPIR-V validation accepts dynamic texel offsets.
 		options.maintenance8_enabled = maintenance8_enabled;
 		options.shader_hash = params.hash;
+		{
+			// KYTY_SHADER_ADDR_LOG=1: map guest shader addresses (device-fault checkpoints) to hashes.
+			static const bool addr_log = [] {
+				const char* v = std::getenv("KYTY_SHADER_ADDR_LOG");
+				return v != nullptr && v[0] == '1';
+			}();
+			if (addr_log) {
+				Log::WriteToConsoleAndLog(fmt::format("ShaderAddr: {} hash=0x{:016x} base=0x{:016x}\n",
+				                                      label, params.hash, params.Base()));
+			}
+		}
 		options.user_data   = runtime.user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;

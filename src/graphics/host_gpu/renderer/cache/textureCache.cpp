@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
@@ -2158,6 +2159,24 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// KYTY_DEPTH_STENCIL_ALIAS (default off; =1 on; suspected of a device loss in UFC 5, unproven): a depth allocation used alternately as D32 and as
+// D32S8 (EA SPORTS UFC 5 switches its 1068x600 depth target every frame) keeps both images alive
+// as aliases instead of recreating, copying and freeing one each switch. Copies never include the
+// stencil aspect, so the stencil image keeps its own stencil while the depth aspect is synced from
+// whichever interpretation wrote last (PS5 depth and stencil are separate planes).
+static bool DepthStencilAliasEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_DEPTH_STENCIL_ALIAS");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Whether `image` may take part in alias syncing despite a stencil aspect.
+static bool StencilAliasAllowed(const Image& image) {
+	return !image.info.HasStencil() || (DepthStencilAliasEnabled() && image.info.IsDepth());
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -2297,7 +2316,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           cached.backing.samples, replacement.backing.samples);
 	}
 	if (keep_aliases && cached.backing.samples == replacement.backing.samples &&
-	    !cached.info.HasStencil() && !replacement.info.HasStencil()) {
+	    StencilAliasAllowed(cached) && StencilAliasAllowed(replacement)) {
 		// The replacement now holds the newest contents; the cached interpretation stays alive
 		// as a non-owner alias for the next switch back.
 		if (replacement.IsGpuModified()) {
@@ -3160,6 +3179,15 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	                                      metadata_base_layer, values, decodable, false);
 }
 
+// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): see FindImage's render-target path.
+static bool CmaskDrawExpandEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
+		return v == nullptr || std::strcmp(v, "0") != 0;
+	}();
+	return enabled;
+}
+
 Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
     DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
     uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
@@ -3190,10 +3218,63 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	const auto slice_range = [&](uint32_t slice) {
 		return GuestRange {range.address + slice_size * (first + slice), slice_size};
 	};
+	// The guest's own kernel wrote these bytes (GPU-owned buffer memory, not an aliased image's
+	// contents): they are the target's current CMASK and safe to decide per tile.
+	const bool cmask_guest_written =
+	    cmask && m_buffer_cache.IsRegionGpuModified(range.address, range.size);
 	{
 		std::scoped_lock lock {m_lock};
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
-			return Event::DccFallbackMetadataAliased;
+		// Draw-expand mode: a guest-cleared CMASK is decided here even under a stale cached image
+		// (MaterializeCmaskClear); falling back to a readback would drain the GPU every frame.
+		static const bool ignore_alias = [] {
+			const char* v = std::getenv("KYTY_CMASK_NATIVE_IGNORE_ALIAS");
+			return v == nullptr || std::strcmp(v, "0") != 0;
+		}();
+		if (cmask && CmaskDrawExpandEnabled() && ignore_alias && std::getenv("KYTY_CMASK_ALIAS_LOG") != nullptr) {
+			static std::unordered_set<uint64_t> logged_alias;
+			const auto aliases = FindImagesInRegion(range.address, range.size, false);
+			if (!aliases.empty() && logged_alias.insert(range.address).second) {
+				std::string text = fmt::format("CmaskAlias: meta 0x{:x}+0x{:x} target 0x{:x} {}x{} fmt {}:",
+				                               range.address, range.size, desc.info.data.address,
+				                               desc.info.extent.width, desc.info.extent.height,
+				                               static_cast<int>(desc.info.pixel_format));
+				for (const auto other: aliases) {
+					if (const auto* img = m_slot_images.try_get(other)) {
+						text += fmt::format(" [0x{:x}+0x{:x} {}x{} fmt {} gpu_mod {} depth {}]",
+						                    img->info.data.address, img->info.data.size,
+						                    img->info.extent.width, img->info.extent.height,
+						                    static_cast<int>(img->backing.format), img->IsGpuModified() ? 1 : 0,
+						                    img->info.IsDepth() ? 1 : 0);
+					}
+				}
+				Log::WriteToConsoleAndLog(text + "\n");
+			}
+		}
+		{
+			const auto aliases = FindImagesInRegion(range.address, range.size, false);
+			// Stale aliases only (no GPU-written interpretation over the bytes): the buffer holds
+			// the target's current CMASK, so it is decided per tile on the GPU.
+			bool stale_only = true;
+			for (const auto other: aliases) {
+				const auto* image = m_slot_images.try_get(other);
+				if (image != nullptr && image->IsGpuModified()) {
+					stale_only = false;
+					break;
+				}
+			}
+			if (!aliases.empty() && cmask && CmaskDrawExpandEnabled() && ignore_alias &&
+			    !(cmask_guest_written || stale_only)) {
+				// GPU-written interpretations own some of the bytes: move them into the buffer on
+				// the GPU (in order, no CPU wait), so the inspection reads the current CMASK, as the
+				// readback fallback would after draining the GPU.
+				(void)MaterializeOwnedBytes(range, {}, id, "cmask-inspect");
+			} else if (!aliases.empty() && !(cmask && CmaskDrawExpandEnabled() && ignore_alias)) {
+				if (std::getenv("KYTY_CMASK_FALLBACK_LOG") != nullptr) {
+					std::printf("CmaskFallbackWhy: aliased (cmask=%d expand=%d ignore=%d)\n", cmask ? 1 : 0,
+					            CmaskDrawExpandEnabled() ? 1 : 0, ignore_alias ? 1 : 0);
+				}
+				return Event::DccFallbackMetadataAliased;
+			}
 		}
 		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
 		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
@@ -3217,12 +3298,19 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		}
 	}
 	if (ImageRangeOverlaps(range, desc.info.data)) {
+		if (std::getenv("KYTY_CMASK_FALLBACK_LOG") != nullptr) {
+			std::printf("CmaskFallbackWhy: metadata 0x%llx+0x%llx overlaps target data 0x%llx+0x%llx\n",
+			            (unsigned long long)range.address, (unsigned long long)range.size,
+			            (unsigned long long)desc.info.data.address, (unsigned long long)desc.info.data.size);
+		}
 		return Event::DccFallbackMetadataAliased;
 	}
 	// KYTY_DCC_GPU_REFRESH (textureCache.h): a DCC image that is registered, matches the view and
 	// is fully resident is accepted while waiting for a refresh or not GPU-owned; it is refreshed
 	// right before the inspection, as the CPU fallback's ClearImage refreshes it.
-	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
+	// Draw-expand CMASK targets take the same refresh: the alternative is a readback that drains
+	// the GPU every frame (UFC 5's UI target).
+	const bool refresh_allowed = m_dcc_gpu_refresh && (!cmask || CmaskDrawExpandEnabled());
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
 		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
@@ -3263,7 +3351,9 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			case Support::Format: return Event::DccFallbackFormat;
 			case Support::Unsupported: return Event::DccFallbackUnsupported;
 		}
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		// Draw-expand CMASK: aliases were handled above (their bytes moved into the buffer).
+		if (!(cmask && CmaskDrawExpandEnabled()) &&
+		    !FindImagesInRegion(range.address, range.size, false).empty()) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		return std::nullopt;
@@ -3806,6 +3896,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+
 void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
                                          uint32_t metadata_base_layer, MetadataNoop* noop) {
 	using Event = Profiler::FrameEvent;
@@ -3821,6 +3912,13 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	if (!desc.cmask.valid || desc.type != BindingType::RenderTarget || !id) {
 		description_noop();
 		return;
+	}
+	// Draw-expand mode: CMASK still holding our expanded fill has nothing cleared to apply.
+	if (CmaskDrawExpandEnabled() && desc.cmask.range.Valid()) {
+		if (const auto fill = m_buffer_cache.KnownFill(desc.cmask.range.address, desc.cmask.range.size);
+		    fill && *fill == UINT32_MAX) {
+			return;
+		}
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	{
@@ -3871,12 +3969,28 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		{
 			std::scoped_lock lock {m_lock};
 			// Bytes some image also covers are not proven to be this surface's CMASK.
-			if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
+			// Draw-expand mode: the target's registers name these bytes as its CMASK, which is
+			// what the hardware reads; a stale cached image over them does not change that.
+			if (!CmaskDrawExpandEnabled() &&
+			    !FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
 				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
 				ClearTrace("CMASK", "aliased", metadata.address, metadata.size, desc.info.data.address,
 				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 				continue;
 			}
+		}
+		// Draw-expand mode: the guest's own kernels fast-clear CMASK (and FindImage marks it
+		// expanded at every render-target bind), so the bytes are decided on the GPU, per tile,
+		// every time: tiles still marked cleared get the clear colour, as the hardware shows them.
+		if (CmaskDrawExpandEnabled()) {
+			// Still our own expanded fill (no guest write since): nothing is cleared.
+			if (const auto fill = m_buffer_cache.KnownFill(metadata.address, metadata.size);
+			    fill && *fill == UINT32_MAX) {
+				continue;
+			}
+			native[slice] = 1;
+			provable      = false;
+			continue;
 		}
 		// The proof that every tile of the slice is fast-cleared: all CMASK bytes are 0. Guest
 		// memory holds bytes the GPU does not own. GPU-owned bytes are decided here only while a
@@ -3979,6 +4093,18 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		                              : Event::CmaskFastClearInspectionReuses,
 		                          view.layer_count);
 		return;
+	}
+	if (std::getenv("KYTY_CMASK_FALLBACK_LOG") != nullptr) {
+		static std::unordered_set<uint64_t> fallback_logged;
+		const uint64_t key = desc.info.data.address ^ (uint64_t {static_cast<uint32_t>(outcome)} << 52u) ^
+		                     (uint64_t {static_cast<uint32_t>(m_image_state_reason)} << 44u);
+		if (fallback_logged.insert(key).second) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "CmaskFallback: target 0x{:x} {}x{} fmt {} meta 0x{:x}+0x{:x} outcome {} image_state {}\n",
+			    desc.info.data.address, desc.info.extent.width, desc.info.extent.height,
+			    static_cast<int>(view.format), range.address, range.size, static_cast<int>(outcome),
+			    static_cast<int>(m_image_state_reason)));
+		}
 	}
 	// No native inspection: read the undecided slices back, as the DCC CPU fallback does.
 	for (uint32_t slice = 0; slice < view.layer_count; slice++) {
@@ -4257,6 +4383,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	const bool recording = record != nullptr && record->valid;
 	MaterializeDccClear(result, desc, metadata_base_layer, recording ? &record->dcc : nullptr);
 	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
+	// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): the colour block marks every CMASK tile it
+	// writes as expanded. The host renders uncompressed and never updates CMASK, so a guest that
+	// fast-clears CMASK with its own kernel and later reads it as data (Frostbite builds its UI
+	// tile mask from the UI target's CMASK) sees every tile as still cleared. Binding a CMASK
+	// target for rendering therefore marks its whole CMASK expanded on the GPU, in order with the
+	// draws (conservative: untouched tiles hold the materialized clear colour on the host).
+	if (desc.cmask.valid && desc.type == BindingType::RenderTarget && desc.cmask.range.Valid()) {
+		const auto fill = m_buffer_cache.KnownFill(desc.cmask.range.address, desc.cmask.range.size);
+		if (CmaskDrawExpandEnabled() && !(fill && *fill == UINT32_MAX)) {
+			m_buffer_cache.FillBuffer(desc.cmask.range.address, desc.cmask.range.size, UINT32_MAX,
+			                          false);
+			if (recording) {
+				record->cmask.provable = false;
+			}
+		}
+	}
 	if (recording) {
 		record->valid = record->dcc.provable && record->cmask.provable;
 		if (!record->valid) {
@@ -4414,6 +4556,32 @@ void TextureCache::EraseSurfaceMeta(uint64_t address) {
 		NoteSurfaceMetaChange();
 	}
 	memo = {address, m_surface_meta_inserts};
+}
+
+std::string TextureCache::DebugDescribeRegion(uint64_t address, uint64_t size, ImageId chosen) {
+	std::scoped_lock lock {m_lock};
+	std::string      out;
+	char             line[320];
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		std::snprintf(line, sizeof(line),
+		              "  %s img %u: 0x%016llx+0x%llx %ux%u fmt=%d tile=%d samples=%u reg=%d gpu_mod=%d "
+		              "buf_mod=%d cpu_dirty=%d depth=%d vo=%d tick_last=%llu\n",
+		              id == chosen ? "*" : " ", id.index,
+		              static_cast<unsigned long long>(image->info.data.address),
+		              static_cast<unsigned long long>(image->info.data.size), image->info.extent.width,
+		              image->info.extent.height, static_cast<int>(image->backing.format),
+		              static_cast<int>(image->info.tile_mode), image->backing.samples,
+		              image->registered ? 1 : 0, image->IsGpuModified() ? 1 : 0,
+		              image->IsBufferModified() ? 1 : 0, image->IsDefinitelyCpuDirty() ? 1 : 0,
+		              image->info.IsDepth() ? 1 : 0, image->usage.video_out ? 1 : 0,
+		              static_cast<unsigned long long>(image->tick_accessed_last));
+		out += line;
+	}
+	return out;
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -4744,7 +4912,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 
 bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
 	return !AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	       image.info.HasStencil() || image.backing.image == nullptr;
+	       !StencilAliasAllowed(image) || image.backing.image == nullptr;
 }
 
 // Whether two images at the same guest range are interpretations of the same texel grid. Same
@@ -4787,7 +4955,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	auto& image = m_slot_images[id];
 	// TextureCache::SyncAliasReturnsAtOnce mirrors this condition.
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	    image.info.HasStencil() || image.backing.image == nullptr) {
+	    !StencilAliasAllowed(image) || image.backing.image == nullptr) {
 		return;
 	}
 	// A kept alias (same memory, another format) is stale when another interpretation wrote the
@@ -4796,7 +4964,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		const auto* other = m_slot_images.try_get(other_id);
 		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
 		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
-		    other->info.HasStencil() || other->info.data != image.info.data ||
+		    !StencilAliasAllowed(*other) || other->info.data != image.info.data ||
 		    !SameAliasGrid(other->info, image.info) ||
 		    other->backing.samples != image.backing.samples) {
 			continue;

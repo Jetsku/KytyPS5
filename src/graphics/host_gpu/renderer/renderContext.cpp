@@ -1,3 +1,4 @@
+#include <chrono>
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/alignment.h"
@@ -342,9 +343,31 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitUnmap);
+			const auto                    t0   = std::chrono::steady_clock::now();
 			const auto                    tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			// KYTY_UNMAP_STATS=1: count the unmaps that drain the GPU and the time they wait.
+			static const bool unmap_stats = [] {
+				const char* v = std::getenv("KYTY_UNMAP_STATS");
+				return v != nullptr && v[0] == '1';
+			}();
+			if (unmap_stats) {
+				static uint64_t count = 0, wait_us = 0, bytes = 0;
+				static auto     last  = std::chrono::steady_clock::now();
+				const auto      now   = std::chrono::steady_clock::now();
+				count++;
+				bytes += size;
+				wait_us += std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
+				if (now - last > std::chrono::seconds(5)) {
+					std::printf("UnmapStats: %llu draining unmaps in %.1f s, %.1f ms waited, %.1f MiB\n",
+					            static_cast<unsigned long long>(count),
+					            std::chrono::duration<double>(now - last).count(), wait_us / 1000.0,
+					            bytes / 1048576.0);
+					count = wait_us = bytes = 0;
+					last  = now;
+				}
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

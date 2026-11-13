@@ -371,6 +371,23 @@ struct Presenter::Impl {
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
+		{
+			// KYTY_PRESENT_DEBUG=1: once per second, every cached image over the flipped surface.
+			static const bool present_debug = [] {
+				const char* v = std::getenv("KYTY_PRESENT_DEBUG");
+				return v != nullptr && v[0] == '1';
+			}();
+			static uint64_t present_debug_n = 0;
+			if (present_debug && (present_debug_n++ % 60) == 0) {
+				char head[200];
+				std::snprintf(head, sizeof(head), "PresentDebug #%llu surface 0x%016llx+0x%llx:\n",
+				              static_cast<unsigned long long>(present_debug_n - 1),
+				              static_cast<unsigned long long>(info.data.address),
+				              static_cast<unsigned long long>(info.data.size));
+				Log::WriteToConsoleAndLog(std::string(head) +
+				                          cache.DebugDescribeRegion(info.data.address, info.data.size, image_id));
+			}
+		}
 		return image;
 	}
 	void Present();
