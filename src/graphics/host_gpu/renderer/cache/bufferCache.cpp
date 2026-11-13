@@ -109,8 +109,13 @@ struct BufferCache::HostImportState {
 		uint64_t          guest_end   = 0;
 		const uint8_t*    alias       = nullptr;
 		vk::DeviceAddress address     = 0;
-		// The import as a cache-style buffer for read bindings (CpuAddress = guest_begin).
+		// The import as a buffer for read bindings (offsets are chunk offsets).
 		std::shared_ptr<Buffer> view;
+	};
+	// A redirected cache page: its chunk and the offset of its bytes in the chunk.
+	struct PageRef {
+		uint32_t index  = 0;
+		uint64_t offset = 0;
 	};
 	enum Failure : uint32_t {
 		NotDirect,   // no direct-memory backing alias for the page (flexible memory, unmapped)
@@ -153,11 +158,18 @@ struct BufferCache::HostImportState {
 		    v != nullptr && std::strcmp(v, "1") == 0) {
 			upload_candidates_enabled = true;
 		}
+		if (const auto* v = std::getenv("KYTY_HOST_IMPORT_CHUNK_MB"); v != nullptr && v[0] != '\0') {
+			chunk_size = std::max<uint64_t>(std::strtoull(v, nullptr, 10), 1) << 20u;
+		}
+		backing_base = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAliasBase(&backing_size));
+		if (backing_base != nullptr && backing_size != 0) {
+			chunk_index.assign((backing_size + chunk_size - 1) / chunk_size, -1);
+		}
 		const auto* max_mb = std::getenv("KYTY_HOST_IMPORT_MAX_MB");
 		if (max_mb != nullptr && max_mb[0] != '\0') {
 			max_bytes = std::strtoull(max_mb, nullptr, 10) << 20u;
 		}
-		usable = d.vkGetMemoryHostPointerPropertiesEXT != nullptr &&
+		usable = !chunk_index.empty() && d.vkGetMemoryHostPointerPropertiesEXT != nullptr &&
 		         (d.vkGetBufferDeviceAddress != nullptr || d.vkGetBufferDeviceAddressKHR != nullptr);
 		std::printf("HostImport: enabled (alignment %" PRIu64 " bytes, limit %" PRIu64 " MiB)%s\n",
 		            alignment, max_bytes >> 20u, usable ? "" : ", entry points missing: inactive");
@@ -255,18 +267,27 @@ struct BufferCache::HostImportState {
 		imp.alias           = alias;
 		imports.push_back(std::move(imp));
 		imported_bytes += size;
+		created++;
 		return static_cast<uint32_t>(imports.size() - 1);
 	}
 
 	static constexpr size_t MaxImports = 4096;
 	VkDevice                device;
 	uint64_t                alignment = 4096;
-	uint64_t                max_bytes = uint64_t {4096} << 20u;
+	uint64_t                max_bytes = uint64_t {16384} << 20u;
 	bool                    usable    = false;
 	std::vector<Import>     imports;
 	// Redirected guest bytes (whole cache pages) and the import each page points into.
 	RangeSet                               redirected;
-	std::unordered_map<uint64_t, uint32_t> page_import;
+	std::unordered_map<uint64_t, PageRef>  page_import;
+	// The direct-memory backing alias is imported once, in fixed chunks (KYTY_HOST_IMPORT_CHUNK_MB,
+	// default 256), the first time a redirect needs one: never per run. chunk_index: -1 not yet
+	// imported, -2 import failed (not retried), else the index in `imports`.
+	const uint8_t*                         backing_base = nullptr;
+	uint64_t                               backing_size = 0;
+	uint64_t                               chunk_size   = uint64_t {256} << 20u;
+	std::vector<int32_t>                   chunk_index;
+	uint64_t                               created      = 0; // imports created since the report
 	// Pages that fell back or failed to import: never candidates again.
 	RangeSet                               excluded;
 	std::unordered_map<uint64_t, Seen>     seen;
@@ -6279,8 +6300,8 @@ void BufferCache::HostImportWriteEntries(uint64_t first_page, uint64_t last_page
 		const auto        found   = redirect ? m_host_import->page_import.find(page)
 		                                     : m_host_import->page_import.end();
 		if (found != m_host_import->page_import.end()) {
-			const auto& imp = m_host_import->imports[found->second];
-			address         = imp.address + (guest - imp.guest_begin);
+			const auto& imp = m_host_import->imports[found->second.index];
+			address         = imp.address + found->second.offset;
 		} else {
 			const auto id = m_page_table[page];
 			if (id && !IsBufferInvalid(id)) {
@@ -6426,45 +6447,60 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 
 bool BufferCache::HostImportRedirectRun(uint64_t begin, uint64_t end, const uint8_t* alias,
                                         uint32_t& failure_out) {
-	auto&                    state   = *m_host_import;
-	HostImportState::Failure failure = HostImportState::Other;
-	std::optional<uint32_t>  index;
-	for (uint32_t i = 0; i < state.imports.size(); ++i) {
-		const auto& imp = state.imports[i];
-		if (imp.guest_begin <= begin && end <= imp.guest_end &&
-		    imp.alias + (begin - imp.guest_begin) == alias) {
-			index = i;
-			break;
-		}
+	auto& state = *m_host_import;
+	// [begin, end) is one mapping, so its backing is contiguous from `alias`. Pieces per chunk.
+	if (alias < state.backing_base || alias + (end - begin) > state.backing_base + state.backing_size) {
+		failure_out = HostImportState::NotDirect;
+		return false;
 	}
-	if (!index) {
-		// Padded, so that neighbouring runs share an import, a multi-dword access running past a
-		// redirected page reads the next page's guest bytes, and read bindings fit in one import.
-		constexpr uint64_t Pad          = uint64_t {1} << 20u;
-		const auto         padded_begin = Common::AlignDown(begin > Pad ? begin - Pad : 0, Pad);
-		const auto         padded_end   = Common::AlignUp(end + Pad, Pad);
-		const auto*        padded_alias = static_cast<const uint8_t*>(
-            LibKernel::Memory::GuestBackingAlias(padded_begin, padded_end - padded_begin));
-		if (padded_alias != nullptr && padded_alias + (begin - padded_begin) == alias) {
-			index = state.Create(padded_begin, padded_end, padded_alias, failure);
+	struct Piece {
+		uint64_t begin;
+		uint64_t end;
+		uint32_t index;
+		uint64_t offset;
+	};
+	std::vector<Piece> pieces;
+	uint64_t           guest = begin;
+	while (guest < end) {
+		const auto backing     = static_cast<uint64_t>(alias - state.backing_base) + (guest - begin);
+		const auto chunk       = backing / state.chunk_size;
+		const auto chunk_begin = chunk * state.chunk_size;
+		const auto chunk_bytes =
+		    Common::AlignDown(std::min(state.chunk_size, state.backing_size - chunk_begin), state.alignment);
+		const auto piece_end = std::min(end, guest + (chunk_begin + state.chunk_size - backing));
+		auto&      slot      = state.chunk_index[chunk];
+		if (slot == -1) {
+			HostImportState::Failure failure = HostImportState::Other;
+			const auto index = state.Create(chunk_begin, chunk_begin + chunk_bytes,
+			                                state.backing_base + chunk_begin, failure);
+			if (index) {
+				auto& created = state.imports[*index];
+				created.view  = std::make_shared<Buffer>(m_graphics, m_scheduler,
+				                                         vk::Buffer(created.buffer), 0, chunk_bytes,
+				                                         created.address);
+				slot          = static_cast<int32_t>(*index);
+			} else {
+				slot = -2;
+				std::printf("HostImport: chunk %" PRIu64 " (%" PRIu64 " MiB at backing +0x%" PRIx64
+				            ") failed to import (reason %u); its pages stay on the cache path\n",
+				            chunk, chunk_bytes >> 20u, chunk_begin, static_cast<uint32_t>(failure));
+				std::fflush(stdout);
+			}
 		}
-		if (!index) {
-			index = state.Create(begin, end, alias, failure);
-		}
-		if (!index) {
-			failure_out = failure;
+		if (slot < 0 || backing - chunk_begin + (piece_end - guest) > chunk_bytes) {
+			failure_out = HostImportState::Other;
 			return false;
 		}
-		auto& created = state.imports[*index];
-		created.view  = std::make_shared<Buffer>(m_graphics, m_scheduler, vk::Buffer(created.buffer),
-		                                         created.guest_begin,
-		                                         created.guest_end - created.guest_begin,
-		                                         created.address);
+		pieces.push_back({guest, piece_end, static_cast<uint32_t>(slot), backing - chunk_begin});
+		guest = piece_end;
 	}
 	state.redirected.Add(begin, end - begin);
-	for (uint64_t page = begin >> CACHING_PAGEBITS; page < (end >> CACHING_PAGEBITS); ++page) {
-		state.page_import[page] = *index;
-		state.failed_generation.erase(page);
+	for (const auto& piece: pieces) {
+		for (uint64_t page = piece.begin; page < piece.end; page += CACHING_PAGESIZE) {
+			state.page_import[page >> CACHING_PAGEBITS] = {piece.index,
+			                                               piece.offset + (page - piece.begin)};
+			state.failed_generation.erase(page >> CACHING_PAGEBITS);
+		}
 	}
 	HostImportWriteEntries(begin >> CACHING_PAGEBITS, end >> CACHING_PAGEBITS, true);
 	return true;
@@ -6484,19 +6520,21 @@ std::optional<std::pair<Buffer*, uint64_t>> BufferCache::HostImportReadBinding(u
 	if (found == state.page_import.end()) {
 		return std::nullopt;
 	}
+	const auto ref = found->second;
 	for (uint64_t page = first + 1; page <= last; ++page) {
 		const auto other = state.page_import.find(page);
-		if (other == state.page_import.end() || other->second != found->second) {
+		if (other == state.page_import.end() || other->second.index != ref.index ||
+		    other->second.offset != ref.offset + ((page - first) << CACHING_PAGEBITS)) {
 			return std::nullopt;
 		}
 	}
-	auto& imp = state.imports[found->second];
-	if (imp.view == nullptr || vaddr < imp.guest_begin || vaddr + size > imp.guest_end) {
+	auto& imp = state.imports[ref.index];
+	if (imp.view == nullptr) {
 		return std::nullopt;
 	}
 	state.bound_reads++;
 	state.bound_bytes += size;
-	return std::make_pair(imp.view.get(), vaddr - imp.guest_begin);
+	return std::make_pair(imp.view.get(), ref.offset + (vaddr - (first << CACHING_PAGEBITS)));
 }
 
 void BufferCache::HostImportValidate() {
@@ -6539,15 +6577,17 @@ void BufferCache::HostImportValidate() {
 		// The guest may have remapped the range (other backing): runs of one import at a time.
 		uint64_t run = begin;
 		while (run < end) {
-			const auto  index = state.page_import.at(run >> CACHING_PAGEBITS);
-			const auto& imp   = state.imports[index];
-			const auto  last  = std::min(end, imp.guest_end);
-			uint64_t    stop  = run + CACHING_PAGESIZE;
-			while (stop < last && state.page_import.at(stop >> CACHING_PAGEBITS) == index) {
+			const auto  ref  = state.page_import.at(run >> CACHING_PAGEBITS);
+			const auto& imp  = state.imports[ref.index];
+			uint64_t    stop = run + CACHING_PAGESIZE;
+			while (stop < end) {
+				const auto next = state.page_import.at(stop >> CACHING_PAGEBITS);
+				if (next.index != ref.index || next.offset != ref.offset + (stop - run)) {
+					break;
+				}
 				stop += CACHING_PAGESIZE;
 			}
-			if (LibKernel::Memory::GuestBackingAlias(run, stop - run) !=
-			    imp.alias + (run - imp.guest_begin)) {
+			if (LibKernel::Memory::GuestBackingAlias(run, stop - run) != imp.alias + ref.offset) {
 				remapped.emplace_back(run, stop);
 			}
 			run = stop;
@@ -6650,7 +6690,10 @@ void BufferCache::HostImportAdvanceFrame() {
 	});
 	const auto&      f   = state.failed_pages;
 	constexpr double MiB = 1024.0 * 1024.0;
-	std::printf("HostImport: %zu regions, %.1f MiB imported, %.1f MiB redirected in %zu runs, %" PRIu64
+	std::printf("HostImport: %.2f imports created/s (chunk %" PRIu64 " MiB), ",
+	            static_cast<double>(state.created) / elapsed, state.chunk_size >> 20u);
+	state.created = 0;
+	std::printf("%zu regions, %.1f MiB imported, %.1f MiB redirected in %zu runs, %" PRIu64
 	            " fallback pages, %" PRIu64 " failed pages (not-direct %" PRIu64 ", limit %" PRIu64
 	            ", align %" PRIu64 ", hostptr %" PRIu64 ", reqs %" PRIu64 ", alloc %" PRIu64
 	            ", other %" PRIu64 "), %.1f MiB/s BDA sync skipped, %.0f read bindings/s (%.1f MiB/s) "
