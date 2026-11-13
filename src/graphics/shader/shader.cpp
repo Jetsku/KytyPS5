@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "graphics/shader/shader.h"
 
 #include "common/assert.h"
@@ -471,6 +472,26 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	uint64_t effective_hash = declared_hash;
+	{
+		// KYTY_SHADER_ADDR_LOG=1: once per guest address, its hash (to read device-fault checkpoints).
+		static const bool addr_log = [] {
+			const char* v = std::getenv("KYTY_SHADER_ADDR_LOG");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (addr_log) {
+			static std::mutex                   addr_mutex;
+			static std::unordered_set<uint64_t> addr_seen;
+			bool                                first = false;
+			{
+				std::scoped_lock lock(addr_mutex);
+				first = addr_seen.insert(shader_addr).second;
+			}
+			if (first) {
+				std::printf("ShaderAddrGuest: %s addr=0x%016" PRIx64 " hash=0x%016" PRIx64 " size=%u\n",
+				            label, shader_addr, declared_hash, data.code_size_bytes);
+			}
+		}
+	}
 	if (RegisteredShaderCodeEnabled() && DrawPrep::Speculative()) {
 		// Keep the worker's exact code certificate, including failed-read fallback at commit.
 		const auto certified_hash = HashShaderCodeCertified(code);

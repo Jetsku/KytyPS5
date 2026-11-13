@@ -2158,6 +2158,24 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// KYTY_DEPTH_STENCIL_ALIAS (default off; =1 on; suspected of a device loss in UFC 5, unproven): a depth allocation used alternately as D32 and as
+// D32S8 (EA SPORTS UFC 5 switches its 1068x600 depth target every frame) keeps both images alive
+// as aliases instead of recreating, copying and freeing one each switch. Copies never include the
+// stencil aspect, so the stencil image keeps its own stencil while the depth aspect is synced from
+// whichever interpretation wrote last (PS5 depth and stencil are separate planes).
+static bool DepthStencilAliasEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_DEPTH_STENCIL_ALIAS");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Whether `image` may take part in alias syncing despite a stencil aspect.
+static bool StencilAliasAllowed(const Image& image) {
+	return !image.info.HasStencil() || (DepthStencilAliasEnabled() && image.info.IsDepth());
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -2297,7 +2315,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           cached.backing.samples, replacement.backing.samples);
 	}
 	if (keep_aliases && cached.backing.samples == replacement.backing.samples &&
-	    !cached.info.HasStencil() && !replacement.info.HasStencil()) {
+	    StencilAliasAllowed(cached) && StencilAliasAllowed(replacement)) {
 		// The replacement now holds the newest contents; the cached interpretation stays alive
 		// as a non-owner alias for the next switch back.
 		if (replacement.IsGpuModified()) {
@@ -3806,6 +3824,15 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): see FindImage's render-target path.
+static bool CmaskDrawExpandEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_CMASK_DRAW_EXPAND");
+		return v == nullptr || std::strcmp(v, "0") != 0;
+	}();
+	return enabled;
+}
+
 void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
                                          uint32_t metadata_base_layer, MetadataNoop* noop) {
 	using Event = Profiler::FrameEvent;
@@ -3877,6 +3904,14 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 				continue;
 			}
+		}
+		// Draw-expand mode: the guest's own kernels fast-clear CMASK (and FindImage marks it
+		// expanded at every render-target bind), so the bytes are decided on the GPU, per tile,
+		// every time: tiles still marked cleared get the clear colour, as the hardware shows them.
+		if (CmaskDrawExpandEnabled()) {
+			native[slice] = 1;
+			provable      = false;
+			continue;
 		}
 		// The proof that every tile of the slice is fast-cleared: all CMASK bytes are 0. Guest
 		// memory holds bytes the GPU does not own. GPU-owned bytes are decided here only while a
@@ -4257,6 +4292,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	const bool recording = record != nullptr && record->valid;
 	MaterializeDccClear(result, desc, metadata_base_layer, recording ? &record->dcc : nullptr);
 	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
+	// KYTY_CMASK_DRAW_EXPAND (default on; =0 off): the colour block marks every CMASK tile it
+	// writes as expanded. The host renders uncompressed and never updates CMASK, so a guest that
+	// fast-clears CMASK with its own kernel and later reads it as data (Frostbite builds its UI
+	// tile mask from the UI target's CMASK) sees every tile as still cleared. Binding a CMASK
+	// target for rendering therefore marks its whole CMASK expanded on the GPU, in order with the
+	// draws (conservative: untouched tiles hold the materialized clear colour on the host).
+	if (desc.cmask.valid && desc.type == BindingType::RenderTarget && desc.cmask.range.Valid()) {
+		if (CmaskDrawExpandEnabled()) {
+			m_buffer_cache.FillBuffer(desc.cmask.range.address, desc.cmask.range.size, UINT32_MAX,
+			                          false);
+			if (recording) {
+				record->cmask.provable = false;
+			}
+		}
+	}
 	if (recording) {
 		record->valid = record->dcc.provable && record->cmask.provable;
 		if (!record->valid) {
@@ -4414,6 +4464,32 @@ void TextureCache::EraseSurfaceMeta(uint64_t address) {
 		NoteSurfaceMetaChange();
 	}
 	memo = {address, m_surface_meta_inserts};
+}
+
+std::string TextureCache::DebugDescribeRegion(uint64_t address, uint64_t size, ImageId chosen) {
+	std::scoped_lock lock {m_lock};
+	std::string      out;
+	char             line[320];
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		std::snprintf(line, sizeof(line),
+		              "  %s img %u: 0x%016llx+0x%llx %ux%u fmt=%d tile=%d samples=%u reg=%d gpu_mod=%d "
+		              "buf_mod=%d cpu_dirty=%d depth=%d vo=%d tick_last=%llu\n",
+		              id == chosen ? "*" : " ", id.index,
+		              static_cast<unsigned long long>(image->info.data.address),
+		              static_cast<unsigned long long>(image->info.data.size), image->info.extent.width,
+		              image->info.extent.height, static_cast<int>(image->backing.format),
+		              static_cast<int>(image->info.tile_mode), image->backing.samples,
+		              image->registered ? 1 : 0, image->IsGpuModified() ? 1 : 0,
+		              image->IsBufferModified() ? 1 : 0, image->IsDefinitelyCpuDirty() ? 1 : 0,
+		              image->info.IsDepth() ? 1 : 0, image->usage.video_out ? 1 : 0,
+		              static_cast<unsigned long long>(image->tick_accessed_last));
+		out += line;
+	}
+	return out;
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -4744,7 +4820,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 
 bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
 	return !AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	       image.info.HasStencil() || image.backing.image == nullptr;
+	       !StencilAliasAllowed(image) || image.backing.image == nullptr;
 }
 
 // Whether two images at the same guest range are interpretations of the same texel grid. Same
@@ -4787,7 +4863,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	auto& image = m_slot_images[id];
 	// TextureCache::SyncAliasReturnsAtOnce mirrors this condition.
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	    image.info.HasStencil() || image.backing.image == nullptr) {
+	    !StencilAliasAllowed(image) || image.backing.image == nullptr) {
 		return;
 	}
 	// A kept alias (same memory, another format) is stale when another interpretation wrote the
@@ -4796,7 +4872,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		const auto* other = m_slot_images.try_get(other_id);
 		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
 		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
-		    other->info.HasStencil() || other->info.data != image.info.data ||
+		    !StencilAliasAllowed(*other) || other->info.data != image.info.data ||
 		    !SameAliasGrid(other->info, image.info) ||
 		    other->backing.samples != image.backing.samples) {
 			continue;
