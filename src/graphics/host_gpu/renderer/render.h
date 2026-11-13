@@ -58,6 +58,9 @@ struct PreparedDraw;
 struct BindingPlan;
 struct StagePlan;
 class Engine;
+namespace Segment {
+struct EncodedDraw;
+} // namespace Segment
 } // namespace DrawPrep
 
 class DispatchGuard;
@@ -1752,6 +1755,17 @@ private:
 	CommitStats::CandidateOutcome m_stats_candidate = CommitStats::CandidateOutcome::NotReached;
 	uint8_t m_stats_inelig      = 0; // DrawRun::KeyDiag::Inelig of the committed draw's record
 	uint8_t m_stats_prev_inelig = 0; // and of the previous draw's
+	// KYTY_SPEC_SEGMENTS (drawPrep/segment.h): the committed slot's encoded draw (the engine sets
+	// it while the switch is on), whether the kernel validated it for this draw, and the draw the
+	// draw command is spliced from (mode 1).
+	const DrawPrep::Segment::EncodedDraw* m_segment           = nullptr;
+	bool                                  m_segment_validated = false;
+	const DrawPrep::Segment::EncodedDraw* m_segment_splice    = nullptr;
+	// The kernel-taken continuation's encoded draw validated (counts; sets m_segment_validated);
+	// the draw to splice in mode 1, else null. Verify: the serial values against the encoded ones.
+	[[nodiscard]] const DrawPrep::Segment::EncodedDraw* SegmentValidate(const DrawIndexArgs& args);
+	void SegmentVerify(const DrawIndexArgs& args, const DrawEmitInfo& emit,
+	                   const DrawIndexBufferSource& index_source);
 	[[nodiscard]] bool ContinuationKernelEntry(const DrawIndexArgs& args) const;
 	[[nodiscard]] bool ContinuationKernel(uint64_t submit_id, CommandBuffer& buffer,
 	                                      const DrawIndexArgs& args);

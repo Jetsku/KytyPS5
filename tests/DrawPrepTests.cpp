@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/drawPrep/segment.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 
@@ -1341,6 +1342,148 @@ void TestWorkerGateBasics() {
 	Check(backlog_reads == 8, "the producer reads the backlog every WakeBacklog-th publish");
 }
 
+// KYTY_SPEC_SEGMENTS (segment.h): synthetic draws through encode, validate, compare and the
+// segment bookkeeping; then the hand-over through the preparation window (workers encode, the
+// producer validates in order).
+DrawPrep::Segment::EncodeInputs SegmentInputs(uint32_t n) {
+	DrawPrep::Segment::EncodeInputs in;
+	in.run_key                  = 0x1234;
+	in.index_type               = 0;
+	in.index_count              = 3 * (n + 1);
+	in.instance_count           = 1 + (n & 1u);
+	in.base_vertex              = static_cast<int32_t>(n) - 2;
+	in.index_address            = 0x100000 + uint64_t {n} * 0x40;
+	in.resolved_vertex_offset   = 10;
+	in.resolved_instance_offset = n & 3u;
+	return in;
+}
+
+void TestSegmentEncodeValidate() {
+	using namespace DrawPrep::Segment;
+	Check(ParseMode(nullptr) == Mode::Off && ParseMode("0") == Mode::Off && ParseMode("1") == Mode::On &&
+	          ParseMode("2") == Mode::Verify && ParseMode("verify") == Mode::Verify && ParseMode("x") == Mode::Off,
+	      "segments: switch values");
+	auto in   = SegmentInputs(5);
+	auto draw = Encode(in);
+	Check(draw.miss == Miss::None && draw.run_key == 0x1234 && draw.element_size == 2 && draw.index_count == 18 &&
+	          draw.instance_count == 2 && draw.vertex_offset == 13 && draw.first_instance == 1 &&
+	          draw.index_address == 0x100000 + 5 * 0x40 && draw.index_bytes == 36,
+	      "segments: encode fields (vertex offset = resolved + base vertex)");
+	in.index_type = 1;
+	Check(Encode(in).element_size == 4 && Encode(in).index_bytes == 72, "segments: 32-bit indices");
+	// Each refusal, in the order Encode checks them.
+	const auto refuse = [&](auto&& change, Miss expected, const char* text) {
+		auto bad = SegmentInputs(1);
+		change(bad);
+		Check(Encode(bad).miss == expected, text);
+	};
+	refuse([](EncodeInputs& x) { x.indexed = false; }, Miss::NotIndexed, "segments: not indexed");
+	refuse([](EncodeInputs& x) { x.prepared_ok = false; }, Miss::NotPrepared, "segments: not prepared");
+	refuse([](EncodeInputs& x) { x.run_key = 0; }, Miss::NoKey, "segments: no key");
+	refuse([](EncodeInputs& x) { x.offsets_from_state = false; }, Miss::OffsetSource, "segments: offset source");
+	refuse([](EncodeInputs& x) { x.gpu_instance_address = 0x40; }, Miss::GpuInstances, "segments: GPU instances");
+	refuse([](EncodeInputs& x) { x.plain_primitive = false; }, Miss::PrimitiveType, "segments: primitive type");
+	refuse([](EncodeInputs& x) { x.index_type = 2; }, Miss::ElementSize, "segments: element size");
+	refuse([](EncodeInputs& x) { x.vertex_stage = false; }, Miss::NoVertexStage, "segments: no vertex stage");
+	refuse([](EncodeInputs& x) { x.indexed = false; x.run_key = 0; }, Miss::NotIndexed, "segments: first reason wins");
+	// Validate.
+	Check(Validate(draw, 0x1234, 2) == Miss::None, "segments: validates against its run");
+	Check(Validate(EncodedDraw {}, 0x1234, 2) == Miss::NotEncoded, "segments: nothing encoded");
+	Check(Validate(draw, 0x9999, 2) == Miss::Key, "segments: another run's key");
+	Check(Validate(draw, 0x1234, 4) == Miss::RecordElement, "segments: the record's element size");
+	// Compare.
+	auto serial = draw;
+	Check(Compare(draw, serial) == 0, "segments: equal draws compare equal");
+	serial.vertex_offset++;
+	serial.index_bytes++;
+	Check(Compare(draw, serial) == ((1u << static_cast<uint32_t>(Field::VertexOffset)) |
+	                                (1u << static_cast<uint32_t>(Field::IndexBytes))),
+	      "segments: the mask names the differing fields");
+	// Segments: consecutive validated draws of one run.
+	SegmentTracker tracker;
+	uint32_t       starts = 0;
+	for (uint64_t run: {7u, 7u, 7u}) starts += tracker.Note(run) ? 1u : 0u;
+	tracker.Break(); // a start draw in between
+	for (uint64_t run: {7u, 7u, 9u, 9u}) starts += tracker.Note(run) ? 1u : 0u;
+	Check(starts == 3, "segments: a break or another run starts a segment");
+	// The report line names every field and reason.
+	Counters counters;
+	counters.kernel_taken = 10;
+	counters.validated    = 8;
+	counters.segments     = 2;
+	counters.misses[static_cast<size_t>(Miss::Key)] = 2;
+	counters.mismatches[static_cast<size_t>(Field::VertexOffset)] = 1;
+	const auto line = FormatLine(counters, "verify");
+	Check(line.find("validated 8 (80.0%)") != std::string::npos && line.find("(4.0 draws/segment)") != std::string::npos &&
+	          line.find("vertex_offset=1") != std::string::npos && line.find("total=1") != std::string::npos &&
+	          line.find("key=2") != std::string::npos && line.find("record_element=0") != std::string::npos,
+	      "segments: report line");
+}
+
+struct SegmentItem {
+	uint32_t                       input = 0;
+	DrawPrep::Segment::EncodedDraw draw;
+};
+
+void TestSegmentHandOver() {
+	using namespace DrawPrep::Segment;
+	constexpr uint64_t            Items = 100000;
+	DrawPrep::Window<SegmentItem> window(32);
+	std::atomic<bool>             stop {false};
+	std::vector<std::thread>      threads;
+	const auto                    encode = [](uint32_t input) {
+        auto in = SegmentInputs(input);
+        if (input % 97u == 0) in.run_key = 0x5555; // another run's draw: a validation miss
+        return Encode(in);
+	};
+	for (int w = 0; w < 4; w++) {
+		threads.emplace_back([&] {
+			while (!stop.load(std::memory_order_acquire)) {
+				uint64_t seq  = 0;
+				auto*    item = window.TryClaim(seq);
+				if (item == nullptr) {
+					std::this_thread::yield();
+					continue;
+				}
+				item->draw = encode(item->input);
+				window.Complete(seq);
+			}
+		});
+	}
+	uint64_t   next = 0, retired = 0, validated = 0, key_misses = 0, mismatches = 0;
+	const auto retire = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.draw = encode(item.input); // the producer prepares the head itself
+		} else {
+			while (!window.HeadDone()) std::this_thread::yield();
+		}
+		const auto miss = Validate(item.draw, 0x1234, 2);
+		if (miss == Miss::None) {
+			validated++;
+			mismatches += Compare(item.draw, Encode(SegmentInputs(item.input))) != 0 ? 1u : 0u;
+		} else {
+			key_misses += miss == Miss::Key ? 1u : 0u;
+		}
+		window.Retire();
+		retired++;
+	};
+	while (retired < Items) {
+		if (next < Items && !window.Full()) {
+			window.Reserve().input = static_cast<uint32_t>(next++);
+			window.Publish();
+		} else {
+			retire();
+		}
+	}
+	stop.store(true, std::memory_order_release);
+	for (auto& t: threads) t.join();
+	const uint64_t expected_misses = (Items + 96) / 97;
+	Check(key_misses == expected_misses && validated == Items - expected_misses,
+	      "segments hand-over: every draw validated or missed by its key");
+	Check(mismatches == 0, "segments hand-over: encoded draws equal the serial encode");
+}
+
 // KYTY_SERVE_IN_WAITS bit 1 (HeadWaitServiceAt): off keeps the 2 ms deadlock guard only; on serves
 // at every 64th look while commands are queued, and asks whether they are only at such a look.
 void TestHeadWaitService() {
@@ -2478,6 +2621,8 @@ int main(int argc, char** argv) {
 	TestHeadWakeAndWorkerHooks(1, 20000);
 	TestWorkerGateBasics();
 	TestHeadWaitService();
+	TestSegmentEncodeValidate();
+	TestSegmentHandOver();
 	TestAwaitHead();
 	TestWorkerGateStress();
 	TestColdTokenStranded();

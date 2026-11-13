@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/drawPrep/segment.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -94,6 +95,10 @@ enum class CertMode : uint8_t { Value, Log };
 // the command processor; false while unset.
 void               SetServiceCommandsPending(bool (*pending)());
 [[nodiscard]] bool ServiceCommandsPending();
+// KYTY_SPEC_SEGMENTS (live, default 0; segment.h): 1 the commit thread splices the draw a preparing
+// thread encoded for a continuation the kernel takes, 2 verify.
+[[nodiscard]] Segment::Mode     SpecSegmentsMode();
+[[nodiscard]] Segment::Counters& SegmentCounters();
 
 // The register state a draw reads, copied when the draw packet is parsed.
 struct RegisterSnapshot {

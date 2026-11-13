@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -411,6 +412,20 @@ static Live::Switch g_serve_in_waits("KYTY_SERVE_IN_WAITS", [](const char* value
 
 bool ServeInHeadWait() {
 	return (g_serve_in_waits.Get() & 1) != 0;
+}
+
+// KYTY_SPEC_SEGMENTS (live, default 0; segment.h): 0 off, 1 splice, 2 / verify.
+static Live::Switch g_spec_segments("KYTY_SPEC_SEGMENTS", [](const char* value) -> int64_t {
+	return static_cast<int64_t>(Segment::ParseMode(value));
+});
+static Segment::Counters g_segment_counters;
+
+Segment::Mode SpecSegmentsMode() {
+	return static_cast<Segment::Mode>(g_spec_segments.Get());
+}
+
+Segment::Counters& SegmentCounters() {
+	return g_segment_counters;
 }
 
 static std::atomic<bool (*)()> g_service_commands_pending {nullptr};
@@ -1516,6 +1531,9 @@ struct Engine::Slot {
 	// KYTY_DRAW_PREP_LEAN digest cache: the publication epoch when the slot was filled
 	// (syncEpoch.h CurrentPublish, read by the publishing thread).
 	uint64_t code_epoch = 0;
+	// KYTY_SPEC_SEGMENTS (segment.h): the draw the preparing thread encoded (miss NotEncoded while
+	// the switch was off when it prepared the slot).
+	Segment::EncodedDraw segment;
 };
 
 namespace {
@@ -1536,6 +1554,51 @@ public:
 } // namespace
 
 namespace {
+
+// KYTY_SPEC_SEGMENTS (segment.h), after the run key on the preparing thread: the slot's encoded
+// draw. Reads only the slot (its arguments, registers and preparation).
+void EncodeSlotSegment(Engine::Slot& slot) {
+	if (SpecSegmentsMode() == Segment::Mode::Off) [[likely]] {
+		slot.segment.miss = Segment::Miss::NotEncoded;
+		return;
+	}
+	Segment::EncodeInputs in;
+	in.indexed = slot.kind == DrawKind::Index;
+	if (in.indexed) {
+		const auto& args   = slot.index_args;
+		const auto& vs     = slot.prepared.vertex_info;
+		const auto  prim   = slot.registers.user_config.GetPrimType();
+		in.prepared_ok     = slot.prepared.ok;
+		in.run_key         = slot.run_key;
+		in.offsets_from_state   = args.offset_source == DrawOffsetSource::DrawState;
+		in.gpu_instance_address = args.gpu_instance_address;
+		in.plain_primitive = prim != Prospero::PrimitiveType::kQuadListLegacy &&
+		                     (prim == Prospero::PrimitiveType::kPointList || prim == Prospero::PrimitiveType::kLineList ||
+		                      prim == Prospero::PrimitiveType::kLineStrip || prim == Prospero::PrimitiveType::kTriList ||
+		                      prim == Prospero::PrimitiveType::kTriFan || prim == Prospero::PrimitiveType::kTriStrip ||
+		                      prim == Prospero::PrimitiveType::kRectList || prim == Prospero::PrimitiveType::kPolygon ||
+		                      prim == Prospero::PrimitiveType::kRectListLegacy || prim == Prospero::PrimitiveType::kPatch);
+		in.index_type      = args.index_type_and_size;
+		in.vertex_stage    = !vs.fetch_embedded || static_cast<bool>(vs.stage);
+		in.index_count     = args.index_count;
+		in.instance_count  = args.instance_count;
+		in.base_vertex     = args.base_vertex;
+		in.index_address   = reinterpret_cast<uint64_t>(args.index_addr);
+		if (in.prepared_ok && in.vertex_stage) {
+			const auto [vertex_offset, instance_offset] =
+			    ResolveDrawOffsets(slot.registers.user_config.GetIndexOffset(), vs);
+			in.resolved_vertex_offset   = vertex_offset;
+			in.resolved_instance_offset = instance_offset;
+		}
+	}
+	slot.segment = Segment::Encode(in);
+	auto& counters = SegmentCounters();
+	if (slot.segment.miss == Segment::Miss::None) {
+		counters.encoded.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		counters.misses[static_cast<size_t>(slot.segment.miss)].fetch_add(1, std::memory_order_relaxed);
+	}
+}
 
 // After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs, and the
 // run key (KYTY_DRAW_RUN).
@@ -1558,6 +1621,7 @@ void HashForRepeatTrace(Engine::Slot& slot) {
 		DrawRun::StructureKeyParts(slot.registers.context, slot.registers.user_config, slot.prepared,
 		                           slot.run_parts);
 	}
+	EncodeSlotSegment(slot);
 	if (!RepeatTrace::Enabled()) [[likely]] {
 		return;
 	}
@@ -1979,6 +2043,7 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
 	slot.after_stop      = 0;
 	slot.speculative     = false;
 	slot.code_epoch      = SyncEpoch::CurrentPublish();
+	slot.segment.miss    = Segment::Miss::NotEncoded; // (until its preparing thread encodes it)
 	slot.repeat_packet   = RepeatTrace::Enabled() ? RepeatTrace::TakeDrawPacket() : 0;
 }
 
@@ -2712,6 +2777,10 @@ void PrintDrawPrepSummary() {
 	            static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
 	            fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str(),
 	            dispatches.c_str());
+	if (const auto mode = SpecSegmentsMode(); mode != Segment::Mode::Off) {
+		// KYTY_SPEC_SEGMENTS: totals since the start (segment.h FormatLine).
+		std::printf("%s\n", Segment::FormatLine(g_segment_counters, mode == Segment::Mode::Verify ? "verify" : "on").c_str());
+	}
 	if (BindingParts() != 0) {
 		// KYTY_DRAW_PREP_BINDINGS: how many committed plans carried a pipeline the commit could use.
 		auto&           totals = GetBindingTotals();
@@ -2775,11 +2844,28 @@ void Engine::Commit(Slot& slot) {
 	executor.m_in_engine_commit = true;
 	CommitStats::StepMark(CommitStats::Step::BindRegs);
 	CommitStats::StepMark(CommitStats::Step::Calib);
+	// KYTY_SPEC_SEGMENTS: the slot's encoded draw, for the continuation kernel (segment.h).
+	const bool segments = slot.kind == DrawKind::Index && SpecSegmentsMode() != Segment::Mode::Off;
+	executor.m_segment           = segments ? &slot.segment : nullptr;
+	executor.m_segment_validated = false;
 	if (slot.kind == DrawKind::Index) {
 		executor.DrawIndex(slot.submit_id, scheduler.Current(), slot.index_args);
 	} else {
 		executor.DrawAuto(slot.submit_id, scheduler.Current(), slot.auto_args);
 	}
+	if (segments) {
+		static Segment::SegmentTracker tracker; // (the commit thread only)
+		if (executor.m_segment_validated) {
+			if (tracker.Note(executor.m_run.key ^ executor.m_run.rendering_serial)) {
+				g_segment_counters.segments.fetch_add(1, std::memory_order_relaxed);
+			}
+		} else {
+			tracker.Break();
+		}
+	}
+	executor.m_segment           = nullptr;
+	executor.m_segment_validated = false;
+	executor.m_segment_splice    = nullptr;
 	executor.m_in_engine_commit = false;
 	executor.m_run_key          = 0;
 	executor.m_run_targets_key  = 0;

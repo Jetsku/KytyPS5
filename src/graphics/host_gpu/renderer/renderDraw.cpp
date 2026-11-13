@@ -6998,6 +6998,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			vk_buffer.drawIndirect(instance_record, instance_record_offset, 1, 16u);
 		}
+	} else if (m_segment_splice != nullptr && draw.IsIndexed()) {
+		// KYTY_SPEC_SEGMENTS=1: the draw command the preparing thread encoded (a plain primitive
+		// type and an indexed draw, which the encode required; the same command EmitDrawPrimitives
+		// records).
+		const auto& spliced = *m_segment_splice;
+		auto&       counters = DrawPrep::SegmentCounters();
+		const auto  n        = counters.spliced.fetch_add(1, std::memory_order_relaxed);
+		const bool  timed    = (n & 63u) == 0;
+		const auto  start    = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		vk_buffer.drawIndexed(spliced.index_count, spliced.instance_count, 0, spliced.vertex_offset,
+		                      spliced.first_instance);
+		if (timed) {
+			counters.splice_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                 std::chrono::steady_clock::now() - start)
+			                                                       .count()),
+			                             std::memory_order_relaxed);
+			counters.splice_timed.fetch_add(1, std::memory_order_relaxed);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -7404,6 +7422,71 @@ bool RenderExecutor::ContinuationKernelEntry(const DrawIndexArgs& args) const {
 	       g_cube_every.Get() <= 1 && !graphics_debug_dump_enabled() && !ListResetEnabled();
 }
 
+// KYTY_SPEC_SEGMENTS (drawPrep/segment.h): every 64th validation (and its splice) is timed.
+const DrawPrep::Segment::EncodedDraw* RenderExecutor::SegmentValidate(const DrawIndexArgs& args) {
+	(void)args;
+	m_segment_validated = false;
+	if (m_segment == nullptr) {
+		return nullptr;
+	}
+	const auto mode     = DrawPrep::SpecSegmentsMode();
+	auto&      counters = DrawPrep::SegmentCounters();
+	if (mode == DrawPrep::Segment::Mode::Off) {
+		return nullptr;
+	}
+	const auto taken = counters.kernel_taken.fetch_add(1, std::memory_order_relaxed);
+	const bool timed = (taken & 63u) == 0;
+	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const auto miss  = DrawPrep::Segment::Validate(*m_segment, m_run_key, m_kernel_record.element_size);
+	if (timed) {
+		counters.validate_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                   std::chrono::steady_clock::now() - start)
+		                                                         .count()),
+		                               std::memory_order_relaxed);
+		counters.timed.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (miss != DrawPrep::Segment::Miss::None) {
+		counters.misses[static_cast<size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	counters.validated.fetch_add(1, std::memory_order_relaxed);
+	m_segment_validated = true;
+	return mode == DrawPrep::Segment::Mode::On ? m_segment : nullptr;
+}
+
+void RenderExecutor::SegmentVerify(const DrawIndexArgs& args, const DrawEmitInfo& emit,
+                                   const DrawIndexBufferSource& index_source) {
+	if (DrawPrep::SpecSegmentsMode() != DrawPrep::Segment::Mode::Verify || m_segment == nullptr) {
+		return;
+	}
+	auto&                          counters = DrawPrep::SegmentCounters();
+	DrawPrep::Segment::EncodedDraw serial;
+	serial.miss           = DrawPrep::Segment::Miss::None;
+	serial.index_count    = args.index_count;
+	serial.instance_count = args.instance_count;
+	serial.vertex_offset  = emit.vertex_offset;
+	serial.first_instance = emit.first_instance;
+	serial.index_address  = index_source.address;
+	serial.index_bytes    = index_source.size;
+	const auto mask       = DrawPrep::Segment::Compare(*m_segment, serial);
+	const auto draws      = counters.verify_draws.fetch_add(1, std::memory_order_relaxed);
+	if (mask == 0) {
+		return;
+	}
+	uint64_t reported = 0;
+	for (size_t i = 0; i < DrawPrep::Segment::kFieldNames.size(); i++) {
+		if ((mask & (1u << i)) != 0) {
+			reported += counters.mismatches[i].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if (reported < 16) {
+		std::printf("SpecSegments verify: draw %" PRIu64 " mismatch mask 0x%x (encoded vo %d fi %u ic %u; serial vo %d fi %u ic %u)\n",
+		            draws, mask, m_segment->vertex_offset, m_segment->first_instance, m_segment->index_count,
+		            serial.vertex_offset, serial.first_instance, serial.index_count);
+		std::fflush(stdout);
+	}
+}
+
 // KYTY_CONT_KERNEL=1: the continuation kernel's front. The preparation is taken, validated (with the
 // record's pixel-shader activity: Validate compares it with the preparation's own) and applied; the
 // run candidate check decides. A draw that is not a continuation gets its preparation back and runs
@@ -7454,10 +7537,22 @@ bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffe
 	index_source.guest_element_size = m_kernel_record.element_size;
 	index_source.type = m_kernel_record.element_size == 2 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
-	const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 	DrawEmitInfo emit {};
-	emit.vertex_offset  = vertex_offset + args.base_vertex;
-	emit.first_instance = instance_offset;
+	// KYTY_SPEC_SEGMENTS (drawPrep/segment.h): the draw the preparing thread encoded, validated
+	// against this run; mode 1 takes its offsets and splices its draw command, verify compares.
+	const auto* spliced = SegmentValidate(args);
+	if (spliced != nullptr) {
+		emit.vertex_offset  = spliced->vertex_offset;
+		emit.first_instance = spliced->first_instance;
+	} else {
+		const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+		emit.vertex_offset  = vertex_offset + args.base_vertex;
+		emit.first_instance = instance_offset;
+		if (m_segment_validated) {
+			SegmentVerify(args, emit, index_source);
+		}
+	}
+	m_segment_splice = spliced;
 	m_kernel = true;
 	CommitStats::StepMark(CommitStats::Step::Restart);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, m_kernel_record.topology, emit, index_source,
