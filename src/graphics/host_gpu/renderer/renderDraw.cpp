@@ -929,6 +929,26 @@ struct DrawRenderState {
 	// color_info entries and vertex_info stages the current draw may have written.
 	uint32_t color_slots_written   = 0;
 	uint32_t vertex_stages_written = 0;
+	// KYTY_BK_ADOPT (drawPrep/bookkeep.h): while a kernel continuation runs, its stage runtimes point
+	// at the committed slot's preparations instead of `stage_preps` (null otherwise).
+	DrawPrep::PreparedDraw* adopted = nullptr;
+	// The pixel preparation the draw reads (PlainPixelProgram): the adopted one or `stage_preps`.
+	[[nodiscard]] const PipelineCache::StagePrep& PixelPrep() const {
+		return adopted != nullptr ? adopted->pixel_prep : stage_preps.pixel;
+	}
+	// Points the stage runtimes back at `stage_preps` (after an adopted draw, or when it declines).
+	void Unadopt() {
+		if (adopted == nullptr) {
+			return;
+		}
+		for (uint32_t i = 0; i < adopted->vertex_stages && i < vertex_info.size(); i++) {
+			vertex_info[i].stage.resources = &stage_preps.vertex[i].resources;
+		}
+		if (adopted->pixel_active) {
+			ps_input_info.stage.resources = &stage_preps.pixel.resources;
+		}
+		adopted = nullptr;
+	}
 
 	void Reset() {
 		// KYTY_RENDER_STATE_FAST reset: a draw reads color_info[0, color_count) and depth_info, and
@@ -2800,6 +2820,8 @@ static void SwapPreparedStage(PipelineCache::StagePrep& state, PipelineCache::St
 // draw state already holds them from the previous draw of the run and they are not copied again;
 // 2 verify: copied, and compared with what the state held. GPU thread only.
 static int g_apply_keyed_skip = 0;
+// KYTY_BK_ADOPT: true while ContinuationKernel applies a preparation it may adopt by pointer.
+static bool g_apply_adopt = false;
 static std::atomic<uint64_t> g_inplace_checks {0};
 static std::atomic<uint64_t> g_inplace_mismatches {0};
 
@@ -2822,6 +2844,21 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 		state.ps_input_info = prepared.pixel_info;
 	}
 	CopyPreparedVertexInfo(state.vertex_info[0], prepared.vertex_info);
+	state.adopted = nullptr;
+	if (g_apply_adopt) {
+		// KYTY_BK_ADOPT: the runtimes read the slot's preparations, which stay this thread's until
+		// the slot retires after the draw (ContinuationKernel points them back first).
+		state.vertex_info[0].stage.resources = &prepared.vertex_prep.resources;
+		for (uint32_t i = 1; i < prepared.vertex_stages; i++) {
+			CopyPreparedVertexInfo(state.vertex_info[i], prepared.tess_info[i - 1]);
+			state.vertex_info[i].stage.resources = &prepared.tess_prep[i - 1].resources;
+		}
+		if (prepared.pixel_active) {
+			state.ps_input_info.stage.resources = &prepared.pixel_prep.resources;
+		}
+		state.adopted = &prepared;
+		return;
+	}
 	SwapPreparedStage(state.stage_preps.vertex[0], prepared.vertex_prep);
 	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
 	// KYTY_DRAW_PREP_TESS: a tessellated draw's HS and TES stages.
@@ -6831,7 +6868,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && bindings.pixel.has_value()) {
 		const auto plain_mode = LodStatsCounter::PlainVariant();
 		const auto plain      = plain_mode != LodStatsCounter::Plain::Off
-		                            ? PipelineCache::PlainPixelProgram(state.stage_preps.pixel)
+		                            ? PipelineCache::PlainPixelProgram(state.PixelPrep())
 		                            : ShaderProgram {};
 		if (plain) {
 			if (bindings.pixel->mip_stats_active) {
@@ -7941,12 +7978,26 @@ bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffe
 	                   args.first_instance};
 	state.ps_active = m_run.ps_active;
 	g_apply_keyed_skip = static_cast<int>(g_cont_kernel_inplace.Get());
+	// KYTY_BK_ADOPT (drawPrep/bookkeep.h): the stage preparations by pointer. Not with the verify
+	// paths that read `stage_preps` or compare the swap itself.
+	const auto adopt_mode = DrawPrep::BkAdoptMode();
+	auto&      bk         = DrawPrep::BkCounters();
+	if (adopt_mode != DrawPrep::Bookkeep::Mode::Off) {
+		g_apply_adopt = DrawPrep::VerifyMode() == 0 && RenderStateVerifyMode() == 0;
+		if (!g_apply_adopt) {
+			bk.Fall(DrawPrep::Bookkeep::Fallback::AdoptVerifyPaths);
+		}
+	}
 	RefreshShaders(buffer, draw, state);
+	g_apply_adopt      = false;
 	g_apply_keyed_skip = 0;
 	if (!m_prepared_validated || state.programs.translation_pending || ContKernel::Bindless(state) ||
 	    !DrawRunCandidate(buffer, state, args.render_target_slice_offset) || m_run_pipeswap) {
-		// ApplyPreparedDraw swapped the stage preps: swapping again restores both sides.
-		if (m_prepared_validated) {
+		// ApplyPreparedDraw swapped the stage preps: swapping again restores both sides. An adopted
+		// preparation was not moved: the runtimes only point back at the draw state's.
+		if (state.adopted != nullptr) {
+			state.Unadopt();
+		} else if (m_prepared_validated) {
 			SwapPreparedStage(state.stage_preps.vertex[0], saved_prepared->vertex_prep);
 			for (uint32_t i = 1; i < saved_prepared->vertex_stages; i++) {
 				SwapPreparedStage(state.stage_preps.vertex[i], saved_prepared->tess_prep[i - 1]);
@@ -7991,12 +8042,37 @@ bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffe
 		}
 	}
 	m_segment_splice = spliced;
+	// KYTY_BK_ADOPT verify: the adopted preparations, as they were before the draw.
+	static PipelineCache::GraphicsStagePreps adopt_copy; // (the GPU thread only)
+	auto* const adopted = state.adopted;
+	if (adopted != nullptr) {
+		bk.Add(bk.adopted);
+		if (adopt_mode == DrawPrep::Bookkeep::Mode::Verify) {
+			adopt_copy.vertex[0] = adopted->vertex_prep;
+			if (adopted->pixel_active) {
+				adopt_copy.pixel = adopted->pixel_prep;
+			}
+		}
+	}
 	m_kernel = true;
 	CommitStats::StepMark(CommitStats::Step::Restart);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, m_kernel_record.topology, emit, index_source,
 	                    m_kernel_record.primitive_restart);
 	m_kernel = false;
 	ResetBindings();
+	if (adopted != nullptr) {
+		if (adopt_mode == DrawPrep::Bookkeep::Mode::Verify) {
+			// The draw reads the preparations through the runtimes only; it must not have changed them
+			// (the swap would have left such a change in the draw state, the adoption in the slot).
+			bk.Add(bk.adopt_checks);
+			if (!SameStagePrep(adopt_copy.vertex[0], adopted->vertex_prep) ||
+			    (adopted->pixel_active && !SameStagePrep(adopt_copy.pixel, adopted->pixel_prep))) {
+				DrawPrep::Bookkeep::ReportMismatch(bk.adopt_mismatches, "adopt", "preparation changed by the draw");
+			}
+		}
+		// The slot retires after this commit: nothing may point into it.
+		state.Unadopt();
+	}
 	CommitStats::StepMark(CommitStats::Step::ResetBindings);
 	return true;
 }
