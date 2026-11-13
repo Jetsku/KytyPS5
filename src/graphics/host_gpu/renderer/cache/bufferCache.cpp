@@ -75,6 +75,30 @@ namespace Libs::Graphics {
 // A redirected page that becomes GPU-dirty, has a GPU-modified image over it, a pending backing
 // publication, or receives a BDA write falls back for good (its entries point at the cache buffer
 // again and the next pass scans fully). Imports are never freed (the alias outlives them).
+// KYTY_UPLOAD_SOURCES=1 (default off): every 5 s the top 20 upload sources by bytes.
+namespace UploadSources {
+enum Path : uint32_t { BdaSync, ReadBinding, WrittenBinding, TexelRead, HotPage, StreamRead, Other, Count };
+constexpr const char* Names[Count] = {"bda-sync", "read-binding", "written-binding", "texel-read",
+                                      "hot-page", "stream-read",  "other"};
+struct Entry {
+	uint64_t bytes  = 0;
+	uint64_t copies = 0;
+	uint64_t lo     = UINT64_MAX;
+	uint64_t hi     = 0;
+};
+inline bool Enabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_UPLOAD_SOURCES");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+inline std::mutex                            g_mutex;
+inline std::unordered_map<uint64_t, Entry>   g_entries; // key: (address >> 20) << 3 | path
+inline std::array<uint64_t, Count>           g_path_bytes {};
+inline std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
+} // namespace UploadSources
+
 struct BufferCache::HostImportState {
 	struct Import {
 		VkDeviceMemory    memory      = VK_NULL_HANDLE;
@@ -243,6 +267,8 @@ struct BufferCache::HostImportState {
 	std::array<uint64_t, FailureCount>     failed_pages {};
 	uint64_t                               bound_reads         = 0;
 	uint64_t                               bound_bytes         = 0;
+	// Ranges any read path uploaded (KYTY_UPLOAD_SOURCES paths): streaming candidates too.
+	RangeSet                               upload_candidates;
 	std::chrono::steady_clock::time_point  report_time;
 };
 
@@ -1844,6 +1870,9 @@ void BufferCache::AdvanceFrame() noexcept {
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 	if (m_host_import != nullptr) {
 		HostImportAdvanceFrame();
+	}
+	if (UploadSources::Enabled()) {
+		ReportUploadSources();
 	}
 }
 
@@ -3516,6 +3545,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		m_staging_buffer.Commit();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
 	}
+	if ((source || late_source) && (UploadSources::Enabled() || m_host_import != nullptr)) {
+		using namespace UploadSources;
+		const Path guest_path = stats != nullptr          ? BdaSync
+		                        : upload_reason != nullptr ? (is_written ? WrittenBinding : Other)
+		                        : is_written               ? WrittenBinding
+		                        : is_texel_buffer          ? TexelRead
+		                                                   : ReadBinding;
+		for (size_t i = 0; i < copies.size(); ++i) {
+			NoteUploadSource(buffer.CpuAddress() + copies[i].dstOffset, copies[i].size,
+			                 i < guest_copies ? guest_path : HotPage);
+		}
+		for (const auto& copy: late_copies) {
+			NoteUploadSource(buffer.CpuAddress() + copy.dstOffset, copy.size, WrittenBinding);
+		}
+	}
 	if (source || late_source) {
 		if (stats != nullptr) {
 			stats->upload_bytes += total_size + late_size;
@@ -4491,6 +4535,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 			}
 			if (read) {
 				m_stream_buffer.Commit();
+				if (UploadSources::Enabled() || m_host_import != nullptr) {
+					NoteUploadSource(vaddr, size, UploadSources::StreamRead);
+				}
 				return {&m_stream_buffer, offset};
 			}
 		}
@@ -6413,6 +6460,9 @@ void BufferCache::HostImportUpdate() {
 	for (const auto& range: m_bda_hot_ranges) {
 		candidates.Add(range.address, range.size);
 	}
+	state.upload_candidates.ForEach(
+	    [&](uint64_t begin, uint64_t end) { candidates.Add(begin, end - begin); });
+	state.upload_candidates.Clear();
 	using LookupPart = BufferLookupStats::Part;
 	const auto kind  = static_cast<LookupPart>(m_bda_pass_kind);
 	if (m_bda_dirty_log && kind != LookupPart::BdaHot && kind != LookupPart::BdaNone) {
@@ -6493,6 +6543,85 @@ void BufferCache::HostImportAdvanceFrame() {
 	state.bound_reads   = 0;
 	state.bound_bytes   = 0;
 	state.report_time   = now;
+}
+
+void BufferCache::NoteUploadSource(uint64_t address, uint64_t size, uint32_t path) {
+	using namespace UploadSources;
+	// Read paths feed the host import's streaming candidates (uploaded in two frames: imported).
+	if (m_host_import != nullptr && path != WrittenBinding && path != TexelRead && path != Other &&
+	    GuestGpu::IsGpuThread()) {
+		m_host_import->upload_candidates.Add(address, size);
+	}
+	if (!Enabled()) {
+		return;
+	}
+	std::scoped_lock lock(g_mutex);
+	auto&            entry = g_entries[((address >> 20u) << 3u) | path];
+	entry.bytes += size;
+	entry.copies++;
+	entry.lo = std::min(entry.lo, address);
+	entry.hi = std::max(entry.hi, address + size);
+	g_path_bytes[path] += size;
+}
+
+void BufferCache::ReportUploadSources() {
+	using namespace UploadSources;
+	std::vector<std::pair<uint64_t, Entry>> top;
+	std::array<uint64_t, Count>             paths {};
+	double                                  elapsed = 0.0;
+	{
+		std::scoped_lock lock(g_mutex);
+		const auto       now = std::chrono::steady_clock::now();
+		elapsed              = std::chrono::duration<double>(now - g_start).count();
+		if (elapsed < 5.0) {
+			return;
+		}
+		top.assign(g_entries.begin(), g_entries.end());
+		paths = g_path_bytes;
+		g_entries.clear();
+		g_path_bytes = {};
+		g_start      = now;
+	}
+	constexpr double MiB   = 1024.0 * 1024.0;
+	uint64_t         total = 0;
+	for (const auto bytes: paths) {
+		total += bytes;
+	}
+	std::printf("UploadSources %.1fs: %.1f MiB/s total;", elapsed,
+	            static_cast<double>(total) / MiB / elapsed);
+	for (uint32_t i = 0; i < Count; ++i) {
+		if (paths[i] != 0) {
+			std::printf(" %s %.1f", Names[i], static_cast<double>(paths[i]) / MiB / elapsed);
+		}
+	}
+	std::printf(" MiB/s\n");
+	const auto shown = std::min<size_t>(top.size(), 20);
+	std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(shown), top.end(),
+	                  [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+	for (size_t i = 0; i < shown; ++i) {
+		const auto& [key, entry] = top[i];
+		const auto  path         = static_cast<uint32_t>(key & 7u);
+		const auto  page         = Common::AlignDown(entry.lo, CACHING_PAGESIZE);
+		const bool  direct = LibKernel::Memory::GuestBackingAlias(page, CACHING_PAGESIZE) != nullptr;
+		const auto  span   = entry.hi - entry.lo;
+		const char* status = "import-off";
+		if (m_host_import != nullptr) {
+			const auto& state = *m_host_import;
+			status = state.redirected.Contains(entry.lo, span)     ? "imported"
+			         : state.redirected.Intersects(entry.lo, span) ? "partly-imported"
+			         : state.excluded.Intersects(entry.lo, span)   ? "excluded(fallback/failed)"
+			         : HasGpuDirtyBytes(entry.lo, span)            ? "gpu-dirty"
+			         : !direct                                     ? "not-direct"
+			         : m_texture_cache.IsRegionGpuModified(entry.lo, span) ? "image-gpu-modified"
+			         : path == WrittenBinding                              ? "gpu-written-path"
+			                                                               : "not-yet-candidate";
+		}
+		std::printf("  #%zu 0x%010" PRIx64 "-0x%010" PRIx64 " %.2f MiB/s %" PRIu64
+		            " copies path=%s mem=%s import=%s\n",
+		            i + 1, entry.lo, entry.hi, static_cast<double>(entry.bytes) / MiB / elapsed,
+		            entry.copies, Names[path], direct ? "direct" : "flexible/other", status);
+	}
+	std::fflush(stdout);
 }
 
 } // namespace Libs::Graphics

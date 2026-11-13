@@ -332,6 +332,9 @@ private:
 	void HostImportUnredirect(uint64_t vaddr, uint64_t size, bool exclude);
 	void HostImportSettleWrite(uint64_t vaddr, uint64_t size);
 	void HostImportAdvanceFrame();
+	// KYTY_UPLOAD_SOURCES=1: per-path accounting of uploaded guest bytes (bufferCache.cpp).
+	void NoteUploadSource(uint64_t address, uint64_t size, uint32_t path);
+	void ReportUploadSources();
 	[[nodiscard]] bool HostImportRedirects(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> HostImportRedirectedRuns(uint64_t vaddr,
 	                                                                                 uint64_t size) const;
