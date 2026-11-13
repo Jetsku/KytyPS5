@@ -1088,6 +1088,30 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	    Prospero::SampledTextureNumericClass(descriptor.Format()) ==
 	        Prospero::TextureNumericClass::Unsupported;
 	if (descriptor.IsNull() || unsupported_sampled_format) {
+		{
+			// KYTY_NULL_TEXTURE_LOG=1: report (up to 64 times) why a texture binds as null here.
+			static const bool null_log = [] {
+				const char* v = std::getenv("KYTY_NULL_TEXTURE_LOG");
+				return v != nullptr && v[0] == '1';
+			}();
+			static std::atomic_uint32_t null_reported {0};
+			if (null_log && null_reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+				std::printf("NullTexture: %s storage=%d src=%u pc=0x%x numeric=%d indirect_root=%u read=%d addr=0x%016" PRIx64
+				            " format=%u type=%u tile=%u numeric_class=%d "
+				            "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				            descriptor.IsNull() ? "null-descriptor" : "unsupported-sampled-format",
+				            storage ? 1 : 0, resource.source, resource.first_use_pc,
+				            static_cast<int>(resource.numeric_class), resource.indirect_root,
+				            resource.read ? 1 : 0, descriptor.Base40(),
+				            static_cast<uint32_t>(descriptor.Format()),
+				            static_cast<uint32_t>(descriptor.Type()),
+				            static_cast<uint32_t>(descriptor.TileMode()),
+				            static_cast<int>(Prospero::SampledTextureNumericClass(descriptor.Format())),
+				            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				            descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+				            descriptor.fields[6], descriptor.fields[7]);
+			}
+		}
 		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                         : TextureCache::BindingType::Texture);
 		binding.image_id = texture_cache.FindImage(desc);
