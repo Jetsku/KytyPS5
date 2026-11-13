@@ -5116,6 +5116,42 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		}
 		return {false, 0};
 	}
+	// KYTY_CP_SEQ_TOUCHED_EXACT=1 with the wait journal: a WAIT_REG_MEM whose label already passes
+	// its compare (labels only advance; the bytes are not GPU-dirty, have no pending publication
+	// and no CP write of this stream is pending over them) is answered the same way as a
+	// self-label wait: the resolver still executes it in order and passes it at once, and the
+	// front keeps parsing. UFC 5 waits ~6 times a frame on other queues' labels already written.
+	if (kind == CpSeq::OpKind::WaitRegMem && WaitJournalEnabled()) {
+		static const bool touched_exact = [] {
+			const char* v = std::getenv("KYTY_CP_SEQ_TOUCHED_EXACT");
+			return v != nullptr && v[0] == '1';
+		}();
+		static const bool wait_pass = [] {
+			const char* v = std::getenv("KYTY_CP_SEQ_WAIT_PASS");
+			return v == nullptr || v[0] != '0';
+		}();
+		const auto& wait = *static_cast<const CpSeq::WaitRegMemOp*>(payload);
+		if (touched_exact && wait_pass && (wait.size == 4u || wait.size == 8u)) {
+			const bool pending = std::any_of(m_pending_writes.begin(), m_pending_writes.end(),
+			                                 [&](const PendingWrite& w) {
+				                                 return w.begin < wait.addr + wait.size &&
+				                                        wait.addr < w.end;
+			                                 });
+			auto& cache = m_renderer.GetBufferCache();
+			if (!pending && !cache.IsRegionGpuModifiedRelaxed(wait.addr, wait.size) &&
+			    !cache.HasPendingBackingPublication(wait.addr, wait.size)) {
+				uint64_t value = 0;
+				std::memcpy(&value, reinterpret_cast<const void*>(wait.addr), wait.size);
+				if (TestWaitRegMemValue(value, wait.ref, wait.mask, wait.func)) {
+					if (BarrierStatsEnabled()) {
+						g_barrier_stats.passed.fetch_add(1, std::memory_order_relaxed);
+					}
+					m_adopt_tracking = false;
+					return {false, 0};
+				}
+			}
+		}
+	}
 	if (BarrierStatsEnabled()) {
 		switch (kind) {
 			case CpSeq::OpKind::WaitRegMem: {
@@ -5241,6 +5277,19 @@ bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {
 	if (cursor.copy == nullptr && !GpuTouched::g_pages.AnyTouched(rest_begin, rest_end)) {
 		cursor.checked_epoch = m_barrier_epoch;
 		return true;
+	}
+	// KYTY_CP_SEQ_TOUCHED_EXACT=1: command bytes that are not GPU-dirty now (see ReadGuestForFront).
+	static const bool touched_exact = [] {
+		const char* v = std::getenv("KYTY_CP_SEQ_TOUCHED_EXACT");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (touched_exact && cursor.copy == nullptr) {
+		auto& cache = m_renderer.GetBufferCache();
+		if (!cache.IsRegionGpuModifiedRelaxed(rest_begin, rest_end - rest_begin) &&
+		    !cache.HasPendingBackingPublication(rest_begin, rest_end - rest_begin)) {
+			cursor.checked_epoch = m_barrier_epoch;
+			return true;
+		}
 	}
 	if (cursor.copy != nullptr && cursor.checked_epoch != 0) {
 		// A copy taken in order stays what the serial CP reads, unless a CP write since then
