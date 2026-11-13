@@ -1731,6 +1731,8 @@ private:
 	// KYTY_CP_COMMIT_STATS: the kernel's outcome for the committed draw (Taken is m_kernel itself).
 	CommitStats::KernelOutcome    m_stats_kernel    = CommitStats::KernelOutcome::Off;
 	CommitStats::CandidateOutcome m_stats_candidate = CommitStats::CandidateOutcome::NotReached;
+	uint8_t m_stats_inelig      = 0; // DrawRun::KeyDiag::Inelig of the committed draw's record
+	uint8_t m_stats_prev_inelig = 0; // and of the previous draw's
 	[[nodiscard]] bool ContinuationKernelEntry(const DrawIndexArgs& args) const;
 	[[nodiscard]] bool ContinuationKernel(uint64_t submit_id, CommandBuffer& buffer,
 	                                      const DrawIndexArgs& args);

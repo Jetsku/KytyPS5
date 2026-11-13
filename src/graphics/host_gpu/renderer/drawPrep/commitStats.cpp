@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/renderer/drawPrep/changeClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 
 #include "common/liveSwitch.h"
 
@@ -83,6 +84,14 @@ struct MaskAggregate {
 };
 constexpr uint32_t KernelOutcomes = 5;
 constexpr uint32_t CandidateCount = static_cast<uint32_t>(CandidateOutcome::Count);
+// DrawRun::KeyDiag::Inelig, in its order (drawRun.h).
+constexpr uint32_t    IneligCount = 22;
+const char* const kIneligNames[IneligCount] = {
+    "none",        "notreached", "notengine",   "notvalidated", "nokey",      "mesh",
+    "indirect",    "vstages",    "writes",      "feedback",     "norendering", "renderstate",
+    "debugdump",   "depthclear", "stencilclear", "colorclear",  "gds",         "program",
+    "texattach",   "storage",    "depthpromo",  "alias"};
+static_assert(IneligCount == static_cast<uint32_t>(DrawRun::KeyDiag::Inelig::Count), "one name per reason");
 
 
 struct ReasonAggregate {
@@ -207,6 +216,8 @@ struct State {
 	std::array<std::array<uint64_t, KernelOutcomes>, 2>    kernel {};
 	// The run candidate's outcome per class.
 	std::array<std::array<uint64_t, CandidateCount>, ReasonCount> candidate {};
+	// Candidates without a record: why the previous draw left none, per class.
+	std::array<std::array<uint64_t, IneligCount>, ReasonCount> norecord {};
 	// Interval.
 	uint64_t interval_ns  = 0;
 	uint64_t interval_tsc = 0;
@@ -447,7 +458,27 @@ void PrintMasks(State& s, double seconds, double ns_per_tick) {
 		}
 		line += ";";
 	}
+	line += " | norecord-by/f";
+	for (uint32_t r = 0; r < ReasonCount; r++) {
+		bool named = false;
+		for (uint32_t k = 0; k < IneligCount; k++) {
+			if (s.norecord[r][k] == 0) {
+				continue;
+			}
+			if (!named) {
+				std::snprintf(text, sizeof(text), " %s:", kReasonNames[r]);
+				line += text;
+				named = true;
+			}
+			std::snprintf(text, sizeof(text), " %s %.1f", kIneligNames[k], static_cast<double>(s.norecord[r][k]) / frames);
+			line += text;
+		}
+		if (named) {
+			line += ";";
+		}
+	}
 	std::printf("%s\n", line.c_str());
+	s.norecord  = {};
 	s.masks     = {};
 	s.kernel    = {};
 	s.candidate = {};
@@ -789,6 +820,9 @@ void EndDraw() {
 			}
 			s.kernel[b.run_continued ? 1 : 0][static_cast<uint32_t>(b.kernel)]++;
 			s.candidate[reason][static_cast<uint32_t>(b.candidate)]++;
+			if (b.candidate == CandidateOutcome::NoRecord) {
+				s.norecord[reason][std::min<uint32_t>(b.prev_inelig, IneligCount - 1)]++;
+			}
 		}
 		s.previous       = b;
 		s.previous_valid = true;

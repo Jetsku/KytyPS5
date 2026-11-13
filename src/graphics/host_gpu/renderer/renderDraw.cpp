@@ -3425,6 +3425,11 @@ void RenderExecutor::BeginDrawRun() {
 		                                            : DrawRun::KeyDiag::Inelig::NotEngine;
 		m_key_diag.combo       = -2;
 	}
+	if (CommitStats::Enabled()) [[unlikely]] {
+		m_stats_prev_inelig = m_stats_inelig;
+		m_stats_inelig      = static_cast<uint8_t>(m_in_engine_commit ? DrawRun::KeyDiag::Inelig::NotReached
+		                                                                   : DrawRun::KeyDiag::Inelig::NotEngine);
+	}
 }
 
 bool RenderExecutor::DrawRunCommandUnchanged(const CommandBuffer& buffer) const {
@@ -4207,6 +4212,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 			    depth->feedback_serial == depth->ContentSerial()) {
 				DrawRun::GetTotals().depth_promotions_excluded.fetch_add(1, std::memory_order_relaxed);
 				m_key_diag.reason = DrawRun::KeyDiag::Inelig::DepthPromotion;
+				m_stats_inelig    = static_cast<uint8_t>(DrawRun::KeyDiag::Inelig::DepthPromotion);
 				return;
 			}
 		}
@@ -4242,6 +4248,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 		if (mark.texture && DrawRunOverAttachment(attachments, mark.address, mark.size)) {
 			DrawRun::GetTotals().alias_excluded.fetch_add(1, std::memory_order_relaxed);
 			m_key_diag.reason = DrawRun::KeyDiag::Inelig::Alias;
+			m_stats_inelig    = static_cast<uint8_t>(DrawRun::KeyDiag::Inelig::Alias);
 			return;
 		}
 	}
@@ -6935,7 +6942,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 			}
 		}
-		if (DrawRun::KeyDiagEnabled()) [[unlikely]] {
+		if (DrawRun::KeyDiagEnabled() || CommitStats::Enabled()) [[unlikely]] {
 			using DrawRun::KeyDiag::Inelig;
 			auto reason = Inelig::None;
 			if (!eligible) {
@@ -6985,9 +6992,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						reason = Inelig::NotReached; // not found: shown as "notreached"
 					}
 				}
-				DrawRun::KeyDiag::CountIneligible(reason);
+				if (DrawRun::KeyDiagEnabled()) {
+					DrawRun::KeyDiag::CountIneligible(reason);
+				}
 			}
 			m_key_diag.reason = reason;
+			m_stats_inelig    = static_cast<uint8_t>(reason); // KYTY_CP_COMMIT_STATS
 		}
 		if (eligible) {
 			OwnedCounters::Add(DrawRun::GetTotals().eligible, 1);
@@ -7055,6 +7065,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		shape.run_continued = m_run_active;
 		shape.kernel        = m_kernel ? CommitStats::KernelOutcome::Taken : m_stats_kernel;
 		shape.candidate     = m_stats_candidate;
+		shape.prev_inelig   = m_stats_prev_inelig;
 		CommitStats::NoteRecorded(shape);
 		// The hashing above is the diagnostic's own cost: not counted in any phase.
 		CommitStats::Skip();

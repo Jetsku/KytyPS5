@@ -281,6 +281,7 @@ struct DrawShape {
 	bool     run_continued    = false; // KYTY_DRAW_RUN continued the previous draw's run
 	KernelOutcome kernel      = KernelOutcome::Off;
 	CandidateOutcome candidate = CandidateOutcome::NotReached;
+	uint8_t prev_inelig = 0; // the previous draw's DrawRun::KeyDiag::Inelig (why it left no record)
 };
 
 // GPU thread (the command processor's resolver), around DrawPrep::Engine::Commit.
