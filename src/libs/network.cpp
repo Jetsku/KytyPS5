@@ -2818,6 +2818,7 @@ struct HttpEpoll {
 	Network::Id http_ctx_id = Network::Id(0);
 	Network::Id request_id  = Network::Id(0);
 	void*       user_arg    = nullptr;
+	bool        reported    = false; // the sent request's completion was delivered
 };
 
 struct HttpNBEvent {
@@ -3262,6 +3263,7 @@ int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
 
 	eh->request_id = Network::Id(id);
 	eh->user_arg   = user_arg;
+	eh->reported   = false;
 
 	return OK;
 }
@@ -3318,6 +3320,25 @@ int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int max
 
 	if (eh == nullptr || maxevents < 0 || (maxevents > 0 && nbev == nullptr)) {
 		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	// No network: a request that was sent has already failed (HttpSendRequest). Deliver that
+	// completion once as a socket error + hang-up so a non-blocking caller stops waiting for it
+	// (EA titles otherwise wait forever for their update check and never leave the error dialog).
+	if (maxevents > 0 && eh->request_id.IsValid() && !eh->reported) {
+		int send_result = HTTP_ERROR_BEFORE_SEND;
+		if (g_net->HttpGetRequestResponse(eh->request_id, &send_result, nullptr, nullptr, nullptr,
+		                                  nullptr) &&
+		    send_result != HTTP_ERROR_BEFORE_SEND) {
+			constexpr uint32_t HTTP_NB_EVENT_SOCK_ERR = 0x08;
+			constexpr uint32_t HTTP_NB_EVENT_HUP      = 0x10;
+			nbev[0].events       = HTTP_NB_EVENT_SOCK_ERR | HTTP_NB_EVENT_HUP;
+			nbev[0].event_detail = 0;
+			nbev[0].id           = eh->request_id.ToInt();
+			nbev[0].user_arg     = eh->user_arg;
+			eh->reported         = true;
+			return 1;
+		}
 	}
 
 	return 0;
