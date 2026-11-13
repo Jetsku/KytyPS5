@@ -11495,6 +11495,38 @@ void TestReadOnlyBuffers() {
         "read-only buffers: a program that stores declared its buffers NonWritable");
 }
 
+// The host-uploaded shader data and flattened SRT are declared NonWritable, whatever the program
+// does with its own buffers (here a buffer store, which keeps "buffers" writable).
+void TestReadOnlyEmulatorData() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x02, 4, 0),
+      125u << 25u, // s_load_dwordx4 s[4:7], s[0:1], null SOFFSET: an SRT read
+      EncodeSmem0(0x08, 12, 4),
+      0u, // s_buffer_load_dword s12, s[8:11], s0: a descriptor in user data, its offset in shader data
+      EncodeVop1(0x01, 0, 12),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 1, 0), // buffer_store_dword v0 through s[4:7]
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> user_data{};
+  user_data[8]  = 0x2000u;
+  user_data[10] = 4u;
+  auto options      = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data = user_data;
+  // Shader data past the push-constant range lives in the shader_data storage buffer.
+  const auto result = RecompileForTest(shader, options, nullptr, nullptr,
+                                       ShaderRecompiler::IR::PushData::DwordCount);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  for (const char *name : {"%shader_data", "%flattened_srt"}) {
+    Check(source.find(std::string(name) + " = OpVariable") != std::string::npos,
+          (std::string("read-only emulator data: the test program does not use ") + name).c_str());
+    Check(source.find(std::string("OpDecorate ") + name + " NonWritable") != std::string::npos,
+          (std::string("read-only emulator data: not NonWritable: ") + name).c_str());
+  }
+  Check(source.find("OpDecorate %buffers NonWritable") == std::string::npos,
+        "read-only emulator data: a storing program declared its buffers NonWritable");
+}
+
 void TestGeometryOutputGuard() {
   namespace Spirv = ShaderRecompiler::Spirv;
   const auto saved = Spirv::GetHostGeometryGuard();
@@ -16065,6 +16097,7 @@ int main(int argc, char **argv) {
   TestMeshIndirectParams();
   TestGeometryOutputGuard();
   TestReadOnlyBuffers();
+  TestReadOnlyEmulatorData();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

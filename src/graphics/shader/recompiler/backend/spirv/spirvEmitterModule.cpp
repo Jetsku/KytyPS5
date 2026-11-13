@@ -337,15 +337,23 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
 				break;
+			// The per-draw shader data and the flattened SRT are uploaded by the host and only ever
+			// loaded. Without NonWritable a host compiler must assume another binding's writes
+			// (mip_stats atomics, guest buffer stores) may alias them, and keeps every load, and
+			// all the per-draw selects that depend on it, per invocation.
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state), "shader_data");
+				state.builder.AddAnnotation(spv::OpDecorate, state.shader_data_storage_variable,
+				                            spv::DecorationNonWritable);
 				break;
 			case IR::DescriptorBindingKind::MipStats:
 				state.mip_stats_variable = Define(StorageBufferType(state), "mip_stats");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				state.builder.AddAnnotation(spv::OpDecorate, state.flattened_srt_variable,
+				                            spv::DecorationNonWritable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),
