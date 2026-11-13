@@ -47,6 +47,8 @@ struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
 struct DrawEmitInfo;
+struct PreparedVertexBuffers;
+struct PreparedIndexBuffer;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
@@ -436,14 +438,39 @@ public:
 	// push constants through StateHandle().
 	void PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t size,
 	                   const void* data);
-	void InvalidatePushConstants() const { m_shadow.InvalidatePushConstants(); }
+	void InvalidatePushConstants() const {
+		SettleEncode();
+		m_shadow.InvalidatePushConstants();
+	}
 
 	// The encode's view (drawEncode.h): the shadow the state commands above update, the switches
 	// its comparisons depend on, and the ring the encoder writes (null while recording natively).
-	[[nodiscard]] DrawEncode::Shadow& EncodeShadow() const noexcept { return m_shadow; }
+	[[nodiscard]] DrawEncode::Shadow& EncodeShadow() const {
+		SettleEncode();
+		return m_shadow;
+	}
 	[[nodiscard]] static DrawEncode::ShadowFlags EncodeFlags();
 	[[nodiscard]] const CommandStream::Ring* EncoderRing() const noexcept {
 		return Encoding() ? &m_encoder->GetRing() : nullptr;
+	}
+	// KYTY_ENC_OFFLOAD (encodeOffload.h): the command-stream encoder while encoding (null while
+	// recording natively); the shadow without settling (the offload's own use: what the commit
+	// thread owns while jobs are pending, or the shadow the jobs update); and the hook that settles
+	// pending jobs before the shadow contents are touched (called once, then cleared).
+	[[nodiscard]] CommandStream::Encoder* StreamEncoder() const noexcept {
+		return Encoding() ? m_encoder : nullptr;
+	}
+	[[nodiscard]] DrawEncode::Shadow& EncodeShadowUnsettled() const noexcept { return m_shadow; }
+	void SetSettleHook(void (*hook)(void* context), void* context) const noexcept {
+		m_settle_hook         = hook;
+		m_settle_hook_context = context;
+	}
+	void SettleEncode() const {
+		if (m_settle_hook != nullptr) [[unlikely]] {
+			const auto hook = m_settle_hook;
+			m_settle_hook   = nullptr;
+			hook(m_settle_hook_context);
+		}
 	}
 
 	// Native handle for recording any command. Records pending batched barriers first.
@@ -532,6 +559,8 @@ private:
 	// What the state commands recorded in this buffer left in effect (drawEncode.h): bound
 	// pipelines, push-descriptor contents and epochs, push constants.
 	mutable DrawEncode::Shadow m_shadow;
+	mutable void (*m_settle_hook)(void* context) = nullptr;
+	mutable void* m_settle_hook_context          = nullptr;
 
 	// Barrier batcher state (see BarrierBatchEnabled()). Owned by the recording producer.
 	mutable PendingBarriers m_pending;
@@ -1454,6 +1483,21 @@ private:
 		DrawEncode::BuiltDescriptors  built;
 	};
 	std::unique_ptr<EncCapture> m_enc_capture;
+	// KYTY_ENC_OFFLOAD (renderDraw.cpp, encodeOffload.h).
+	struct OffloadJob;
+	struct OffloadState;
+	OffloadState* m_offload = nullptr;
+	OffloadJob*   OffloadAcquire(CommandBuffer& buffer);
+	void          OffloadPost(OffloadJob* job, CommandBuffer& buffer);
+	OffloadJob*   OffloadBindings(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                              std::span<PreparedBindings* const> stages, bool keep_images, bool mesh_active,
+	                              bool run_verify_push, const PreparedVertexBuffers& vertex,
+	                              const PreparedIndexBuffer& index);
+	void          OffloadVerifyPart(OffloadJob* job, CommandBuffer& buffer, const CommandStream::Ring* ring,
+	                                uint64_t real_begin);
+	void          OffloadSettle(uint32_t reason);
+	void          OffloadReport();
+	static void   OffloadSettleNow(OffloadState& state, uint64_t& reason);
 	struct ShaderUploadEntry {
 		uint64_t tick = 0;
 		uint64_t hash = 0;

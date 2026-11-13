@@ -267,6 +267,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 		NoteForeignCommand();
 	}
 	// Including push-constant updates with other layouts (helper passes, occlusion reductions).
+	SettleEncode();
 	m_shadow.InvalidatePushConstants();
 	if (Encoding()) {
 		// KYTY_CP_RECORDER: the recorder executes everything encoded so far (including the batch
@@ -291,6 +292,7 @@ CommandSink CommandBuffer::Sink() const {
 		FlushBarriers();
 		NoteForeignCommand();
 	}
+	SettleEncode();
 	m_shadow.InvalidatePushConstants();
 	return CommandSink(*this);
 }
@@ -751,6 +753,7 @@ void CommandBuffer::NoteDrawRecorded() const {
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	// Nothing bound, every descriptor epoch advances, push constants are undefined.
+	SettleEncode();
 	m_shadow.Begin();
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
 	ResetBarrierState();
@@ -799,17 +802,20 @@ void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipel
 }
 
 void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
+	SettleEncode();
 	m_shadow.InvalidateDescriptors(point);
 }
 
 void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                       vk::DescriptorSet set) {
+	SettleEncode();
 	auto sink = StateSink();
 	m_shadow.BindDescriptorSet(sink, EncodeFlags(), point, layout, set);
 }
 
 void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
                                   uint32_t size, const void* data) {
+	SettleEncode();
 	auto sink = StateSink();
 	m_shadow.PushConstants(sink, EncodeFlags(), layout, stages, size, data);
 }
@@ -817,6 +823,7 @@ void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlag
 int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                        uint32_t set, uint32_t count,
                                        const vk::WriteDescriptorSet* writes, bool known_miss) {
+	SettleEncode();
 	auto sink = StateSink();
 	return m_shadow.PushDescriptors(sink, EncodeFlags(), point, layout, set, count, writes, known_miss);
 }

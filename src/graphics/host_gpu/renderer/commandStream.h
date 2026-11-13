@@ -668,6 +668,19 @@ public:
 	[[nodiscard]] uint64_t CommandDigest() const noexcept { return m_cb_digest; }
 	[[nodiscard]] uint64_t CommandPackets() const noexcept { return m_cb_packets; }
 
+	// KYTY_ENC_OFFLOAD (encodeOffload.h): called once before the next packet is opened (then
+	// cleared), so packets encoded elsewhere are spliced in ahead of it.
+	void SetOpenHook(void (*hook)(void* context), void* context) noexcept {
+		m_open_hook         = hook;
+		m_open_hook_context = context;
+	}
+	[[nodiscard]] bool HasOpenHook() const noexcept { return m_open_hook != nullptr; }
+	// Appends the packets another encoder with the same options wrote into `source` from its read
+	// position up to `end` (Wrap packets skipped), consuming them there: each packet is copied as it
+	// is, and its verify sequence renumbered and folded into this command buffer's digest exactly as
+	// Close would. Returns the bytes appended.
+	uint64_t Splice(Ring& source, uint64_t end);
+
 	void Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns);
 	// `submit` fields other than the digest; the encoder fills the verify digest and count.
 	void Submit(const SubmitPacket& submit);
@@ -786,6 +799,8 @@ private:
 	uint64_t  m_bytes      = 0;
 	uint64_t  m_cb_digest  = 0;
 	uint64_t  m_cb_packets = 0;
+	void (*m_open_hook)(void* context) = nullptr;
+	void* m_open_hook_context          = nullptr;
 };
 
 class Encoder::Writer {

@@ -38,6 +38,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/commandStreamLog.h"
+#include "graphics/host_gpu/renderer/encodeOffload.h"
 #include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/watchRange.h"
@@ -958,7 +960,6 @@ struct DrawRenderState {
 RenderExecutor::RenderExecutor(RenderContext& context)
     : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()) {}
 
-RenderExecutor::~RenderExecutor() = default;
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -1579,6 +1580,360 @@ struct PreparedVertexBuffers {
 	std::array<vk::DeviceSize, MaxBuffers> sizes {};
 	uint32_t                               count = 0;
 };
+
+// ------------------------------------------------------------------------------------------------
+// KYTY_ENC_OFFLOAD (live; default 0; 1 on; verify): the emission of draws on one in-order emit
+// thread (encodeOffload.h; the C1 cut of the whole-workload plan at the draw's emission point). A
+// draw the value packets cover posts two parts: its bindings (vertex
+// buffers, push constants, push descriptors, bindless set, index buffer) after the commit thread
+// built its descriptor writes, and its draw (pipeline bind, clip planes, object id, draw command)
+// after BeginRendering. Anything else the commit thread records, and any access to the shadow
+// contents, settles first (the hooks), so the stream order is the inline one.
+static int64_t ParseEncOffload(const char* value) {
+	if (value == nullptr || value[0] == '\0') {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0 || std::strcmp(value, "2") == 0) {
+		return 2;
+	}
+	return std::strcmp(value, "1") == 0 ? 1 : 0;
+}
+static Live::Switch g_enc_offload("KYTY_ENC_OFFLOAD", ParseEncOffload);
+
+struct RenderExecutor::OffloadJob {
+	bool                    draw_part = false;
+	bool                    verify    = false;
+	DrawEncode::Shadow*     shadow    = nullptr;
+	DrawEncode::Shadow      verify_shadow;
+	DrawEncode::ShadowFlags flags;
+	vk::PipelineLayout      layout = nullptr;
+	// Bindings part.
+	bool                          vertex = false;
+	PreparedVertexBuffers         vb;
+	vk::PipelineBindPoint         point = vk::PipelineBindPoint::eGraphics;
+	DrawEncode::DescriptorScratch scratch;
+	DrawEncode::BuiltDescriptors  built;
+	bool                          push       = false;
+	bool                          known_miss = false;
+	bool                          bindless   = false;
+	vk::DescriptorSet             bindless_set = nullptr;
+	bool                          index        = false;
+	PreparedIndexBuffer           ib;
+	// Draw part.
+	bool                     bind     = false;
+	vk::Pipeline             pipeline = nullptr;
+	uint32_t                 clip_bytes = 0;
+	vk::ShaderStageFlags     clip_stages;
+	std::array<uint32_t, 24> clip {};
+	bool                     objprim = false;
+	vk::ShaderStageFlags     objprim_stages;
+	uint32_t                 objprim_offset = 0;
+	uint32_t                 object_id      = 0;
+	DrawEncode::DirectDraw   direct;
+
+	template <typename Sink>
+	void Run(Sink& sink) {
+		auto& shadow_ref = *shadow;
+		if (!draw_part) {
+			if (vertex) {
+				DrawEncode::EmitVertexBuffers(sink, vb.count, vb.buffers.data(), vb.offsets.data(), vb.sizes.data());
+			}
+			DrawEncode::EmitPushConstants(sink, shadow_ref, flags, layout, built);
+			if (push && !scratch.writes.empty()) {
+				const auto result =
+				    DrawEncode::EmitPushDescriptors(sink, shadow_ref, flags, point, layout, scratch, known_miss);
+				if (!verify) {
+					DrawEncode::CountPushMiss(result, scratch.writes);
+				}
+			}
+			if (bindless) {
+				DrawEncode::EmitBindlessSet(sink, point, layout, bindless_set);
+			}
+			if (index) {
+				DrawEncode::EmitIndexBuffer(sink, ib.buffer, ib.offset, ib.type);
+			}
+			return;
+		}
+		if (bind) {
+			sink.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+		}
+		if (clip_bytes != 0) {
+			sink.pushConstants(layout, clip_stages, ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
+			                   clip_bytes, clip.data());
+		}
+		if (objprim) {
+			sink.pushConstants(layout, objprim_stages, objprim_offset, sizeof(object_id), &object_id);
+			shadow_ref.InvalidatePushConstants();
+		}
+		DrawEncode::EmitDirectDraw(sink, direct);
+	}
+	static void RunOn(void* job, CommandStream::Encoder& out) { static_cast<OffloadJob*>(job)->Run(out); }
+};
+
+// Why a draw (with the switch on) was emitted inline.
+enum class OffloadMiss : uint32_t {
+	NoStream,      // the command buffer records natively (no recorder, or a direct window)
+	Sites,         // capture-mode GpuOpProfiler sites on every packet
+	BatchOff,      // barrier batcher off (a GDS dependency would record at once)
+	SetPath,       // descriptor sets (allocation and reuse cache stay on the commit thread)
+	PushCompare,   // a push the shadow must compare (its epoch would move on the encode thread)
+	DrawRunVerify, // KYTY_DRAW_RUN=verify reads the built writes
+	Mesh,
+	DrawDiag,      // the draw part: labels, draw statistics, skip lists, GPU instances, indirect
+	Count,
+};
+static constexpr std::array<const char*, static_cast<size_t>(OffloadMiss::Count)> g_offload_miss_names {
+    "no_stream", "sites", "batch_off", "set_path", "push_compare", "drawrun_verify", "mesh", "draw_diag"};
+
+struct RenderExecutor::OffloadState {
+	EncodeOffload::Engine                                     engine;
+	std::array<OffloadJob, EncodeOffload::Engine::MaxJobs>    jobs;
+	uint64_t                                                  next   = 0;
+	CommandStream::Encoder*                                   target = nullptr;
+	const CommandBuffer*                                      buffer = nullptr;
+	// Counters (commit thread; printed by OffloadReport).
+	uint64_t candidates = 0;
+	uint64_t kernel     = 0; // of them kernel-taken continuations
+	uint64_t bindings   = 0;
+	uint64_t draws      = 0;
+	std::array<uint64_t, static_cast<size_t>(OffloadMiss::Count)> misses {};
+	uint64_t settle_stream = 0;
+	uint64_t settle_shadow = 0;
+	uint64_t settle_full   = 0;
+	uint64_t settle_switch = 0;
+	// Verify.
+	uint64_t verify_parts       = 0;
+	uint64_t verify_stream_b    = 0;
+	uint64_t verify_stream_d    = 0;
+	uint64_t verify_shadow_b    = 0;
+	uint64_t verify_shadow_d    = 0;
+	uint64_t verify_uncompared  = 0;
+	uint64_t verify_packets     = 0;
+	uint64_t reported           = 0;
+};
+
+void RenderExecutor::OffloadSettleNow(OffloadState& state, uint64_t& reason) {
+	reason++;
+	state.target->SetOpenHook(nullptr, nullptr);
+	state.buffer->SetSettleHook(nullptr, nullptr);
+	state.engine.Settle(*state.target);
+}
+
+void RenderExecutor::OffloadSettle(uint32_t reason) {
+	auto& state = *m_offload;
+	if (state.engine.Pending() == 0) {
+		return;
+	}
+	OffloadSettleNow(state, reason == 0 ? state.settle_full : state.settle_switch);
+}
+
+RenderExecutor::OffloadJob* RenderExecutor::OffloadAcquire(CommandBuffer& buffer) {
+	if (m_offload == nullptr) {
+		m_offload = new OffloadState();
+	}
+	auto&      state   = *m_offload;
+	auto*      encoder = buffer.StreamEncoder();
+	const bool verify  = g_enc_offload.Get() == 2;
+	if (state.engine.Pending() != 0 && (verify || state.target != encoder || state.buffer != &buffer)) {
+		// Verify jobs run on a copy of the shadow and are taken at once: nothing may be pending.
+		// (Unreachable: a new command buffer begins with a packet, which settles.)
+		OffloadSettle(1);
+	}
+	if (state.engine.Pending() >= EncodeOffload::Engine::MaxJobs) {
+		OffloadSettle(0);
+	}
+	state.engine.Configure(encoder->GetOptions());
+	auto& job     = state.jobs[state.next % EncodeOffload::Engine::MaxJobs];
+	job.verify    = verify;
+	job.flags     = CommandBuffer::EncodeFlags();
+	job.shadow    = job.verify ? &job.verify_shadow : &buffer.EncodeShadowUnsettled();
+	if (job.verify) {
+		job.verify_shadow = buffer.EncodeShadowUnsettled();
+	}
+	return &job;
+}
+
+void RenderExecutor::OffloadPost(OffloadJob* job, CommandBuffer& buffer) {
+	auto& state = *m_offload;
+	EXIT_IF(!state.engine.Post(job, OffloadJob::RunOn));
+	state.next++;
+	if (job->verify) {
+		return;
+	}
+	state.target = buffer.StreamEncoder();
+	state.buffer = &buffer;
+	state.target->SetOpenHook(
+	    [](void* context) {
+		    auto& s = *static_cast<OffloadState*>(context);
+		    OffloadSettleNow(s, s.settle_stream);
+	    },
+	    &state);
+	buffer.SetSettleHook(
+	    [](void* context) {
+		    auto& s = *static_cast<OffloadState*>(context);
+		    OffloadSettleNow(s, s.settle_shadow);
+	    },
+	    &state);
+}
+
+RenderExecutor::OffloadJob* RenderExecutor::OffloadBindings(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+                                                            std::span<PreparedBindings* const> stages, bool keep_images,
+                                                            bool mesh_active, bool run_verify_push,
+                                                            const PreparedVertexBuffers& vertex,
+                                                            const PreparedIndexBuffer&   index) {
+	if (m_offload == nullptr) {
+		m_offload = new OffloadState();
+	}
+	auto& state = *m_offload;
+	if ((++state.candidates & 0x3ffffu) == 1) {
+		OffloadReport();
+	}
+	state.kernel += m_kernel ? 1u : 0u;
+	// The commit's cache and barrier work runs here (the caller then encodes inline without it).
+	CommitBindingsSideEffects(buffer, pipeline, stages, keep_images);
+	auto miss = OffloadMiss::Count;
+	auto* encoder = buffer.StreamEncoder();
+	if (encoder == nullptr) {
+		miss = OffloadMiss::NoStream;
+	} else if (encoder->GetOptions().all_sites) {
+		miss = OffloadMiss::Sites;
+	} else if (!BarrierBatchEnabled()) {
+		miss = OffloadMiss::BatchOff;
+	} else if (mesh_active) {
+		miss = OffloadMiss::Mesh;
+	} else if (!pipeline.uses_push_descriptors) {
+		miss = OffloadMiss::SetPath;
+	} else if (run_verify_push || DrawRun::GetMode() == DrawRun::Mode::Verify) {
+		miss = OffloadMiss::DrawRunVerify;
+	} else if (!DrawEncode::FreshSkipEnabled() ||
+	           !std::ranges::any_of(stages, [](const auto* prepared) { return prepared->fresh_upload; })) {
+		// Without a fresh upload the push is compared with the shadow (and may move its epoch).
+		bool any_descriptors = false;
+		for (const auto* prepared: stages) {
+			any_descriptors |= !prepared->runtime->program->bindings.descriptors.empty();
+		}
+		if (any_descriptors) {
+			miss = OffloadMiss::PushCompare;
+		}
+	}
+	if (miss != OffloadMiss::Count) {
+		state.misses[static_cast<size_t>(miss)]++;
+		return nullptr;
+	}
+	auto* job      = OffloadAcquire(buffer);
+	job->draw_part = false;
+	job->layout    = pipeline.pipeline_layout;
+	job->point     = vk::PipelineBindPoint::eGraphics;
+	job->vertex    = true;
+	job->vb        = vertex;
+	job->index     = true;
+	job->ib        = index;
+	// KYTY_DRAW_RUN_PUSH: a continuation pushes only its per-draw descriptors.
+	const bool partial = keep_images && DrawRunPartialPush(buffer, pipeline);
+	if (partial && !job->verify) {
+		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
+	}
+	DrawEncode::BuildDescriptors(stages, vk::PipelineBindPoint::eGraphics, partial, MakeDescriptorEnv(stages),
+	                             job->scratch, job->built);
+	if (!job->verify) {
+		CommitStats::AddItems(CommitStats::Item::DescWrites, job->scratch.writes.size());
+	}
+	job->push       = true;
+	job->known_miss = DrawEncode::FreshSkipEnabled() && job->built.fresh;
+	EXIT_IF(!job->scratch.writes.empty() && (!job->known_miss || pipeline.descriptor_set_layout == nullptr));
+	if (!job->scratch.writes.empty() && !job->verify && DrawEncode::OffsetAuditEnabled()) [[unlikely]] {
+		NoteDescriptorOffsetAudit(pipeline, job->scratch.writes);
+	}
+	job->bindless     = pipeline.uses_bindless;
+	job->bindless_set = pipeline.uses_bindless ? m_context.GetBindlessTable().Set() : vk::DescriptorSet {};
+	OffloadPost(job, buffer);
+	if (!job->verify) {
+		state.bindings++;
+	}
+	return job;
+}
+
+// Verify: the oldest job's packets and shadow against the inline encode recorded since real_begin.
+void RenderExecutor::OffloadVerifyPart(OffloadJob* job, CommandBuffer& buffer, const CommandStream::Ring* ring,
+                                       uint64_t real_begin) {
+	auto&                  state = *m_offload;
+	CommandStream::CallLog job_log;
+	state.engine.TakeOldest(job_log);
+	state.verify_parts++;
+	const auto* after = buffer.EncoderRing();
+	bool        stream_bad = false;
+	if (ring == nullptr || after != ring) {
+		state.verify_uncompared++;
+	} else {
+		CommandStream::CallLog inline_log;
+		CommandStream::LogPackets(*ring, real_begin, ring->WritePosition(), inline_log);
+		state.verify_packets += inline_log.calls.size();
+		stream_bad = inline_log.calls != job_log.calls;
+	}
+	const auto& real  = buffer.EncodeShadowUnsettled();
+	const auto& mine  = job->verify_shadow;
+	const auto& p     = real.push_constants;
+	const auto& q     = mine.push_constants;
+	bool        shadow_bad = p.valid != q.valid ||
+	                  (p.valid && (p.layout != q.layout || p.stages != q.stages || p.size != q.size ||
+	                               std::memcmp(p.dwords.data(), q.dwords.data(),
+	                                           std::min<size_t>(p.size, sizeof(p.dwords))) != 0));
+	if (!job->draw_part) {
+		const auto& x = real.descriptor_states[0];
+		const auto& y = mine.descriptor_states[0];
+		shadow_bad |= x.layout != y.layout || x.bound_set != y.bound_set || x.buffers != y.buffers ||
+		              x.images != y.images || x.writes.size() != y.writes.size() ||
+		              real.descriptor_epochs != mine.descriptor_epochs;
+	}
+	if (stream_bad) {
+		(job->draw_part ? state.verify_stream_d : state.verify_stream_b)++;
+	}
+	if (shadow_bad) {
+		(job->draw_part ? state.verify_shadow_d : state.verify_shadow_b)++;
+	}
+	if ((stream_bad || shadow_bad) && state.reported < 16) {
+		state.reported++;
+		std::printf("EncOffload verify: part %s mismatch (stream %d shadow %d, job packets %zu)\n",
+		            job->draw_part ? "draw" : "bindings", stream_bad ? 1 : 0, shadow_bad ? 1 : 0, job_log.calls.size());
+		std::fflush(stdout);
+	}
+}
+
+void RenderExecutor::OffloadReport() {
+	auto& state = *m_offload;
+	auto& es    = state.engine.GetStats();
+	const auto jobs    = es.jobs.load(std::memory_order_relaxed);
+	const auto settles = es.settles.load(std::memory_order_relaxed);
+	const auto timed   = es.timed.load(std::memory_order_relaxed);
+	const auto wtimed  = es.worker_timed.load(std::memory_order_relaxed);
+	std::string misses;
+	for (size_t i = 0; i < g_offload_miss_names.size(); i++) {
+		misses += fmt::format(" {}={}", g_offload_miss_names[i], state.misses[i]);
+	}
+	std::printf("EncOffload (%s): draws seen %" PRIu64 " (kernel %" PRIu64 ") bindings %" PRIu64 " draws %" PRIu64 " jobs %" PRIu64
+	            " settles %" PRIu64 " (stream %" PRIu64 " shadow %" PRIu64 " full %" PRIu64 " switch %" PRIu64
+	            ") jobs/settle %.2f spliced %" PRIu64 " B (%.0f B/job) waits %" PRIu64
+	            " sampled splice %.0f ns wait %.0f ns per settle, worker %.0f ns per job, parks %" PRIu64 ";"
+	            " misses%s; verify parts %" PRIu64 " packets %" PRIu64 " uncompared %" PRIu64
+	            " mismatches stream_b=%" PRIu64 " stream_d=%" PRIu64 " shadow_b=%" PRIu64 " shadow_d=%" PRIu64 "\n",
+	            g_enc_offload.Get() == 2 ? "verify" : "on", state.candidates, state.kernel, state.bindings, state.draws, jobs, settles,
+	            state.settle_stream, state.settle_shadow, state.settle_full, state.settle_switch,
+	            settles != 0 ? static_cast<double>(es.spliced_jobs.load()) / static_cast<double>(settles) : 0.0,
+	            es.spliced_bytes.load(),
+	            es.spliced_jobs.load() != 0
+	                ? static_cast<double>(es.spliced_bytes.load()) / static_cast<double>(es.spliced_jobs.load())
+	                : 0.0,
+	            es.waits.load(), timed != 0 ? static_cast<double>(es.splice_ns.load()) / static_cast<double>(timed) : 0.0,
+	            timed != 0 ? static_cast<double>(es.wait_ns.load()) / static_cast<double>(timed) : 0.0,
+	            wtimed != 0 ? static_cast<double>(es.worker_ns.load()) / static_cast<double>(wtimed) : 0.0,
+	            es.parks.load(), misses.c_str(), state.verify_parts, state.verify_packets, state.verify_uncompared,
+	            state.verify_stream_b, state.verify_stream_d, state.verify_shadow_b, state.verify_shadow_d);
+	std::fflush(stdout);
+}
+
+RenderExecutor::~RenderExecutor() {
+	delete m_offload;
+}
 
 bool DrawPrep::CollectVertexRanges(const ShaderVertexInputInfo& vs_input_info,
                                    VertexRangePlan& ranges, uint32_t& invalid) {
@@ -6705,7 +7060,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vk_buffer = buffer.EmissionSink();
 	SetDrawDebugPhase(buffer, submit_id, draw, emit, draw.IsIndexed() ? 0x100u : 0x200u);
 	CommitStats::StepMark(CommitStats::Step::DrawScope);
-	if (!mesh_active) {
+	// KYTY_DRAW_RUN_PUSH verify: a would-be continuation that would push only its per-draw
+	// descriptors must push the previous draw's image and sampler descriptors on the normal path.
+	const bool run_verify_push =
+	    run_verify_images && m_run.verify_valid && DrawRunPartialPush(buffer, pipeline);
+	const bool keep_commit_images = m_run_active && !m_run_texdelta;
+	// KYTY_ENC_OFFLOAD: the draw's bindings part goes to the emit thread (its side effects ran in
+	// OffloadBindings either way); verify encodes inline as well and compares.
+	const bool  offload_tried = g_enc_offload.Get() != 0;
+	OffloadJob* offload_b     = nullptr;
+	if (offload_tried) [[unlikely]] {
+		offload_b = OffloadBindings(buffer, pipeline, stages, keep_commit_images, mesh_active, run_verify_push,
+		                            vertex_bindings, index_binding);
+	}
+	const bool  inline_b    = offload_b == nullptr || offload_b->verify;
+	const auto* verify_ring = offload_b != nullptr ? buffer.EncoderRing() : nullptr;
+	const auto  verify_from = verify_ring != nullptr ? verify_ring->WritePosition() : 0;
+	if (!mesh_active && inline_b) {
 		const CommitStats::SubScope vertex_scope(CommitStats::Sub::VertexCommit);
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -6713,14 +7084,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x300u);
 	}
-	// KYTY_DRAW_RUN_PUSH verify: a would-be continuation that would push only its per-draw
-	// descriptors must push the previous draw's image and sampler descriptors on the normal path.
-	const bool run_verify_push =
-	    run_verify_images && m_run.verify_valid && DrawRunPartialPush(buffer, pipeline);
-	{
+	if (inline_b) {
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
 		const CommitStats::SubScope push_scope(CommitStats::Sub::Push);
-		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active && !m_run_texdelta);
+		if (offload_tried) {
+			CommitBindingsEncode(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, keep_commit_images);
+		} else {
+			CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, keep_commit_images);
+		}
 	}
 	if (run_verify_push) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
@@ -6737,7 +7108,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitStats::StepMark(CommitStats::Step::CbTail);
 	CommitStats::Mark(CommitStats::Phase::CommitBindings);
-	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);
+	if (!mesh_active && inline_b) CommitIndexBuffer(vk_buffer, index_binding);
+	if (offload_b != nullptr && offload_b->verify) {
+		OffloadVerifyPart(offload_b, buffer, verify_ring, verify_from);
+	}
 	CommitStats::StepMark(CommitStats::Step::IndexCommit);
 
 	// KYTY_DRAW_RUN continuation: the dynamic state is a function of the same registers, targets and
@@ -6840,6 +7214,87 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_indirect_barrier_rendering = buffer.ActiveRenderingSerial();
 	}
 	CommitStats::StepMark(CommitStats::Step::Begin);
+	// Vulkan debug labels (--rd / KYTY_TRACE_VK_LABELS): the draw's shaders and game pass.
+	const bool draw_label = PassCensus::LabelsEnabled();
+	// KYTY_DRAW_SKIP_VS / KYTY_DRAW_SKIP_PS (diagnostic, live, default off): draws with one of these
+	// programs record their state but emit no draw command (to see which object a draw renders).
+	const bool skip_draw =
+	    (g_draw_skip_vs.Get() != 0 && state.vertex_info[0].stage.program != nullptr &&
+	     g_draw_skip_vs_set.Contains(state.vertex_info[0].stage.program->shader_hash)) ||
+	    (g_draw_skip_ps.Get() != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	     g_draw_skip_ps_set.Contains(state.ps_input_info.stage.program->shader_hash));
+	const bool draw_stats = DrawStats::Path() != nullptr && !skip_draw && state.depth_info.desc.info.data.address != 0 &&
+	                        state.depth_info.depth_write_enable;
+	// KYTY_ENC_OFFLOAD: the draw part follows the bindings part (BeginRendering settled it if it
+	// recorded anything).
+	OffloadJob* offload_d = nullptr;
+	if (offload_b != nullptr) [[unlikely]] {
+		if (draw_label || skip_draw || draw_stats || mesh_active || mesh_indirect || indirect != nullptr ||
+		    instance_record) {
+			m_offload->misses[static_cast<size_t>(OffloadMiss::DrawDiag)]++;
+		} else {
+			offload_d            = OffloadAcquire(buffer);
+			offload_d->draw_part = true;
+			offload_d->layout    = pipeline.pipeline_layout;
+			offload_d->pipeline  = pipeline.pipeline;
+			const auto flags     = CommandBuffer::EncodeFlags();
+			const auto bound     = buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics);
+			offload_d->bind      = !(flags.renderer_batch && bound == pipeline.pipeline);
+			offload_d->clip_bytes = 0;
+			if (const auto planes = state.vertex_info[0].user_clip_planes; planes != 0) {
+				uint32_t count = 0;
+				for (uint32_t mask = planes; mask != 0; mask >>= 1u) {
+					count++;
+				}
+				offload_d->clip_stages = vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex;
+				offload_d->clip_bytes  = count * 4u * sizeof(uint32_t);
+				offload_d->clip        = buffer.GetRegisters().GetUserClipPlanes();
+			}
+			offload_d->objprim = state.ps_active && state.ps_input_info.HasObjprimOutput();
+			if (offload_d->objprim) {
+				vk::ShaderStageFlags objprim_stages = vk::ShaderStageFlagBits::eFragment;
+				for (const auto& stage: vertex_stages) {
+					objprim_stages |= NativeShaderStage(stage.logical_stage);
+				}
+				offload_d->objprim_stages = objprim_stages;
+				offload_d->objprim_offset = uint32_t {state.ps_input_info.objprim_push_dword} * 4u;
+				offload_d->object_id      = buffer.GetUserConfig().GetObjectId();
+			}
+			if (m_segment_splice != nullptr && draw.IsIndexed()) {
+				const auto& spliced               = *m_segment_splice;
+				offload_d->direct                 = {};
+				offload_d->direct.indexed         = true;
+				offload_d->direct.count           = spliced.index_count;
+				offload_d->direct.instance_count  = spliced.instance_count;
+				offload_d->direct.vertex_offset   = spliced.vertex_offset;
+				offload_d->direct.first_instance  = spliced.first_instance;
+				if (!offload_d->verify) {
+					DrawPrep::SegmentCounters().spliced.fetch_add(1, std::memory_order_relaxed);
+				}
+			} else {
+				offload_d->direct = MakeDirectDraw(ucfg, draw, emit);
+			}
+			if (!offload_d->verify) {
+				// What the inline bind leaves behind, decided here (the commit thread owns these).
+				if (CommitStats::Enabled() && offload_d->bind) [[unlikely]] {
+					CommitStats::AddItems(CommitStats::Item::PipelineNew, 1);
+				}
+				(void)buffer.EncodeShadowUnsettled().TakePipelineBind(flags, vk::PipelineBindPoint::eGraphics,
+				                                                      pipeline.pipeline);
+				m_dynamic_state.command  = vk_buffer.Identity();
+				m_dynamic_state.pipeline = pipeline.pipeline;
+				if (state.color_count == 0) {
+					m_dynamic_state.color_write_valid = false;
+				}
+				m_offload->draws++;
+			}
+			OffloadPost(offload_d, buffer);
+		}
+	}
+	const bool  inline_d      = offload_d == nullptr || offload_d->verify;
+	const auto* verify_ring_d = offload_d != nullptr ? buffer.EncoderRing() : nullptr;
+	const auto  verify_from_d = verify_ring_d != nullptr ? verify_ring_d->WritePosition() : 0;
+	if (inline_d) {
 	{
 		const CommitStats::SubScope bind_scope(CommitStats::Sub::BindPipeline);
 		if (CommitStats::Enabled() &&
@@ -6894,8 +7349,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        sizeof(object_id), &object_id);
 		buffer.InvalidatePushConstants();
 	}
-	// Vulkan debug labels (--rd / KYTY_TRACE_VK_LABELS): the draw's shaders and game pass.
-	const bool draw_label = PassCensus::LabelsEnabled();
 	if (draw_label) {
 		char text[256];
 		PassCensus::LabelText(text, sizeof(text), 'd',
@@ -6905,16 +7358,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                          : 0);
 		vk_buffer.insertDebugLabel(text);
 	}
-	// KYTY_DRAW_SKIP_VS / KYTY_DRAW_SKIP_PS (diagnostic, live, default off): draws with one of these
-	// programs record their state but emit no draw command (to see which object a draw renders).
-	const bool skip_draw =
-	    (g_draw_skip_vs.Get() != 0 && state.vertex_info[0].stage.program != nullptr &&
-	     g_draw_skip_vs_set.Contains(state.vertex_info[0].stage.program->shader_hash)) ||
-	    (g_draw_skip_ps.Get() != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
-	     g_draw_skip_ps_set.Contains(state.ps_input_info.stage.program->shader_hash));
 	uint32_t stats_query = UINT32_MAX;
-	if (DrawStats::Path() != nullptr && !skip_draw && state.depth_info.desc.info.data.address != 0 &&
-	    state.depth_info.depth_write_enable) [[unlikely]] {
+	if (draw_stats) [[unlikely]] {
 		DrawStats::Pending p;
 		p.frame          = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 		p.flags          = (indirect != nullptr ? 1u : 0u) | (mesh_active ? 2u : 0u) | (mesh_indirect ? 4u : 0u) |
@@ -7009,6 +7454,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	DrawStats::End(vk_buffer, stats_query);
 	draw_cmd_scope.Stop();
+	}
+	if (offload_d != nullptr && offload_d->verify) {
+		OffloadVerifyPart(offload_d, buffer, verify_ring_d, verify_from_d);
+	}
 	// KYTY_DRAW_PEEK (above): the draw's per-draw block and indirect arguments, after it.
 	if (const auto peek_hash = DrawPeekRequest()[0];
 	    peek_hash != 0 && state.vertex_info[0].stage.program != nullptr &&

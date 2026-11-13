@@ -849,6 +849,11 @@ void Ring::WakeConsumer() noexcept {
 // Encoder
 
 Encoder::Writer Encoder::Open(Op op, uint64_t payload, bool barrier) {
+	if (m_open_hook != nullptr) [[unlikely]] {
+		const auto hook = m_open_hook;
+		m_open_hook     = nullptr;
+		hook(m_open_hook_context);
+	}
 	const bool     site   = m_options.all_sites || (barrier && m_options.barrier_sites);
 	const bool     verify = m_options.verify;
 	const uint64_t bytes  = sizeof(Header) + (site ? sizeof(SiteBlock) : 0u) +
@@ -900,6 +905,43 @@ void Encoder::Close(Writer& writer, uint64_t hash) {
 		m_ring.Publish();
 		m_options.after_commit(m_options.after_commit_context);
 	}
+}
+
+uint64_t Encoder::Splice(Ring& source, uint64_t end) {
+	uint64_t appended = 0;
+	while (source.ReadPosition() < end) {
+		const auto* header = source.Peek();
+		EXIT_IF(header == nullptr || header->size == 0);
+		const auto bytes = header->size;
+		if (header->op != Op::Wrap) {
+			auto* base = m_ring.Reserve(bytes, m_options.policy, m_stats);
+			std::memcpy(base, header, bytes);
+			const auto* out = reinterpret_cast<Header*>(base);
+			if ((out->flags & FlagVerify) != 0) {
+				const uint32_t offset = sizeof(Header) + ((out->flags & FlagSite) != 0 ? sizeof(SiteBlock) : 0u);
+				auto*          verify = reinterpret_cast<VerifyBlock*>(base + offset);
+				verify->sequence      = ++m_sequence;
+				m_cb_digest           = FoldDigest(m_cb_digest, out->op, verify->hash);
+				m_cb_packets++;
+			}
+			m_packets++;
+			m_bytes += bytes;
+			appended += bytes;
+			const auto op = out->op;
+			m_ring.Commit(bytes);
+			if (KicksConsumer(op)) {
+				m_ring.Kick(m_stats);
+			}
+			if (m_options.after_commit != nullptr) {
+				m_ring.Publish();
+				m_options.after_commit(m_options.after_commit_context);
+			}
+		}
+		source.Advance(bytes);
+	}
+	WaitStats stats;
+	source.Release(stats);
+	return appended;
 }
 
 void Encoder::Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns) {
