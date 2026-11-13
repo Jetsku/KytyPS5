@@ -5,6 +5,9 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -454,6 +457,45 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 	}
 }
 
+// A pixel shader may read an attribute past the interpolants the draw declares
+// (SPI_PS_INPUT_CNTL count). The hardware returns whatever the parameter cache holds, not a fault;
+// EA SPORTS UFC 5 does this in a menu shader. Such reads become zero (KYTY_PS_INPUT_OOR_ZERO,
+// default on; =0 keeps the fatal check).
+void ZeroOutOfRangePixelInputs(Program& program, ShaderStageInputInfo input_info) {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PS_INPUT_OOR_ZERO");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!enabled || program.stage != ShaderType::Pixel || input_info.pixel == nullptr) {
+		return;
+	}
+	const uint32_t count    = input_info.pixel->input_num;
+	uint32_t       replaced = 0;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op != ValueOpcode::GetAttribute && op != ValueOpcode::GetAttributeF16 &&
+			    op != ValueOpcode::GetInterpolationParameter) {
+				continue;
+			}
+			if (!inst.Arg(0).IsImmediate() || inst.Arg(0).GetType() != Type::U32 ||
+			    inst.Arg(0).U32() < count) {
+				continue;
+			}
+			inst.ReplaceUsesWith(op == ValueOpcode::GetAttributeF16 ? Value::F32(0.0f)
+			                                                        : Value(uint32_t {0}));
+			replaced++;
+		}
+	}
+	if (replaced != 0) {
+		static std::atomic_uint32_t logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Shader: %u pixel input read(s) beyond the %u declared inputs read as zero\n",
+			            replaced, count);
+		}
+	}
+}
+
 } // namespace
 
 void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
@@ -462,6 +504,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		                                                : "shader info already collected");
 	}
 	ValidateOptions(program, input_info);
+	ZeroOutOfRangePixelInputs(program, input_info);
 	ValidateValueReferences(program, input_info);
 
 	auto& next = program.info;
