@@ -188,9 +188,13 @@ namespace Detail {
 [[nodiscard]] bool ReadEnabled();
 [[nodiscard]] bool ReadIndirectOnly();
 [[nodiscard]] bool ReadSteps();
+[[nodiscard]] bool StepsLive();
 void               StepAt(Step step);
 } // namespace Detail
 
+// KYTY_CP_COMMIT_STEPS=1 (live, default 0; with KYTY_CP_COMMIT_STATS set): the steps of
+// KYTY_CP_COMMIT_STATS=steps, switched in a running boot (same-boot comparison of the class costs
+// with and without the step boundaries' own cost).
 [[nodiscard]] inline bool StepsEnabled() {
 #if !KYTY_CP_DIAGNOSTICS
 	return false;
@@ -199,7 +203,7 @@ void               StepAt(Step step);
 	const auto steps = static_cast<bool>(Common::Once(steps_once, [&] {
 		return Detail::ReadSteps();
 	}));
-	return steps;
+	return steps || Detail::StepsLive();
 }
 
 // A step boundary (GPU thread): the time since the previous boundary belongs to `step`.
@@ -233,6 +237,27 @@ inline void StepMark(Step step) {
 	return indirect;
 }
 
+// KYTY_CONT_KERNEL's decision for the draw (DrawIndex): switched off or not a DrawIndex, its entry
+// test failed, the kernel declined (normal path from the start), took it, or left it late.
+enum class KernelOutcome : uint8_t { Off, NoEntry, Declined, Taken, Left };
+// KYTY_DRAW_RUN's candidate check for the draw (DrawRunCandidate): not reached, or its first failing
+// condition (no record, key, activity, command buffer/tick, rendering instance, validation, programs,
+// writes over the run, pipeline-swap incompatible), or continued.
+enum class CandidateOutcome : uint8_t {
+	NotReached,
+	NoRecord,
+	Key,
+	Activity,
+	Command,
+	Instance,
+	Validation,
+	Programs,
+	Writes,
+	SwapIncompatible,
+	Continued,
+	Count
+};
+
 // What one recorded draw bound, for the classification (hashes; 0 where not applicable).
 struct DrawShape {
 	uint64_t rendering_serial = 0; // CommandBuffer::ActiveRenderingSerial after BeginRendering
@@ -247,8 +272,16 @@ struct DrawShape {
 	uint64_t vertex           = 0; // vertex buffer handles, offsets, sizes
 	uint64_t bind_input       = 0; // cross-frame: complete binding inputs
 	uint64_t struct_input     = 0; // cross-frame: structure only
+	// The parts of `structure`, for the change classes (StartPhases/Steps reasons, ChangeMasks).
+	uint64_t programs         = 0; // every stage's program
+	uint64_t textures         = 0; // texture views, layouts and mip views
+	uint64_t samplers         = 0; // sampler handles
+	uint64_t attachments      = 0; // colour/depth attachment views and layouts
 	bool     shader_writes    = false;
 	bool     run_continued    = false; // KYTY_DRAW_RUN continued the previous draw's run
+	KernelOutcome kernel      = KernelOutcome::Off;
+	CandidateOutcome candidate = CandidateOutcome::NotReached;
+	uint8_t prev_inelig = 0; // the previous draw's DrawRun::KeyDiag::Inelig (why it left no record)
 };
 
 // GPU thread (the command processor's resolver), around DrawPrep::Engine::Commit.

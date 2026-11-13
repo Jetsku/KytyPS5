@@ -1277,6 +1277,15 @@ if(LINUX)
 	target_link_libraries(draw_prep_tests Threads::Threads)
 endif()
 
+# KYTY_CP_COMMIT_STATS change classes (drawPrep/changeClass.h).
+add_executable(change_class_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ChangeClassTests.cpp")
+target_include_directories(change_class_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+# KYTY_DRAW_RUN_TEXDELTA key split and record marks (drawPrep/texDelta.h).
+add_executable(tex_delta_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TexDeltaTests.cpp")
+target_include_directories(tex_delta_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_link_libraries(tex_delta_tests xxhash)
+
 add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AmprCounterBankTests.cpp"
 )
@@ -1496,6 +1505,8 @@ if(BUILD_TESTING)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME ampr_order COMMAND $<TARGET_FILE:ampr_order_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
+	add_test(NAME change_class COMMAND $<TARGET_FILE:change_class_tests>)
+	add_test(NAME tex_delta COMMAND $<TARGET_FILE:tex_delta_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
 	add_test(NAME guest_tsc COMMAND $<TARGET_FILE:guest_tsc_tests>)
 	add_test(NAME gpu_write_ranges COMMAND $<TARGET_FILE:gpu_write_ranges_tests>)
