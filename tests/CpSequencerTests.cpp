@@ -8,6 +8,7 @@
 
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
+#include "graphics/guest_gpu/command_processor/submitDefer.h"
 #include "graphics/host_gpu/gpuTouchedPages.h"
 
 #include <array>
@@ -334,6 +335,71 @@ void TestSnapshotRing() {
 	Check(ordered, "snapshots arrive intact and in order");
 }
 
+// KYTY_PASS_SUBMIT_DEFER (submitDefer.h): optional submissions and slice yields inside a
+// rendering instance wait for its end; a graphics submission that completes inside one is carried
+// to the next graphics slice; nothing deferred is ever dropped.
+void TestSubmitDefer() {
+	namespace D = SubmitDefer;
+	{
+		D::State s;
+		Check(!D::Defer(s, true, false, false), "defer: no instance, submit now");
+		Check(!D::Defer(s, false, true, false), "defer: switch off, submit now");
+		Check(!D::Defer(s, false, true, true), "defer: switch off, yield now");
+		Check(!s.submit && !s.yield, "defer: nothing pending after immediate requests");
+	}
+	{
+		D::State s;
+		Check(D::Defer(s, true, true, false), "defer: optional submit inside an instance waits");
+		auto take = D::AtBoundary(s, true);
+		Check(!take.submit && !take.yield, "defer: still inside the instance, nothing due");
+		take = D::AtBoundary(s, false);
+		Check(take.submit && !take.yield, "defer: due at the first boundary outside the instance");
+		D::Submitted(s);
+		take = D::AtBoundary(s, false);
+		Check(!take.submit && !take.yield, "defer: a submission clears the deferred one");
+	}
+	{
+		D::State s;
+		Check(D::Defer(s, true, true, true), "yield: slice yield inside an instance waits");
+		auto take = D::AtBoundary(s, false);
+		Check(take.yield && !take.submit, "yield: due outside the instance");
+		take = D::AtBoundary(s, false);
+		Check(!take.yield, "yield: taken once");
+		Check(D::Defer(s, true, true, true), "yield: deferred again");
+		D::SliceStart(s, 7);
+		Check(!D::AtBoundary(s, false).yield, "yield: a new slice drops the old slice's yield");
+	}
+	{
+		D::State s;
+		Check(!D::Carry(s, true, false, 5), "carry: no instance, the submission ends normally");
+		Check(!D::Carry(s, false, true, 5), "carry: switch off, the submission ends normally");
+		Check(!D::CarryPending(s, 5), "carry: nothing carried");
+		Check(D::Carry(s, true, true, 5), "carry: completed inside an instance, recording kept");
+		Check(D::CarryPending(s, 5), "carry: pending while the recording is unsubmitted");
+		D::SliceStart(s, 5);
+		auto take = D::AtBoundary(s, true);
+		Check(!take.submit, "carry: next slice continues the instance");
+		take = D::AtBoundary(s, false);
+		Check(take.submit, "carry: next slice submits it outside the instance");
+		D::Submitted(s);
+		Check(!D::CarryPending(s, 6), "carry: submitted");
+	}
+	{
+		D::State s;
+		Check(D::Carry(s, true, true, 9), "carry: kept");
+		Check(!D::CarryPending(s, 10), "carry: another queue's submission took the recording");
+		D::SliceStart(s, 10);
+		Check(!D::AtBoundary(s, false).submit, "carry: nothing left to submit after it was taken");
+	}
+	{
+		// Switching the live switch off never strands deferred work.
+		D::State s;
+		Check(D::Defer(s, true, true, false) && D::Carry(s, true, true, 3), "live off: deferred");
+		Check(!D::Defer(s, false, true, false), "live off: new requests submit now");
+		Check(D::CarryPending(s, 3) && D::AtBoundary(s, false).submit, "live off: old work still due");
+	}
+}
+
 } // namespace
 
 int main() {
@@ -343,6 +409,7 @@ int main() {
 	TestThreaded();
 	TestTouchedPages();
 	TestSnapshotRing();
+	TestSubmitDefer();
 	if (g_failures != 0) {
 		std::printf("cp sequencer tests: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;
