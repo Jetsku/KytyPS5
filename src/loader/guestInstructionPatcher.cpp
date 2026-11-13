@@ -14,6 +14,7 @@
 #include <array>
 #include <bitset>
 #include <climits>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1740,8 +1741,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	// 252 MB eboot.bin took ~9 s at boot on one emulated core. Scan the functions on several
 	// threads first. The functions with rewrite sites are then decoded again and patched in address
 	// order on this thread, exactly as a single-threaded pass does: patching a function writes only
-	// inside that function and the module's trampolines, so the scan sees the same code bytes, and
-	// the other functions only add to the counters.
+	// inside that function and the module's trampolines, so the scan and the second decode see the
+	// same code bytes, and the other functions only add to the counters.
 	const size_t forced_threads = g_patch_scan_threads.load();
 	const size_t scan_threads =
 	    forced_threads != 0 ? forced_threads
@@ -1788,8 +1789,73 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			                            scan_sites[worker].end());
 		}
 		std::ranges::sort(functions_with_sites);
-		for (const size_t function_index: functions_with_sites) {
-			patch(function_index);
+		// Decoding them again on this thread took as long as the whole scan (Astro Bot: 4643 large
+		// functions, 1.26 s). The workers decode them again, at most Window functions ahead of this
+		// thread, which patches them in address order as before; a decoded function holds about
+		// 1 KiB per instruction, so the window bounds the memory.
+		struct DecodedSites {
+			GuestInstructionPatchResult             counts {};
+			DecodedFunction                         function;
+			std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+			bool                                    ready = false;
+		};
+		constexpr size_t                   Window = 64;
+		std::vector<DecodedSites>          decoded(Window);
+		std::mutex                         decoded_mutex;
+		std::condition_variable            decoded_changed;
+		size_t                             next_decode = 0;
+		size_t                             patched     = 0;
+		const auto                         decode      = [&] {
+			for (;;) {
+				size_t site_index = 0;
+				{
+					std::unique_lock decoded_lock(decoded_mutex);
+					decoded_changed.wait(decoded_lock, [&] {
+						return next_decode >= functions_with_sites.size() ||
+						       next_decode < patched + Window;
+					});
+					if (next_decode >= functions_with_sites.size()) {
+						return;
+					}
+					site_index = next_decode++;
+				}
+				auto& slot = decoded[site_index % Window];
+				// The previous function of this slot is freed here, not on the patching thread:
+				// freeing a decode another thread allocated cost it 0.9 s for Astro Bot.
+				slot = DecodedSites {};
+				analyze(functions_with_sites[site_index], slot.counts, slot.function,
+				        slot.rewrite_sites);
+				{
+					std::lock_guard decoded_lock(decoded_mutex);
+					slot.ready = true;
+				}
+				decoded_changed.notify_all();
+			}
+		};
+		workers.clear();
+		for (size_t worker = 1; worker < scan_threads; ++worker) {
+			workers.emplace_back(decode);
+		}
+		for (size_t site_index = 0; site_index < functions_with_sites.size(); ++site_index) {
+			auto& slot = decoded[site_index % Window];
+			{
+				std::unique_lock decoded_lock(decoded_mutex);
+				decoded_changed.wait(decoded_lock, [&] { return slot.ready; });
+			}
+			AddPatchCounts(result, slot.counts);
+			RejectionMap rejections;
+			RelocateGuestInstructions(module, slot.function, slot.rewrite_sites, rejections, result);
+			TrapUnrelocatedInstructions(*module, slot.function, slot.rewrite_sites, rejections,
+			                            result);
+			{
+				std::lock_guard decoded_lock(decoded_mutex);
+				slot.ready = false;
+				patched    = site_index + 1;
+			}
+			decoded_changed.notify_all();
+		}
+		for (auto& worker: workers) {
+			worker.join();
 		}
 	}
 	const auto trampoline_addr =
