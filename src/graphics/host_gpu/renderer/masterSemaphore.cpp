@@ -1,3 +1,7 @@
+#include <fmt/format.h>
+#include <mutex>
+#include <map>
+#include <chrono>
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
@@ -111,7 +115,38 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                         HangWatchdog::Enabled() ? CurrentTick() : 0);
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	const auto wait_start = std::chrono::steady_clock::now();
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	{
+		// KYTY_GPU_WAIT_STATS=1: every 5 s, the waits on the GPU timeline by reason and thread kind.
+		static const bool wait_stats = [] {
+			const char* v = std::getenv("KYTY_GPU_WAIT_STATS");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (wait_stats) {
+			static std::mutex                                      stats_mutex;
+			static std::map<std::pair<int, uint32_t>, std::pair<uint64_t, uint64_t>> stats;
+			static auto                                            last = std::chrono::steady_clock::now();
+			const auto now = std::chrono::steady_clock::now();
+			const auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(now - wait_start).count();
+			const int  gpu_thread = GuestGpu::IsGpuThread() ? 1 : 0;
+			std::scoped_lock lock(stats_mutex);
+			auto& entry = stats[{gpu_thread, static_cast<uint32_t>(Profiler::CurrentGpuWaitReason())}];
+			entry.first++;
+			entry.second += static_cast<uint64_t>(ns);
+			if (now - last > std::chrono::seconds(5)) {
+				const double secs = std::chrono::duration<double>(now - last).count();
+				std::string text = fmt::format("GpuWaitStats {:.1f}s:", secs);
+				for (const auto& [key, value]: stats) {
+					text += fmt::format(" [{} reason {}: {} waits {:.1f} ms]", key.first ? "GPU" : "other",
+					                    key.second, value.first, value.second / 1e6);
+				}
+				std::printf("%s\n", text.c_str());
+				stats.clear();
+				last = now;
+			}
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		HangWatchdog::Scope error("master-wait-error",
 		                          reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
