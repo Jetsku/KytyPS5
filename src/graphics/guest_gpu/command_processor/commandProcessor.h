@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/guest_gpu/command_processor/submitDefer.h"
 
 #include <cstdint>
 #include <deque>
@@ -147,6 +148,16 @@ public:
 	// Graphics queue: after KYTY_GFX_SLICE_DRAWS draws in a slice, end the slice after the
 	// current packet when another queue has runnable work. Call after recording a draw.
 	void            MaybeYieldSlice();
+	// KYTY_PASS_SUBMIT_DEFER (default on): a submission ends the active rendering instance, and
+	// the next draw on the same targets begins a new one that reloads every attachment. Optional
+	// submissions (end-of-pipe batches, slice yields) requested inside an instance are deferred to
+	// the first op or packet boundary outside one (TakeDeferredSubmit); a graphics submission that
+	// ends inside an instance leaves its recording open for the next graphics slice (CarrySubmit).
+	[[nodiscard]] bool DeferInRendering(bool yield);
+	void               TakeDeferredSubmit(Pm4Execution& execution);
+	[[nodiscard]] bool CarrySubmit();
+	[[nodiscard]] bool CarryPending();
+	void               FlushCarry();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -497,6 +508,8 @@ private:
 	uint32_t  m_idle_flush_draws            = 0;
 	// Draws recorded in the current graphics slice (MaybeYieldSlice).
 	uint32_t  m_slice_draws                 = 0;
+	// KYTY_PASS_SUBMIT_DEFER: deferred submission, slice yield and carried recording.
+	SubmitDefer::State m_submit_defer;
 
 	struct DrawPrepDeleter {
 		void operator()(DrawPrep::Engine* engine) const noexcept;

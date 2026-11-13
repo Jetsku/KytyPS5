@@ -21,6 +21,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__linux__)
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -70,6 +74,70 @@ void TestServicePriority() {
 	                                       : THREAD_PRIORITY_NORMAL;
 	Check(cp == cp_want, "CP priority unchanged");
 	std::printf("  service priority: level %d -> %d, CP -> %d\n", expected, service, cp);
+#elif defined(__linux__)
+	// The raised threads request a 0.1 ms slice and a full minimum utilization clamp; the policy
+	// and nice value stay. A probe thread finds out what this kernel accepts (custom
+	// slices: 6.12+).
+	struct Attr {
+		uint32_t size, policy;
+		uint64_t flags;
+		int32_t  nice;
+		uint32_t priority;
+		uint64_t runtime, deadline, period;
+		uint32_t util_min, util_max;
+	};
+	const auto get = [] {
+		Attr attr {};
+		Check(syscall(SYS_sched_getattr, 0, &attr, sizeof(attr), 0) == 0, "sched_getattr");
+		return attr;
+	};
+	Attr plain {};
+	Attr probe {};
+	std::thread([&] {
+		plain            = get();
+		Attr request     = plain;
+		request.size     = sizeof(request);
+		request.runtime  = 100000;
+		request.flags    = 0x20; // SCHED_FLAG_UTIL_CLAMP_MIN
+		request.util_min = 1024;
+		if (syscall(SYS_sched_setattr, 0, &request, 0) != 0) {
+			request.flags = 0;
+			(void)syscall(SYS_sched_setattr, 0, &request, 0);
+		}
+		probe = get();
+	}).join();
+	const bool slices = probe.runtime == 100000;
+	const bool clamps = probe.util_min == 1024;
+	const auto check  = [&](const Attr& attr, int level, const char* what, int32_t nice) {
+		Check(attr.policy == SCHED_OTHER && attr.nice == nice, what);
+		Check(attr.runtime == (level != 0 && slices ? 100000 : plain.runtime), what);
+		Check(attr.util_min == (level != 0 && clamps ? 1024 : plain.util_min), what);
+	};
+	Attr service {};
+	Attr cp {};
+	std::thread([&] {
+		Common::RaiseServiceThreadPriority();
+		service = get();
+	}).join();
+	Attr child {};
+	std::thread([&] {
+		Common::RaiseCurrentThreadPriority();
+		cp = get();
+		std::thread([&] { child = get(); }).join();
+	}).join();
+	const auto* cp_env = std::getenv("KYTY_CP_PRIORITY");
+	const int   cp_level =
+	    cp_env != nullptr && cp_env[0] >= '0' && cp_env[0] <= '2' ? cp_env[0] - '0' : 1;
+	check(service, expected, "service thread scheduling attributes", plain.nice);
+	check(cp, cp_level, "CP thread scheduling attributes", plain.nice);
+	// Children start with the defaults; at a negative nice they inherit, nice included.
+	check(child, plain.nice < 0 ? cp_level : 0, "a raised thread's child scheduling attributes",
+	      plain.nice);
+	std::printf("  service priority: level %d -> slice %" PRIu64
+	            " ns, util_min %u; CP level %d -> slice %" PRIu64
+	            " ns, util_min %u (kernel: slices %d, clamps %d)\n",
+	            expected, service.runtime, service.util_min, cp_level, cp.runtime, cp.util_min,
+	            slices, clamps);
 #endif
 }
 

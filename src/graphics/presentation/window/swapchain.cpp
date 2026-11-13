@@ -593,6 +593,10 @@ void Swapchain::Destroy() {
 		graphics.submission_queue.DrainPendingLocked();
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
+	if (graphics.present_queue != nullptr) {
+		Common::LockGuard present_lock(graphics.present_queue_mutex);
+		RequireVulkanSuccess(graphics.present_queue.waitIdle(), "wait for present queue");
+	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -1196,13 +1200,21 @@ Swapchain::Status Swapchain::Present() {
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
 
-	vk::Result result;
+	auto&      graphics = m_window.graphic_ctx;
+	vk::Result result   = vk::Result::eSuccess;
 	{
 		// The blit this present waits for goes ahead of game batches still waiting for their
 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		Common::LockGuard lock(graphics.queue_mutex);
+		graphics.submission_queue.DrainReadyForPresentLocked();
+		if (graphics.present_queue == nullptr) {
+			result = graphics.queue.presentKHR(&present);
+		}
+	}
+	if (graphics.present_queue != nullptr) {
+		// The blit's signal was submitted above; game submissions go on while this blocks.
+		Common::LockGuard lock(graphics.present_queue_mutex);
+		result = graphics.present_queue.presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

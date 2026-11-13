@@ -117,6 +117,10 @@ public:
 	[[nodiscard]] HW::Shader* BoundShaders() const noexcept { return m_command.m_shaders; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	// The current recording has an active rendering instance (a submission now would end it).
+	[[nodiscard]] bool InRendering() const {
+		return !m_command.IsInvalid() && m_command.ActiveRenderingSerial() != 0;
+	}
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }

@@ -868,8 +868,44 @@ static bool OptionalSubmitAllowed() {
 	return false;
 }
 
+// KYTY_PASS_SUBMIT_DEFER (default on; =0 submits as before). Live switch: it only decides
+// whether a submission is deferred; a deferred one is always taken (commandProcessor.h).
+static Live::Switch g_pass_submit_defer("KYTY_PASS_SUBMIT_DEFER", Live::ParseDefaultOn);
+
+bool CommandProcessor::DeferInRendering(bool yield) {
+	return SubmitDefer::Defer(m_submit_defer, g_pass_submit_defer.On(), GetScheduler().InRendering(),
+	                          yield);
+}
+
+void CommandProcessor::TakeDeferredSubmit(Pm4Execution& execution) {
+	const auto take = SubmitDefer::AtBoundary(m_submit_defer, GetScheduler().InRendering());
+	if (take.yield) {
+		execution.m_yield = true; // the slice end submits
+	}
+	if (take.submit) {
+		BufferFlush();
+	}
+}
+
+bool CommandProcessor::CarrySubmit() {
+	return SubmitDefer::Carry(m_submit_defer, g_pass_submit_defer.On(), GetScheduler().InRendering(),
+	                          GetScheduler().CurrentTick());
+}
+
+bool CommandProcessor::CarryPending() {
+	// False once another queue's submission took the carried recording.
+	return SubmitDefer::CarryPending(m_submit_defer, GetScheduler().CurrentTick());
+}
+
+void CommandProcessor::FlushCarry() {
+	if (CarryPending()) {
+		BufferFlush();
+	}
+}
+
 void CommandProcessor::BufferFlush() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	SubmitDefer::Submitted(m_submit_defer);
 	m_deferred_eop_flushes     = 0;
 	m_packets_since_eop_request = 0;
 	if (SubmitMinIntervalNs() != 0) {
@@ -922,7 +958,8 @@ uint32_t CommandProcessor::EopFlushPacketLimit() {
 }
 
 void CommandProcessor::BufferFlushForEop() {
-	if (++m_deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed()) {
+	if (++m_deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed() &&
+	    !DeferInRendering(false)) {
 		BufferFlush();
 	}
 }
@@ -1014,6 +1051,9 @@ void CommandProcessor::MaybeYieldSlice() {
 		return;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GfxSliceYields);
+	if (DeferInRendering(true)) {
+		return;
+	}
 	g_current_execution->m_yield = true;
 }
 
@@ -1536,7 +1576,7 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
-/// Body of the GPU thread. Raises the thread's host priority on Windows, then takes queued commands
+/// Body of the GPU thread. Raises the thread's host priority, then takes queued commands
 /// and submissions one at a time and runs them until the GPU is told to stop.
 /// @param data the GuestGpu that owns the queues
 void GuestGpu::ThreadRun(void* data) {
@@ -1570,6 +1610,13 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (gpu->m_gfx_cp->CarryPending()) {
+					// Nothing will continue the carried instance now: submit it before waiting.
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_gfx_cp->FlushCarry();
+					gpu->m_queue_mutex.Lock();
+					continue;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
@@ -1619,6 +1666,13 @@ void GuestGpu::ThreadRun(void* data) {
 				if (fence_held && selected_queue >= 0) {
 					// The fence changed which queue runs next.
 					Profiler::CountFrameEvent(Profiler::FrameEvent::FrameFenceHolds);
+				}
+				if (selected_queue < 0 && gpu->m_gfx_cp->CarryPending()) {
+					// Every queue waits (possibly for the carried work): submit it first.
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_gfx_cp->FlushCarry();
+					gpu->m_queue_mutex.Lock();
+					continue;
 				}
 				if (selected_queue < 0) {
 					HangWatchdog::Scope suspended("cp-all-queues-suspended",
@@ -1833,6 +1887,9 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
+			// A carried graphics recording goes out first: this queue's first dispatch would end
+			// its instance anyway, and the compute work keeps a command buffer of its own.
+			m_gfx_cp->FlushCarry();
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			submission.slice_progress = submission.command_execution.MadeProgress();
@@ -1947,6 +2004,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	const bool progressed = submission.command_execution.MadeProgress();
 	if (submission.type == SubmissionType::FlipPreparation) {
 		submission.slice_progress = complete;
+		cp.FlushCarry();
 		if (complete) {
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
@@ -1958,9 +2016,17 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		if (complete) {
 			m_renderer.RunGarbageCollector();
 		}
-		cp.BufferFlush();
-	} else if (complete) {
-		m_renderer.RunGarbageCollector();
+		// A submission that ends inside a rendering instance leaves its recording open for the
+		// next graphics slice, which usually continues the instance (CarrySubmit).
+		if (!complete || !cp.CarrySubmit()) {
+			cp.BufferFlush();
+		}
+	} else {
+		if (complete) {
+			m_renderer.RunGarbageCollector();
+		}
+		// This slice could not continue a carried instance (it waits): submit the carried work.
+		cp.FlushCarry();
 	}
 	return complete;
 }
@@ -1993,6 +2059,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_yield         = false;
 	execution.m_yielded       = false;
 	m_slice_draws             = 0;
+	m_submit_defer.yield      = false; // a deferred yield belongs to its own slice
 	// The draw-prep packet hook, decided once per slice instead of per packet: with draw prep on
 	// it is on for the process (PacketHookEnabled); only the Tracy-gated fence histogram of draw
 	// prep off can change, and it now follows a connection at the next slice.
@@ -2256,9 +2323,13 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	            guest_packet);
 	TrackAdoptPacket(packet, packet_dw, guest_packet);
 	if (!reference && !sequencer && m_deferred_eop_flushes != 0 &&
-	    ++m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
+	    ++m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed() &&
+	    !DeferInRendering(false)) {
 		// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
 		BufferFlush();
+	}
+	if (!reference && !sequencer) {
+		TakeDeferredSubmit(execution);
 	}
 	if (!execution.m_next_buffer.empty()) {
 		// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
@@ -3253,13 +3324,12 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
 		return {};
 	}
-	if (!m_flip_wait_suspended) {
-		// First evaluation of this packet: submit everything recorded before it (as the
-		// blocking form did); retries have nothing new to submit.
-		BufferFlush();
-	}
 	if (m_renderer.GetVideoOut().IsFlipPending(handle, index)) {
 		if (!m_flip_wait_suspended) {
+			// The queue suspends: submit everything recorded before this packet first, so the GPU
+			// runs it meanwhile; retries have nothing new to submit. A flip already done needs no
+			// submission (it would only end the active rendering instance).
+			BufferFlush();
 			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
 		}
 		m_flip_wait_suspended = true;
@@ -5743,6 +5813,8 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	execution.m_yielded       = false;
 	execution.m_stream_id     = submission;
 	m_slice_draws             = 0;
+	// A carried recording is submitted at this slice's first op boundary outside an instance.
+	SubmitDefer::SliceStart(m_submit_defer, GetScheduler().CurrentTick());
 	struct Scope {
 		Scope(CommandProcessor& processor, Pm4Execution& execution)
 		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
@@ -5791,8 +5863,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
 					break;
 				}
+				// Inside a rendering instance, ending the slice for runnable compute would split
+				// it (KYTY_PASS_SUBMIT_DEFER): wait for the front up to the 2 ms bound instead.
 				if (elapsed > 2'000'000u ||
-				    (g_gpu_state != nullptr && g_gpu_state->HasRunnableComputeWork())) {
+				    (g_gpu_state != nullptr && g_gpu_state->HasRunnableComputeWork() &&
+				     !(g_pass_submit_defer.On() && GetScheduler().InRendering()))) {
 					break;
 				}
 				std::this_thread::yield();
@@ -5856,6 +5931,12 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			execution.m_made_progress = true;
 			continue;
 		}
+		TakeDeferredSubmit(execution);
+		if (execution.m_yield) {
+			execution.m_yield   = false;
+			execution.m_yielded = true;
+			return Pm4ProcessResult::Blocked;
+		}
 		// Placement samples (common/cpuPlacement.h), every 256th op: this thread executes the
 		// graphics queue's packets, and ProcessPacket samples only where packets execute.
 		if ((++m_placement_packets & 255u) == 0u) {
@@ -5869,7 +5950,8 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			if (m_deferred_eop_flushes != 0) {
 				m_packets_since_eop_request +=
 				    static_cast<uint32_t>(std::min<uint64_t>(packet - m_resolver_packets, 1u << 20u));
-				if (m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
+				if (m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed() &&
+				    !DeferInRendering(false)) {
 					// Bound how long a batched end-of-pipe interrupt waits (at an op, not a packet).
 					BufferFlush();
 				}
