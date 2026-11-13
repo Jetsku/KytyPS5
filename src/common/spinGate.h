@@ -38,6 +38,10 @@
 //   long spin; the commit thread parks on the held head's state word (the worker's Complete wakes
 //   it; drawPrep/window.h); the resolver gives its processor to ready threads (SwitchToThread)
 //   between looks until its own 2 ms exit.
+// KYTY_SPIN_BUDGET_SITES (live, default 0x3F): which sites the closed gate caps (bit per Site:
+// 1 sequencer, 2 recorder, 4 commit-head, 8 recorder-drain, 16 resolver, 32 worker); the others
+// spin as with the gate open. KYTY_SPIN_BUDGET_SHORT_US and KYTY_SPIN_BUDGET_PIPE_SHORT_US
+// (sequencer and recorder; default: the same) are live too.
 // Always-on counters per site (waits, spin time, parks; cheap relaxed adds per wait, not per spin
 // iteration) and one "SpinBudget 10s" line every KYTY_SPIN_STATS_PERIOD_S (default 10, 0 = never)
 // with the gate state, the budget and the demand, also with every switch off.
