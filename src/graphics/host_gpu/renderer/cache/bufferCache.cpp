@@ -297,7 +297,20 @@ struct BufferCache::HostImportState {
 	};
 	std::unordered_map<uint64_t, Retry>    retry; // cache page -> back-off
 	std::array<uint64_t, ReasonCount>      fallback_pages {};
-	// Back-off for [begin, end) (cache pages) after a fallback or a failed import.
+	// Failed imports (cache page -> backing map generation at the failure). No timer: a failed
+	// page is retried only as a candidate again, after the backing map changed since its failure
+	// and then stayed unchanged for StableFrames frames (no map, unmap or remap in progress).
+	static constexpr uint64_t                 StableFrames = 30;
+	std::unordered_map<uint64_t, uint64_t>    failed_generation;
+	uint64_t                                  map_generation = 0;
+	uint64_t                                  map_stable_since = 0;
+	void Fail(uint64_t begin, uint64_t end) {
+		for (uint64_t page = begin >> 14u; page < (end >> 14u); ++page) {
+			failed_generation[page] = map_generation;
+		}
+	}
+	[[nodiscard]] bool MapStable() const { return frame - map_stable_since >= StableFrames; }
+	// Back-off for [begin, end) (cache pages) after a fallback.
 	void BackOff(uint64_t begin, uint64_t end) {
 		for (uint64_t page = begin >> 14u; page < (end >> 14u); ++page) {
 			auto& entry  = retry[page];
@@ -312,6 +325,7 @@ struct BufferCache::HostImportState {
 	uint64_t                               skipped_bytes       = 0;
 	uint64_t                               validated_structure = 0;
 	uint64_t                               validated_images    = UINT64_MAX;
+	uint64_t                               validated_map_generation = UINT64_MAX;
 	std::array<uint64_t, FailureCount>     failed_pages {};
 	uint64_t                               bound_reads         = 0;
 	uint64_t                               bound_bytes         = 0;
@@ -6346,7 +6360,9 @@ uint32_t BufferCache::HostImportPageReason(uint64_t page) {
 	if (!id || IsBufferInvalid(id)) {
 		return HostImportState::NoBuffer;
 	}
-	if (state.excluded.Intersects(guest, CACHING_PAGESIZE)) {
+	if (const auto failed = state.failed_generation.find(page);
+	    failed != state.failed_generation.end() &&
+	    (failed->second == state.map_generation || !state.MapStable())) {
 		return HostImportState::Failed;
 	}
 	if (const auto found = state.retry.find(page);
@@ -6383,7 +6399,7 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 				            LibKernel::Memory::GuestBackingAlias(run, 4096) != nullptr ? "yes" : "no");
 				std::fflush(stdout);
 			}
-			state.BackOff(run, run + CACHING_PAGESIZE);
+			state.Fail(run, run + CACHING_PAGESIZE);
 			state.failed_pages[HostImportState::NotDirect]++;
 			state.failures++;
 			run += CACHING_PAGESIZE;
@@ -6399,7 +6415,7 @@ bool BufferCache::HostImportTryRedirect(uint64_t begin, uint64_t end) {
 		if (HostImportRedirectRun(run, stop, first, failure)) {
 			any = true;
 		} else {
-			state.BackOff(run, stop);
+			state.Fail(run, stop);
 			state.failed_pages[failure] += (stop - run) >> CACHING_PAGEBITS;
 			state.failures += (stop - run) >> CACHING_PAGEBITS;
 		}
@@ -6448,6 +6464,7 @@ bool BufferCache::HostImportRedirectRun(uint64_t begin, uint64_t end, const uint
 	state.redirected.Add(begin, end - begin);
 	for (uint64_t page = begin >> CACHING_PAGEBITS; page < (end >> CACHING_PAGEBITS); ++page) {
 		state.page_import[page] = *index;
+		state.failed_generation.erase(page);
 	}
 	HostImportWriteEntries(begin >> CACHING_PAGEBITS, end >> CACHING_PAGEBITS, true);
 	return true;
@@ -6492,7 +6509,11 @@ void BufferCache::HostImportValidate() {
 	// a range-set query; images are queried only after one turned GPU-modified, and the alias
 	// only after the buffer structure or GPU mappings changed.
 	const auto structure    = m_bda_structure_epoch.load(std::memory_order_acquire);
-	const bool check_alias  = structure != state.validated_structure;
+	// The alias is re-checked whenever the buffer structure or the guest backing map moved (a
+	// remap does not necessarily register or drop a cache buffer).
+	const auto map_generation = LibKernel::Memory::GuestBackingMapGeneration();
+	const bool check_alias    = structure != state.validated_structure ||
+	                         map_generation != state.validated_map_generation;
 	const auto images       = m_texture_cache.GpuModifiedTransitions();
 	const bool check_images = images != state.validated_images;
 	const bool publications = m_backing_publication_count.load(std::memory_order_acquire) != 0;
@@ -6540,11 +6561,17 @@ void BufferCache::HostImportValidate() {
 	}
 	state.validated_structure = m_bda_structure_epoch.load(std::memory_order_acquire);
 	state.validated_images    = images;
+	state.validated_map_generation = map_generation;
 }
 
 void BufferCache::HostImportUpdate() {
 	auto& state = *m_host_import;
 	if (!state.usable) {
+		return;
+	}
+	// No import while the backing map changed during this frame (a map, unmap or remap in
+	// progress); failed pages additionally wait for StableFrames unchanged frames.
+	if (LibKernel::Memory::GuestBackingMapGeneration() != state.map_generation) {
 		return;
 	}
 	// Streaming candidates: the hot runs, and the logged ranges when this pass took the log.
@@ -6573,8 +6600,7 @@ void BufferCache::HostImportUpdate() {
 		begin = Common::AlignDown(begin, CACHING_PAGESIZE);
 		end   = Common::AlignUp(end, CACHING_PAGESIZE);
 		for (uint64_t page = begin; page < end; page += CACHING_PAGESIZE) {
-			if (state.redirected.Intersects(page, CACHING_PAGESIZE) ||
-			    state.excluded.Intersects(page, CACHING_PAGESIZE)) {
+			if (state.redirected.Intersects(page, CACHING_PAGESIZE)) {
 				continue;
 			}
 			auto& seen = state.seen[page >> CACHING_PAGEBITS];
@@ -6606,6 +6632,11 @@ void BufferCache::HostImportUpdate() {
 void BufferCache::HostImportAdvanceFrame() {
 	auto& state = *m_host_import;
 	state.frame++;
+	if (const auto generation = LibKernel::Memory::GuestBackingMapGeneration();
+	    generation != state.map_generation) {
+		state.map_generation   = generation;
+		state.map_stable_since = state.frame;
+	}
 	const auto now     = std::chrono::steady_clock::now();
 	const auto elapsed = std::chrono::duration<double>(now - state.report_time).count();
 	if (elapsed < 10.0) {

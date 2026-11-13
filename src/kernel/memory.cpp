@@ -1149,6 +1149,10 @@ const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
+uint64_t GuestBackingMapGeneration() {
+	return GuestAddressSpace::BackingMapGeneration();
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
