@@ -1249,6 +1249,13 @@ enum class FrameEvent : uint32_t {
 	VariantPlanSkips,
 	// KYTY_BDA_STORE_LOG: stores a BDA-writing dispatch logged for pages without a cache buffer.
 	BdaLoggedStores,
+	// KYTY_WRITE_WATCH=1 (bufferCache.cpp CollectHotPages): hot-page compares skipped because
+	// GetWriteWatch reported the page unwritten since its last check; hot pages whose run is not
+	// write-watch memory (direct-memory file views; compared as before); and the verify mode's
+	// (KYTY_WRITE_WATCH_VERIFY=1) pages reported unwritten whose contents differed from the shadow.
+	WriteWatchSkips,
+	WriteWatchUnwatchedPages,
+	WriteWatchVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

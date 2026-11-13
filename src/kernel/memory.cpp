@@ -1149,6 +1149,36 @@ const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
+uint64_t PrivateCommitGeneration() {
+	return g_private_commit_generation.load(std::memory_order_acquire);
+}
+
+bool QueryAndResetWrittenPages(uint64_t vaddr, uint64_t size, std::vector<uint64_t>& written) {
+	written.clear();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (size == 0) {
+		return false;
+	}
+	const auto max_pages = static_cast<size_t>((size + 4095u) / 4096u);
+	std::vector<void*> addresses(max_pages);
+	ULONG_PTR count = max_pages;
+	DWORD     granularity = 0;
+	if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(vaddr), size, addresses.data(),
+	                  &count, &granularity) != 0) {
+		return false;
+	}
+	written.reserve(count);
+	for (ULONG_PTR i = 0; i < count; i++) {
+		written.push_back(reinterpret_cast<uint64_t>(addresses[i]));
+	}
+	return true;
+#else
+	(void)vaddr;
+	(void)size;
+	return false;
+#endif
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {

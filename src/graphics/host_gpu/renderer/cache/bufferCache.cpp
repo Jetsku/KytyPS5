@@ -1747,8 +1747,45 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			                               TRACKER_PAGE_SIZE) == 0;
 		});
 	}
+	// KYTY_WRITE_WATCH=1: hot pages in write-watch memory (private/flexible commits, see
+	// memoryAddressSpace.inc Commit) that GetWriteWatch reports unwritten since their run was last
+	// queried skip the live compare: the shadow was taken after that query reset the page's state
+	// (the query runs before any compare or snapshot of the run), so an unwritten page still equals
+	// it. A write racing the query or the compares is reported by the next query. Runs that are not
+	// write-watch memory (direct memory: file-mapping views) are compared as before.
+	// KYTY_WRITE_WATCH_VERIFY=1 compares the skipped pages anyway and counts disagreements.
+	static const bool write_watch = [] {
+		const char* v = std::getenv("KYTY_WRITE_WATCH");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	static const bool write_watch_verify = [] {
+		const char* v = std::getenv("KYTY_WRITE_WATCH_VERIFY");
+		return write_watch && v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	const bool use_write_watch = write_watch && m_bda_hot_sync && live_same.empty();
+	// Private memory committed or released since the last pass: a page under a shadow may have
+	// been replaced (reads zero) without a write. Query (reset) as usual but compare every page this
+	// pass; the shadows then match the current memory again.
+	bool trust_write_watch = false;
+	if (use_write_watch) {
+		const auto generation = LibKernel::Memory::PrivateCommitGeneration();
+		trust_write_watch     = generation == m_ww_commit_generation;
+		m_ww_commit_generation = generation;
+	}
+	uint64_t   ww_skips        = 0;
+	uint64_t   ww_unwatched    = 0;
+	uint64_t   ww_mismatches   = 0;
 	size_t live_index = 0;
 	for (const auto& range: hot_ranges) {
+		bool watched = false;
+		size_t written_index = 0;
+		if (use_write_watch) {
+			watched = LibKernel::Memory::QueryAndResetWrittenPages(range.address, range.size,
+			                                                       m_ww_written);
+			if (!watched) {
+				ww_unwatched += range.size / TRACKER_PAGE_SIZE;
+			}
+		}
 		// The shadows of a run's pages, in address order: one lookup per run instead of one per
 		// page. `next` stays the first shadow above the current page (an emplace below inserts
 		// before it and keeps it valid).
@@ -1782,9 +1819,27 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			// (hot, hence never GPU-dirty and readable) page first and snapshot only one that
 			// differs. A write racing either compare is seen by the next upload, whose shadow still
 			// holds the old contents, exactly as a write landing right after a snapshot.
-			bool same = m_bda_hot_sync &&
-			            (live_same.empty() ? unchanged_live(reinterpret_cast<const void*>(page))
-			                               : live_same[live_index] != 0);
+			bool unwritten = false;
+			if (watched && trust_write_watch) {
+				while (written_index < m_ww_written.size() && m_ww_written[written_index] < page) {
+					written_index++;
+				}
+				unwritten = shadow != m_hot_shadows.end() &&
+				            (written_index == m_ww_written.size() || m_ww_written[written_index] != page);
+			}
+			bool same = false;
+			if (unwritten) {
+				ww_skips++;
+				same = true;
+				if (write_watch_verify && !unchanged(reinterpret_cast<const void*>(page))) {
+					ww_mismatches++;
+					same = false;
+				}
+			} else {
+				same = m_bda_hot_sync &&
+				       (live_same.empty() ? unchanged_live(reinterpret_cast<const void*>(page))
+				                          : live_same[live_index] != 0);
+			}
 			live_index++;
 			if (!same) {
 				// Snapshot the (writable) page once: the compare, the shadow and the upload all use
@@ -1844,6 +1899,32 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 	MemoryStats::Count(MemoryStats::Counter::HotUploadPages, visited);
 	MemoryStats::Count(MemoryStats::Counter::HotUploadSkipped, skipped);
+	if (use_write_watch) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteWatchSkips, ww_skips);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteWatchUnwatchedPages, ww_unwatched);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteWatchVerifyMismatches, ww_mismatches);
+		m_ww_totals.skips += ww_skips;
+		m_ww_totals.unwatched += ww_unwatched;
+		m_ww_totals.mismatches += ww_mismatches;
+		m_ww_totals.visited += visited;
+		if (ww_mismatches != 0) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "WriteWatchVerify: %" PRIu64
+				             " hot page(s) reported unwritten differed from their shadow\n",
+				             ww_mismatches);
+			}
+		}
+		if (frame - m_ww_totals.last_log_frame >= 600) {
+			m_ww_totals.last_log_frame = frame;
+			std::fprintf(stderr,
+			             "WriteWatch: frame %" PRIu64 " hot visits %" PRIu64 " skipped-unwritten %" PRIu64
+			             " unwatched %" PRIu64 " verify-mismatches %" PRIu64 "\n",
+			             static_cast<uint64_t>(frame), m_ww_totals.visited, m_ww_totals.skips,
+			             m_ww_totals.unwatched, m_ww_totals.mismatches);
+		}
+	}
 	if (settled != 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::HotPageCheckSettles, settled);
 		m_range_memo_totals.settles += settled;
