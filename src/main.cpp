@@ -4,6 +4,7 @@
 #include "common/processHeap.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/topologyRule.h"
 #include "common/u59Preset.h"
 #include "common/wheelConfig.h"
 #include "emulator.h"
@@ -1049,6 +1050,8 @@ static int Main(int argc, char* argv[]) {
 		setenv("RADV_PERFTEST", "transfer_queue", 0);
 	}
 #endif
+	// KYTY_SMALL_CPU_RULE (common/topologyRule.h): before the CPU placement reads its switches.
+	Common::TopologyRule::ApplyAtStartup();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
 	// After the address-space reservations: the thread's stack must not land in the guest range.

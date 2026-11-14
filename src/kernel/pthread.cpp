@@ -143,7 +143,9 @@ static bool LowerCoreBoundThread(KernelCpumask affinity) {
 /// Host priority a guest thread runs at: the priority of its band, or one step below it (but not
 /// below the lowest band value) when the thread is pinned to a single core.
 static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
-	const int host = GuestPriorityToHost(guest_priority);
+	// KYTY_GUEST_PRIORITY_FLAT (common/guestPriority.h, live) moves a band by one step.
+	const int host = Common::GuestPriority::BandHost(GuestPriorityToHost(guest_priority),
+	                                                 Common::GuestPriority::Mode());
 	return core_bound ? std::max(host - 1, -2) : host;
 }
 
@@ -3494,6 +3496,18 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// KYTY_GUEST_PRIORITY_FLAT (live): re-applies the calling guest thread's host priority after a change.
+static void ApplyGuestPriorityToSelf() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto* thread = g_pthread_self;
+	if (thread == nullptr || thread->attr == nullptr) {
+		return;
+	}
+	SetThreadPriority(GetCurrentThread(),
+	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+#endif
+}
+
 /// Entry point of the host thread behind every guest thread: records its identity, applies the guest
 /// priority, then runs the guest entry function on the guest stack and cleans up afterwards.
 /// @param arg the Pthread that this host thread runs
@@ -3540,6 +3554,7 @@ static void* RunThread(void* arg) {
 	thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
 	SetThreadPriority(GetCurrentThread(),
 	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+	Common::GuestPriority::g_apply.store(&ApplyGuestPriorityToSelf, std::memory_order_release);
 #endif
 	Common::PlaceCurrentThreadGuest();
 	GThreadStats::MarkGuestThread();

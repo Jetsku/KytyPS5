@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_COMMON_HLEWAITSTATS_H_
 #define EMULATOR_SRC_COMMON_HLEWAITSTATS_H_
 
+#include "common/guestPriority.h"
+
 #include <atomic>
 #include <cstdint>
 
@@ -56,7 +58,9 @@ void Add(Id id, uint64_t ticks) noexcept;
 // Times the enclosing scope as `id`; Set() changes the id before the scope ends (event queues).
 class Scope {
 public:
-	explicit Scope(Id id) noexcept: m_id(id), m_start(Enabled() ? Tsc() : 0) {}
+	explicit Scope(Id id) noexcept: m_id(id), m_start(Enabled() ? Tsc() : 0) {
+		Common::GuestPriority::Check(); // KYTY_GUEST_PRIORITY_FLAT (live)
+	}
 	~Scope() {
 		if (m_start != 0) {
 			Add(m_id, Tsc() - m_start);
