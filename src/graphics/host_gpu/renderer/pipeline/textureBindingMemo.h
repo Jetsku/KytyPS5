@@ -225,13 +225,46 @@ public:
 	// owner of the page qualifies. Verify: such an answer is claimed, the full resolution runs and
 	// must give the same image and description and add no lookup side effect (residency
 	// extension, alias synchronization).
-	enum class ClaimKind : uint8_t { None, Memo2, Partner, Overlap };
+	//
+	// KYTY_IMG_DEPTHALIAS (live 0|1|verify, default 0; acts only with KYTY_IMG_PARTNER=1, since every
+	// such entry has an alias partner): answers of FindImage's overlap loop that went through
+	// ResolveDepthOverlap without recreating - Astro Bot samples the D32 memory of its depth target
+	// as R16G16_SFLOAT through a kept colour alias (ResolveDepthOverlap's keep_aliases branch) - are
+	// memoized. Exact condition (every state the full lookup reads, and what it writes):
+	//  reads: the owner lists of the outer region's pages (FindImagesInRegion over the description's
+	//    resident prefix) and of each inner region (the alias scan over the merged request's range),
+	//    the owners' registered flags, stencil associations and live ranges - all of which move the
+	//    structure versions of the pages they cover (TextureCache::NoteStructureChange) - the
+	//    candidates' fixed fields (info, backing sample count, generation in the id), the switches
+	//    read once (KYTY_IMAGE_ALIAS_AGE, KYTY_IMAGE_CONTAINS, ...), and for time-dependent "keep"
+	//    branches OverlapSafeToDelete (re-checked live, as KYTY_IMG_OVERLAP does); then FindImage's
+	//    tail as for any entry (requested_first, alias partner, touch).
+	//  writes: per alias answer, `cached.binding.needs_rebind = true` and the image-state epoch when
+	//    the cached (depth) image is bound or a target at that moment (read live at the hit, applied
+	//    in the lookup's order, before SyncAliasFromOwner as in FindImage); SyncAliasFromOwner
+	//    (KYTY_IMG_PARTNER's HitSync); the tick and LRU touch.
+	//  An entry answers while the structure versions of every page of the span (outer region,
+	//  inner regions, the image's first page; at most MaxSpanPages) are the recorded ones: versions
+	//  only grow, so the sum of the span's versions is unchanged exactly when every version is. A
+	//  lookup that recreated (inserted, copied, freed) or had any other impure branch, a rebased
+	//  view, a DCC description, KYTY_BLOCK_SUBRESOURCE_WRITES, or more than MaxRebinds alias
+	//  answers is not recorded. Never revalidated. Only TryResolve answers them (the worker-hinted
+	//  runs and stage set repeats refuse them: they do not replay effects).
+	// Verify: the claim (answer, predicted rebinds with their applied flags, whether the hit would
+	// synchronize) is compared with the full resolution: same answer, its lookup depth-class and
+	// pure with the same result and the same rebind list and applied flags, and alias
+	// synchronizations exactly when predicted (LookupSideEffects).
+	enum class ClaimKind : uint8_t { None, Memo2, Partner, Overlap, DepthAlias };
 	struct SecondClaim {
 		ClaimKind               kind = ClaimKind::None;
 		ImageId                 image;
 		TextureCache::ImageDesc desc;
 		uint64_t                effects = 0; // TextureCache::LookupSideEffects when claimed
 		bool                    expect_sync = false; // KYTY_IMG_PARTNER: an owner qualified
+		// KYTY_IMG_DEPTHALIAS: the rebinds the hit would perform.
+		uint32_t                                                     rebind_count = 0;
+		std::array<ImageId, TextureCache::OverlapLookup::MaxRebinds> rebind {};
+		std::array<bool, TextureCache::OverlapLookup::MaxRebinds>    rebind_applied {};
 	};
 	// Verify modes: compares the pending claim of the last TryResolve with the full resolution's
 	// binding and clears it (no-op without a claim).
@@ -250,6 +283,13 @@ private:
 	[[nodiscard]] static bool PagesHold(const TextureCache& cache, const Entry& entry);
 	// Not an overlap-loop entry, or KYTY_IMG_OVERLAP is on (verify: TryResolve claims only).
 	[[nodiscard]] static bool OverlapUsable(const Entry& entry);
+	// KYTY_IMG_DEPTHALIAS: the most pages a depth-class entry's span covers, the sum of the
+	// structure versions of [first, first + count), and whether the last lookup is of the class.
+	static constexpr uint32_t MaxSpanPages = 64;
+	// The count build (r6) set this: depth-class answers counted (DaRecordable), never recorded.
+	static constexpr bool DepthAliasCountOnly = false;
+	[[nodiscard]] static uint64_t SpanSum(const TextureCache& cache, uint64_t first, uint32_t count);
+	[[nodiscard]] static bool DepthAliasClass(const TextureCache::OverlapLookup& lookup, ImageId found);
 	// KYTY_TEXTURE_MEMO_SLOTS (startup, default 4096, 64..4M): the number of direct-mapped entries
 	// (~1 KiB each; the size is logged once). A level binding more distinct textures per frame
 	// than that evicts entries every frame (Sky Garden: most texture sets KYTY_XFRAME_REUSE kept

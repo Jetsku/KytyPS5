@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/textureSetCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
@@ -1381,6 +1382,27 @@ private:
 	// KYTY_CONT_KERNEL: PrepareBindings for a continuation stage (keep_images): no GDS, no bindless heaps, no verify.
 	void PrepareBindingsContinuation(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
 	                                 DrawPrep::StagePlan* plan);
+	// AcquireRenderTargets' depth decisions (no effects): the aspects the draw samples of its depth
+	// attachment and the feedback aspects, the attachment layout and access, and the
+	// KYTY_DEPTH_FEEDBACK_KEEP decision (keep; adopt: the keep notes its ordering and adopts the
+	// union scope). views_ok false: a sampled view of the image is not one of its views.
+	struct DepthAccessDecision {
+		vk::ImageAspectFlags sampled;
+		vk::ImageAspectFlags feedback;
+		vk::ImageLayout      layout = vk::ImageLayout::eUndefined;
+		vk::AccessFlags2     access;
+		vk::AccessFlags2     sampled_access;
+		bool                 keep           = false;
+		bool                 adopt          = false;
+		bool                 stable_avoided = false;
+		bool                 views_ok       = true;
+		Profiler::FrameEvent miss           = Profiler::FrameEvent::DepthFeedbackKeepMissWrite;
+	};
+	[[nodiscard]] DepthAccessDecision DecideDepthAccess(const CommandBuffer& buffer, const RenderDepthInfo& depth,
+	                                                    const Image& image,
+	                                                    std::span<PreparedBindings* const> stages) const;
+	[[nodiscard]] static vk::ImageMemoryBarrier2 FeedbackKeepOrdering(const Image& image, vk::ImageLayout layout,
+	                                                                  vk::AccessFlags2 sampled);
 	// written: DrawScissorUnion of the draw (nullptr: the whole colour targets may be written).
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
@@ -1755,6 +1777,69 @@ private:
 	};
 	AcquireSeed m_acq_seed;
 	bool        m_acq_seed_prev = false; // m_acq_seed.valid when the committed draw began
+	// KYTY_IMG_ACQFB (count build): the previous full acquisition's targets (signature), result and
+	// feedback aspects, and the depth-feedback keep barriers AcquireRenderTargets noted so far.
+	struct AcquireLast {
+		bool                 valid     = false;
+		uint64_t             signature = 0;
+		RenderState          rendering;
+		vk::ImageAspectFlags feedback;
+	};
+	AcquireLast m_acq_last;
+	uint64_t    m_acq_keeps = 0;
+	struct AcqFbProbe {
+		uint64_t                    signature   = 0;
+		uint64_t                    transitions = 0;
+		uint64_t                    keeps       = 0;
+		bool                        instance    = false;
+		uint32_t                    count       = 0;
+		std::array<DrawRunImage, 9> marks {}; // the attachments before the acquisition
+	};
+	[[nodiscard]] AcqFbProbe AcqFbBefore(const CommandBuffer& buffer, const DrawRenderState& state) const;
+	void AcqFbAfter(const AcqFbProbe& probe, const RenderState& rendering, vk::ImageAspectFlags feedback);
+	// KYTY_IMG_ACQFB (live 0|1|verify, default 0): the acquisition of a draw without a run record
+	// (typically one that samples its own attachments: a colour target bound as a texture, the depth
+	// target sampled in a feedback layout) seeds the next draw's acquisition. The next draw takes the
+	// seed's RenderState and feedback aspects instead of AcquireRenderTargets when the acquisition
+	// would be a repeat (exact condition: imgside DESIGN 9.4, renderDraw.cpp AcqFbCandidate):
+	// what the acquisition reads is the same - targets, scissor union, command buffer, tick, rendering
+	// instance, activity epoch, every attachment mark including content serials as the seeding draw
+	// left them, each colour target's is_bound, the depth decision (DecideDepthAccess, evaluated
+	// live: sampled/feedback aspects, layout, access, keep, adopt) and no HTILE clear pending - and
+	// its effects that are not repeats are performed: touches, attachment_layout/access, the
+	// feedback-keep ordering and AdoptState (adopt), m_depth_feedback, and the content serials (the
+	// targets' GPU-write marks: fresh serials, the unwritten depth target's restored), so no image
+	// that took an attachment's serial in this draw's texture resolution is left looking current.
+	struct AcqFbSeed {
+		bool                                             valid            = false;
+		uint64_t                                         activity         = 0;
+		vk::CommandBuffer                                command          = nullptr;
+		uint64_t                                         tick             = 0;
+		uint64_t                                         rendering_serial = 0;
+		RenderState                                      rendering;
+		vk::ImageAspectFlags                             feedback;
+		std::vector<DrawRunImage>                        marks; // colour targets, then the depth target
+		std::vector<RenderColorInfo>                     colors;
+		std::vector<RenderDepthInfo>                     depth; // one entry
+		vk::Rect2D                                       written {};
+		bool                                             bounded = false;
+		bool                                             has_depth = false;
+		DepthAccessDecision                              decision;
+		std::array<bool, RENDER_COLOR_ATTACHMENTS_MAX>   color_bound {};
+	};
+	AcqFbSeed m_acqfb;
+	bool      m_acqfb_prev = false; // m_acqfb.valid when the committed draw began
+	bool      m_acqfb_this = false; // the committed draw's acquisition was a full one or an ACQFB reuse
+	// What the last acquisition decided (AcquireRenderTargets, or an ACQFB reuse), for the seed.
+	DepthAccessDecision                            m_acq_decision;
+	bool                                           m_acq_has_depth = false;
+	std::array<bool, RENDER_COLOR_ATTACHMENTS_MAX> m_acq_color_bound {};
+	void AcqFbRecord(const CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
+	                 vk::ImageAspectFlags feedback, std::span<PreparedBindings* const> stages, const vk::Rect2D* written);
+	[[nodiscard]] bool AcqFbCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
+	                                  std::span<PreparedBindings* const> stages, const vk::Rect2D* written,
+	                                  DepthAccessDecision& decision) const;
+	void AcqFbApply(CommandBuffer& buffer, DrawRenderState& state, const DepthAccessDecision& decision);
 	// KYTY_IMG_STATS: what the draw's seeding step did (ImgSide::C::SeedWhyNotReached + n), and the
 	// previous draw's.
 	uint8_t m_seed_why      = 0;

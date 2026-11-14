@@ -116,6 +116,8 @@ Live::Switch g_inplace("KYTY_IMG_INPLACE", [](const char* value) { return static
 Live::Switch g_overlap("KYTY_IMG_OVERLAP", [](const char* value) { return static_cast<int64_t>(ParseMode(value)); });
 Live::Switch g_acqseed("KYTY_IMG_ACQSEED", [](const char* value) { return static_cast<int64_t>(ParseMode(value)); });
 Live::Switch g_partner("KYTY_IMG_PARTNER", [](const char* value) { return static_cast<int64_t>(ParseMode(value)); });
+Live::Switch g_depthalias("KYTY_IMG_DEPTHALIAS", [](const char* value) { return static_cast<int64_t>(ParseMode(value)); });
+Live::Switch g_acqfb("KYTY_IMG_ACQFB", [](const char* value) { return static_cast<int64_t>(ParseMode(value)); });
 
 const char* const g_switch_names[static_cast<size_t>(S::Count)] = {
     "memo2 evict",    "memo2 hit",     "memo2 miss",       "memo2 verify",   "memo2 mismatch",
@@ -124,12 +126,17 @@ const char* const g_switch_names[static_cast<size_t>(S::Count)] = {
     "ovlrej timed-taken", "ovlrej timed-many", "ovlrej depth", "ovlrej expand", "ovlrej merge", "ovlrej contains",
     "ovlrej inserted", "ovlrej pages", "ovlrej other", "seedref attachment", "seedref program", "seedref writes",
     "seedref other",
+    "da recordable", "da rej impure", "da rej span", "da rej other", "da rec", "da hit", "da rebind",
+    "da verify", "da mismatch", "acqfb same", "acqfb repeat", "acqfb repeat+serial", "acqfb repeat feedback",
+    "acqfb keep", "acqfb state", "acqfb transit", "acqfb marks", "acqfb noinstance", "acqfb hit", "acqfb verify",
+    "acqfb mismatch",
     "frames"};
 static_assert(sizeof(g_switch_names) / sizeof(g_switch_names[0]) == static_cast<size_t>(S::Count));
 
 bool AnySwitchOn() {
 	return Memo2Mode() != Mode::Off || InplaceMode() != Mode::Off || PartnerMode() != Mode::Off ||
-	       OverlapMode() != Mode::Off || AcqSeedMode() != Mode::Off;
+	       OverlapMode() != Mode::Off || AcqSeedMode() != Mode::Off || DepthAliasMode() != Mode::Off ||
+	       AcqFbMode() != Mode::Off;
 }
 
 void PrintSwitches() {
@@ -154,7 +161,9 @@ void PrintSwitches() {
 	                   " inplace " + std::to_string(static_cast<int>(InplaceMode())) + " partner " +
 	                   std::to_string(static_cast<int>(PartnerMode())) + " overlap " +
 	                   std::to_string(static_cast<int>(OverlapMode())) + " acqseed " +
-	                   std::to_string(static_cast<int>(AcqSeedMode())) + " |";
+	                   std::to_string(static_cast<int>(AcqSeedMode())) + " depthalias " +
+	                   std::to_string(static_cast<int>(DepthAliasMode())) + " acqfb " +
+	                   std::to_string(static_cast<int>(AcqFbMode())) + " |";
 	for (size_t i = 0; i < last.size(); i++) {
 		const auto v = SwitchCounters()[i].load(std::memory_order_relaxed);
 		line += " " + std::string(g_switch_names[i]) + " " + std::to_string(v - last[i]) + " (total " +
@@ -163,7 +172,7 @@ void PrintSwitches() {
 	}
 	uint64_t mismatches = 0;
 	for (const auto counter: {S::Memo2Mismatch, S::InplaceMismatch, S::PartnerMismatch, S::OverlapMismatch,
-	                           S::AcqSeedMismatch}) {
+	                           S::AcqSeedMismatch, S::DaMismatch, S::AcqFbMismatch}) {
 		mismatches += SwitchCounters()[static_cast<size_t>(counter)].load(std::memory_order_relaxed);
 	}
 	line += " | mismatches total " + std::to_string(mismatches);
@@ -190,6 +199,14 @@ Mode OverlapMode() {
 
 Mode AcqSeedMode() {
 	return static_cast<Mode>(g_acqseed.Get());
+}
+
+Mode DepthAliasMode() {
+	return static_cast<Mode>(g_depthalias.Get());
+}
+
+Mode AcqFbMode() {
+	return static_cast<Mode>(g_acqfb.Get());
 }
 
 void ReportMismatch(S counter, const char* what) {

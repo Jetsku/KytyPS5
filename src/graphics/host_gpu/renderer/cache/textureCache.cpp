@@ -4584,6 +4584,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
+	m_depth_path = DepthPath::None;
 	if (!cached.info.IsDepth() && !requested.IsDepth()) {
 		return {};
 	}
@@ -4647,6 +4648,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
 	if (!recreate) {
+		m_depth_path = DepthPath::Same; // a function of the two infos and the switches
 		return cached_id;
 	}
 	// Guests reuse one allocation as depth and as color (e.g. D32F <-> R32F) every frame. Keep one
@@ -4669,6 +4671,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			    !SameBacking(other->info, info, true)) {
 				continue;
 			}
+			// KYTY_IMG_DEPTHALIAS: the branch's only effect (TextureBindingMemo replays it).
+			m_depth_path           = DepthPath::Alias;
+			m_depth_inner_address  = requested.data.address;
+			m_depth_inner_size     = requested.data.size;
+			m_depth_rebind_applied = cached.binding.is_bound || cached.binding.is_target;
 			if (cached.binding.is_bound || cached.binding.is_target) {
 				cached.binding.needs_rebind = true;
 				NoteImageStateChange();
@@ -4676,6 +4683,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			return other_id;
 		}
 	}
+	m_depth_path = DepthPath::Recreate;
 	RefreshImage(cached_id);
 	info.htile_initial_clear  = false;
 	const auto replacement_id = InsertImage(info);
@@ -4901,7 +4909,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
-			NoteOverlapImpure(OverlapLookup::WhyDepth);
+			NoteDepthOverlap(cached_id);
 			return {depth_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
@@ -5013,6 +5021,41 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 	}
 	return {merged_id};
+}
+
+void TextureCache::NoteDepthOverlap(ImageId cached_id) {
+	// KYTY_IMG_DEPTHALIAS: which ResolveDepthOverlap answers keep the lookup replayable.
+	//  Same: the outcome is a function of the request, the cached image's fixed fields (info, backing
+	//    sample count) and start-up switches; no effect.
+	//  Alias: additionally of the inner region scan (FindImagesInRegion over the request's range:
+	//    owner lists, registered flags, stencil associations - all of which move the pages' structure
+	//    versions - and the found image's fixed fields); its one effect is listed for the replay.
+	//  Recreate: inserts, copies, frees: impure.
+	auto& lookup = m_last_overlap;
+	if (m_depth_path == DepthPath::Same) {
+		lookup.depth_class = true;
+		return;
+	}
+	ImagePageTable::PageRange inner {};
+	if (m_depth_path == DepthPath::Alias && lookup.rebind_count < OverlapLookup::MaxRebinds &&
+	    ImagePageTable::TryGetPageRange(m_depth_inner_address, m_depth_inner_size, inner)) {
+		lookup.depth_class                         = true;
+		lookup.rebind[lookup.rebind_count]         = cached_id;
+		lookup.rebind_applied[lookup.rebind_count] = m_depth_rebind_applied;
+		lookup.rebind_count++;
+		lookup.span_first = std::min(lookup.span_first, inner.first);
+		lookup.span_last  = std::max(lookup.span_last, inner.last_exclusive);
+		return;
+	}
+	NoteOverlapImpure(OverlapLookup::WhyDepth);
+}
+
+bool TextureCache::BlockSubwritesOn() {
+	return BlockSubresourceWritesEnabled();
+}
+
+bool TextureCache::AliasSyncSkipOn() {
+	return AliasSyncSkipEnabled();
 }
 
 void TextureCache::NoteOverlapImpure(uint8_t why) {

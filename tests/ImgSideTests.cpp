@@ -140,6 +140,48 @@ void TestReasonOrder() {
 	      "SeedWhyRecorded is the last counter");
 }
 
+void TestDepthAlias() {
+	using ImgSide::DaRecord;
+	// The replay of ResolveDepthOverlap's alias-branch effect.
+	bool rebind = false;
+	Check(!ImgSide::ApplyRebind(false, false, rebind) && !rebind, "neither bound nor a target: nothing");
+	Check(ImgSide::ApplyRebind(true, false, rebind) && rebind, "bound: needs_rebind set");
+	rebind = false;
+	Check(ImgSide::ApplyRebind(false, true, rebind) && rebind, "a target: needs_rebind set");
+	rebind = true;
+	Check(ImgSide::ApplyRebind(true, true, rebind) && rebind, "already set: applied again (epoch moves)");
+	// Record's decision.
+	Check(ImgSide::DepthAliasRecord(true, false, 25, 64) == DaRecord::Keep, "pure, 25 pages: kept");
+	Check(ImgSide::DepthAliasRecord(true, false, 64, 64) == DaRecord::Keep, "the limit itself: kept");
+	Check(ImgSide::DepthAliasRecord(true, false, 65, 64) == DaRecord::Span, "over the limit: span");
+	Check(ImgSide::DepthAliasRecord(false, false, 1, 64) == DaRecord::Impure, "a recreate: impure");
+	Check(ImgSide::DepthAliasRecord(false, true, 100, 64) == DaRecord::Impure, "impure before the other reasons");
+	Check(ImgSide::DepthAliasRecord(true, true, 1, 64) == DaRecord::Other, "rebased / DCC / no pages: other");
+	// The span: outer region [10, 35), image page 10, inner [10, 35): [10, 35).
+	auto span = ImgSide::DepthAliasSpan(10, 35, 10, 35, 10);
+	Check(span.lo == 10 && span.hi == 35, "region = inner: the region");
+	span = ImgSide::DepthAliasSpan(10, 12, UINT64_MAX, 0, 10);
+	Check(span.lo == 10 && span.hi == 12, "no inner region (Same answers only)");
+	span = ImgSide::DepthAliasSpan(10, 12, 8, 40, 10);
+	Check(span.lo == 8 && span.hi == 40, "a larger inner region widens the span");
+	span = ImgSide::DepthAliasSpan(10, 12, UINT64_MAX, 0, 50);
+	Check(span.lo == 10 && span.hi == 51, "the image's first page outside the region is included");
+}
+
+void TestAcqFb() {
+	// The content serial an acquisition leaves (and a KYTY_IMG_ACQFB reuse replays).
+	Check(!ImgSide::AcqFbSerialKept(false, false, true), "colour target: always a fresh serial");
+	Check(!ImgSide::AcqFbSerialKept(false, true, true), "colour target written: fresh");
+	Check(ImgSide::AcqFbSerialKept(true, false, true), "unwritten depth with alias-sync skip: restored");
+	Check(!ImgSide::AcqFbSerialKept(true, true, true), "written depth: fresh");
+	Check(!ImgSide::AcqFbSerialKept(true, false, false), "without alias-sync skip nothing is restored");
+	// The switch counters the verify boots read are distinct and in the line.
+	Check(static_cast<uint8_t>(ImgSide::S::AcqFbMismatch) + 1 == static_cast<uint8_t>(ImgSide::S::Frames),
+	      "acqfb counters end right before frames");
+	Check(static_cast<uint8_t>(ImgSide::S::DaMismatch) + 1 == static_cast<uint8_t>(ImgSide::S::AcqFbSame),
+	      "depthalias counters precede the acqfb ones");
+}
+
 } // namespace
 
 int main() {
@@ -149,6 +191,8 @@ int main() {
 	TestSlots();
 	TestPartnerDecision();
 	TestReasonOrder();
+	TestDepthAlias();
+	TestAcqFb();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;

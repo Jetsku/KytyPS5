@@ -220,6 +220,29 @@ enum class S : uint8_t {
 	SeedRefProgram,    // address writes or GDS
 	SeedRefWrites,     // a buffer write over an attachment's memory
 	SeedRefOther,      // feedback, clears, no rendering instance, depth promotion, a texture over an attachment
+	// KYTY_IMG_DEPTHALIAS (textureBindingMemo.h): the depth-alias class of FindImage's overlap loop.
+	DaRecordable,  // Record: a depth-class answer the rule keeps (count build: counted, not kept)
+	DaRejImpure,   // ... not kept: the loop recreated (or more than MaxRebinds alias answers)
+	DaRejSpan,     // ... not kept: the pages the answer depends on span more than MaxSpanPages
+	DaRejOther,    // ... not kept: rebased view, DCC, result not FindImage's, block subwrites, no page range
+	DaRecords,     // entries recorded
+	DaHit,         // entries that answered
+	DaRebind,      // ... of which rebind effects applied (the depth image was bound or a target)
+	DaChecks,      // verify: claims compared with the full resolution
+	DaMismatch,
+	// KYTY_IMG_ACQFB (render.h): acquisitions of the same targets as the previous one, no run record.
+	AcqFbSame,
+	AcqFbRepeat,       // ... whose acquisition repeated the previous one (state, feedback, no transition, no keep barrier, marks)
+	AcqFbRepeatSerial, // ... and left every attachment's content serial as well
+	AcqFbFeedback,     // ... repeats with depth feedback aspects
+	AcqFbKeep,         // ... not a repeat: the depth-feedback keep noted a barrier
+	AcqFbState,        // ... not a repeat: another RenderState or feedback aspects
+	AcqFbTransit,      // ... not a repeat: transitions recorded
+	AcqFbMarks,        // ... not a repeat: an attachment mark moved (layout/access/stage/...; serials not compared)
+	AcqFbNoInstance,   // repeats without an active rendering instance at the acquisition
+	AcqFbHit,
+	AcqFbChecks,
+	AcqFbMismatch,
 	Frames,        // frame boundaries (per-frame figures of the line)
 	Count
 };
@@ -267,6 +290,47 @@ enum class PartnerAction : uint8_t { Hit, HitSync, Miss, Claim };
 	}
 }
 
+// KYTY_IMG_DEPTHALIAS: the effect of ResolveDepthOverlap's alias branch on the cached image, as a
+// memo hit replays it (true: applied; the caller then moves the image-state epoch).
+[[nodiscard]] constexpr bool ApplyRebind(bool is_bound, bool is_target, bool& needs_rebind) {
+	if (is_bound || is_target) {
+		needs_rebind = true;
+		return true;
+	}
+	return false;
+}
+// Record's decision for a depth-class answer of the overlap loop. pure: no branch with another
+// effect or a time-dependent "free"; refused: a rebased view, DCC, block subwrites or no page range;
+// span_pages: the pages of the outer region, inner regions and the image's first page.
+enum class DaRecord : uint8_t { Keep, Impure, Other, Span };
+[[nodiscard]] constexpr DaRecord DepthAliasRecord(bool pure, bool refused, uint64_t span_pages,
+                                                  uint64_t max_span) {
+	return !pure ? DaRecord::Impure : refused ? DaRecord::Other : span_pages > max_span ? DaRecord::Span : DaRecord::Keep;
+}
+// The span [lo, hi) of pages a depth-class answer depends on: the outer region, the union of the
+// inner regions ([inner_lo, inner_hi), empty when inner_lo >= inner_hi) and the image's first page.
+struct PageSpan {
+	uint64_t lo = 0;
+	uint64_t hi = 0;
+};
+[[nodiscard]] constexpr PageSpan DepthAliasSpan(uint64_t region_lo, uint64_t region_hi, uint64_t inner_lo,
+                                                uint64_t inner_hi, uint64_t image_page) {
+	PageSpan span {region_lo < image_page ? region_lo : image_page,
+	               region_hi > image_page + 1 ? region_hi : image_page + 1};
+	if (inner_lo < inner_hi) {
+		span.lo = inner_lo < span.lo ? inner_lo : span.lo;
+		span.hi = inner_hi > span.hi ? inner_hi : span.hi;
+	}
+	return span;
+}
+
+// KYTY_IMG_ACQFB: whether an acquisition leaves an attachment's content serial as it found it (the
+// unwritten depth target, restored by RestoreContentIfUnwritten with KYTY_ALIAS_SYNC_SKIP) or gives
+// it a fresh one (colour targets always: their binding marks a GPU write). The reuse replays this.
+[[nodiscard]] constexpr bool AcqFbSerialKept(bool is_depth, bool writes, bool alias_sync_skip) {
+	return is_depth && !writes && alias_sync_skip;
+}
+
 // Counters of the commit thread (single writer).
 inline std::array<std::atomic<uint64_t>, static_cast<size_t>(S::Count)>& SwitchCounters() {
 	static std::array<std::atomic<uint64_t>, static_cast<size_t>(S::Count)> counters {};
@@ -294,6 +358,11 @@ void ReportMismatch(S counter, const char* what);
 // KYTY_IMG_ACQSEED: an ordinary acquisition of a draw that may not seed a draw run seeds the next
 // draw's acquisition reuse (render.h, RenderExecutor::AcquireSeed).
 [[nodiscard]] Mode AcqSeedMode();
+// KYTY_IMG_DEPTHALIAS: depth-class overlap answers (a kept colour alias of a depth image) are
+// memoized with the alias branch's rebind effect replayed (textureBindingMemo.h).
+[[nodiscard]] Mode DepthAliasMode();
+// KYTY_IMG_ACQFB: same-target acquisition reuse after draws that sample their attachments (render.h).
+[[nodiscard]] Mode AcqFbMode();
 
 // The 10 s lines (stats with KYTY_IMG_STATS; the switches' counters while any is not off).
 void PrintSummary();

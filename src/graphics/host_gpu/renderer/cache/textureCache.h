@@ -208,6 +208,18 @@ public:
 		// The first reason the loop was impure (KYTY_IMG_OVERLAP counters).
 		enum Why : uint8_t { WhyNone, WhyTimedTaken, WhyTimedMany, WhyDepth, WhyExpand, WhyMerge, WhyContains };
 		uint8_t impure_why = WhyNone;
+		// KYTY_IMG_DEPTHALIAS: ResolveDepthOverlap answered at least once without recreating (the
+		// cached image itself, or a kept alias found by its inner region scan). Such a lookup is pure
+		// apart from the alias branch's one effect, listed in `rebind`: the cached (depth) image gets
+		// needs_rebind (and the image-state epoch moves) when it is bound or a target at that moment
+		// (`rebind_applied`: what the lookup did). The inner scans' pages are [span_first, span_last).
+		bool                          depth_class = false;
+		static constexpr uint32_t     MaxRebinds  = 2;
+		uint32_t                      rebind_count = 0;
+		std::array<ImageId, MaxRebinds> rebind {};
+		std::array<bool, MaxRebinds>    rebind_applied {};
+		uint64_t                      span_first = UINT64_MAX;
+		uint64_t                      span_last  = 0;
 		ImageInfo requested;             // the description's info as FindImage got it
 		uint32_t candidates     = 0;
 		uint64_t region_address = 0;
@@ -220,6 +232,10 @@ public:
 	[[nodiscard]] bool OverlapSafeToDelete(const Image& cached) const;
 	// Marks the current lookup's overlap loop impure, keeping the first reason.
 	void NoteOverlapImpure(uint8_t why);
+	// KYTY_BLOCK_SUBRESOURCE_WRITES (FindImage's ApplyBlockSubwrites runs for every lookup).
+	[[nodiscard]] static bool BlockSubwritesOn();
+	// KYTY_ALIAS_SYNC_SKIP (RestoreContentIfUnwritten restores a serial only with it).
+	[[nodiscard]] static bool AliasSyncSkipOn();
 	// Diagnostics (KYTY_CP_COMMIT=texdcc verify): DCC decisions of MaterializeDccClear that did
 	// something (a slice clear, or a native GPU inspection); a memo hit's full resolution adds none.
 	[[nodiscard]] uint64_t      DccDecisionEffects() const noexcept { return m_dcc_decision_effects; }
@@ -670,6 +686,16 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	// How the last ResolveDepthOverlap answered (KYTY_IMG_DEPTHALIAS): None (no image), Same (the
+	// cached image, no effect), Alias (a kept alias of the inner region m_depth_inner_*; the
+	// cached image's rebind effect applied or not: m_depth_rebind_applied), Recreate (anything else).
+	enum class DepthPath : uint8_t { None, Same, Alias, Recreate };
+	DepthPath m_depth_path            = DepthPath::None;
+	uint64_t  m_depth_inner_address   = 0;
+	uint64_t  m_depth_inner_size      = 0;
+	bool      m_depth_rebind_applied  = false;
+	// ResolveOverlap's record of a depth answer into m_last_overlap.
+	void NoteDepthOverlap(ImageId cached_id);
 	// KYTY_DEPTH_GROW_RECREATE: a depth target bound at the address of a cached one with the same
 	// layout but a larger width and/or height (a dynamic-resolution target that grows inside a fixed
 	// pitch). The pitch/height comparison of ResolveOverlap never recreates it, so draws covered the
