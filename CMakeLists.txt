@@ -1286,6 +1286,10 @@ add_executable(tex_delta_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TexDeltaTests
 target_include_directories(tex_delta_tests PRIVATE "${KYTY_SOURCE_DIR}")
 target_link_libraries(tex_delta_tests xxhash)
 
+# KYTY_IMG_* image-side switches: parser, second-level way choice, counters (drawPrep/imgSide.h).
+add_executable(img_side_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ImgSideTests.cpp")
+target_include_directories(img_side_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 # KYTY_BK_* per-draw bookkeeping switches: parser, ready run, counters (drawPrep/bookkeep.h).
 add_executable(bookkeep_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BookkeepTests.cpp")
 target_include_directories(bookkeep_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -1536,6 +1540,7 @@ if(BUILD_TESTING)
 	add_test(NAME change_class COMMAND $<TARGET_FILE:change_class_tests>)
 	add_test(NAME tex_delta COMMAND $<TARGET_FILE:tex_delta_tests>)
 	add_test(NAME bookkeep COMMAND $<TARGET_FILE:bookkeep_tests>)
+	add_test(NAME img_side COMMAND $<TARGET_FILE:img_side_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
 	add_test(NAME guest_tsc COMMAND $<TARGET_FILE:guest_tsc_tests>)
 	add_test(NAME gpu_write_ranges COMMAND $<TARGET_FILE:gpu_write_ranges_tests>)

@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include <atomic>
@@ -311,12 +312,158 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
 	return hits;
 }
 
+uint32_t TextureBindingMemo::SecondSets() {
+	static const uint32_t sets = [] {
+		const auto* value = std::getenv("KYTY_IMG_MEMO2_SLOTS");
+		const auto  count = value != nullptr && value[0] != '\0' ? std::strtoul(value, nullptr, 10) : 0ul;
+		const auto  slots = count >= 256 && count <= (1ul << 22u) ? static_cast<uint32_t>(count) : 32768u;
+		return slots / SecondWays;
+	}();
+	return sets;
+}
+
+uint32_t TextureBindingMemo::SecondSet(uint64_t hash) {
+	// Other bits than the primary slot's (hash % SlotCount).
+	return static_cast<uint32_t>((hash >> 32u) % SecondSets());
+}
+
+void TextureBindingMemo::CopyAnswer(Entry& to, const Entry& from) {
+	to.key             = from.key;
+	to.tag             = from.tag;
+	to.page            = from.page;
+	to.page_version    = from.page_version;
+	to.image           = from.image;
+	to.requested_first = from.requested_first;
+	to.has_partner     = from.has_partner;
+	to.null_image      = from.null_image;
+	to.exact_format    = from.exact_format;
+	to.view            = from.view;
+	to.desc            = from.desc;
+	to.dcc             = from.dcc;
+	to.dcc_noop        = from.dcc_noop;
+}
+
+void TextureBindingMemo::Publish(Entry& entry) {
+	const auto seq = entry.seq.load(std::memory_order_relaxed);
+	entry.seq.store(seq + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	const auto packed = PackKey(entry.key);
+	for (uint32_t i = 0; i < KeyWords; i++) {
+		entry.packed_key[i].store(packed[i], std::memory_order_relaxed);
+	}
+	entry.published_tag.store(entry.tag, std::memory_order_relaxed);
+	entry.seq.store(seq + 2, std::memory_order_release);
+}
+
+void TextureBindingMemo::Evict(const Entry& entry) {
+	if (entry.tag == 0) {
+		return;
+	}
+	if (!m_second) {
+		m_second      = std::make_unique<Entry[]>(static_cast<size_t>(SecondSets()) * SecondWays);
+		m_second_next = std::make_unique<uint8_t[]>(SecondSets());
+		std::printf("TextureBindingMemo: KYTY_IMG_MEMO2 second level %u entries (%zu KiB)\n",
+		            SecondSets() * SecondWays,
+		            static_cast<size_t>(SecondSets()) * SecondWays * sizeof(Entry) / 1024u);
+	}
+	const auto set  = SecondSet(Hash(entry.key));
+	auto*      ways = &m_second[static_cast<size_t>(set) * SecondWays];
+	const auto way = ImgSide::PickWay(
+	    SecondWays, m_second_next[set],
+	    [&](uint32_t w) { return ways[w].tag != 0 && ways[w].key == entry.key; },
+	    [&](uint32_t w) { return ways[w].tag == 0; });
+	CopyAnswer(ways[way], entry);
+	ImgSide::Bump(ImgSide::S::Memo2Evict);
+}
+
+bool TextureBindingMemo::TrySecond(TextureCache& cache, const Key& key, uint64_t hash, uint32_t slot,
+                                   bool verify) {
+	if (!m_second) {
+		ImgSide::Bump(ImgSide::S::Memo2Miss);
+		return false;
+	}
+	auto*  ways  = &m_second[static_cast<size_t>(SecondSet(hash)) * SecondWays];
+	Entry* found = nullptr;
+	for (uint32_t w = 0; w < SecondWays; w++) {
+		if (ways[w].tag != 0 && ways[w].key == key) {
+			found = &ways[w];
+			break;
+		}
+	}
+	if (found == nullptr) {
+		ImgSide::Bump(ImgSide::S::Memo2Miss);
+		return false;
+	}
+	ImgSide::Bump(ImgSide::S::Memo2Hit);
+	if (!verify) {
+		// Promote: the found recording takes the primary slot, the primary's occupant goes to
+		// its own set of the second level.
+		auto& primary = m_entries[slot];
+		Entry previous;
+		CopyAnswer(previous, primary);
+		CopyAnswer(primary, *found);
+		found->tag = 0;
+		Publish(primary);
+		if (previous.tag != 0 && !(previous.key == key)) {
+			Evict(previous);
+		}
+		return true;
+	}
+	// Verify: the claim, when TryResolve's hit conditions hold for the entry now (read only: a
+	// revalidation is evaluated, not stored).
+	const auto& entry = *found;
+	if (entry.dcc && !cache.MetadataStateHolds(entry.dcc_noop)) {
+		return false;
+	}
+	if (!entry.null_image) {
+		std::scoped_lock lock {cache.m_lock};
+		const auto*      image = cache.m_slot_images.try_get(entry.image);
+		if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind ||
+		    entry.requested_first < image->resident_first ||
+		    (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop))) {
+			return false;
+		}
+		bool partner = entry.has_partner;
+		if (cache.PageVersion(entry.page) != entry.page_version) {
+			if (!RevalidateEnabled() ||
+			    cache.FindImageWithSameBacking(entry.desc.info, entry.exact_format) != entry.image) {
+				return false;
+			}
+			partner = HasPartner(cache, entry.page, entry.image, *image);
+		}
+		if (partner && !image->alias_owner && !image->info.HasStencil()) {
+			return false;
+		}
+	}
+	m_claim.valid = true;
+	m_claim.image = entry.image;
+	m_claim.desc  = entry.desc;
+	return false;
+}
+
+void TextureBindingMemo::VerifySecondClaim(const TextureBinding& full) {
+	if (!m_claim.valid) {
+		return;
+	}
+	m_claim.valid = false;
+	ImgSide::Bump(ImgSide::S::Memo2Checks);
+	const auto& desc = m_claim.desc;
+	if (full.image_id != m_claim.image || full.desc.type != desc.type ||
+	    !(full.desc.view_info == desc.view_info) || full.desc.info.data != desc.info.data ||
+	    full.desc.info.pixel_format != desc.info.pixel_format) {
+		ImgSide::ReportMismatch(ImgSide::S::Memo2Mismatch,
+		                        "memo2: a second-level entry resolved differently");
+	}
+}
+
 bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_t hash,
                                     TextureBinding& binding, uint64_t tag_hint, bool verify_hint) {
 	m_last_revalidated = false;
 	m_last_dcc_hit     = false;
+	m_claim.valid      = false;
 	if (!m_entries) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
+		ImgSide::Count(ImgSide::C::MissEmpty);
 		return false;
 	}
 	const auto slot  = static_cast<uint32_t>(hash % SlotCount());
@@ -330,14 +477,22 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		}
 	}
 	if (entry.tag == 0 || !(hinted || entry.key == key)) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
-		return false;
+		const auto second = ImgSide::Memo2Mode();
+		const bool empty  = entry.tag == 0;
+		// KYTY_IMG_MEMO2 on: a promoted entry continues as a primary hit below.
+		if (second == ImgSide::Mode::Off ||
+		    !TrySecond(cache, key, hash, slot, second == ImgSide::Mode::Verify)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
+			ImgSide::Count(empty ? ImgSide::C::MissEmpty : ImgSide::C::MissConflict);
+			return false;
+		}
 	}
 	// KYTY_CP_COMMIT=texdcc: MaterializeDccClear would decide the same, and do nothing but its
 	// bookkeeping (below), only while the recorded certificate holds.
 	if (entry.dcc && !DccStateHolds(cache, entry)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoStale);
 		m_totals.stale++;
+		ImgSide::Count(ImgSide::C::MissDcc);
 		return false;
 	}
 	bool revalidated = false;
@@ -351,6 +506,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		};
 		if (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop)) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpCommitTexDccRejects);
+			ImgSide::Count(ImgSide::C::MissDcc);
 			return stale();
 		}
 		// A stencil association redirects the binding; a pending rebind, a copy from the alias
@@ -358,6 +514,10 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		// samples) are FindImage/RebindImages work: all take the full resolution.
 		if (image == nullptr || !image->registered || image->depth_id ||
 		    image->binding.needs_rebind || entry.requested_first < image->resident_first) {
+			ImgSide::Count(image != nullptr && image->registered && !image->depth_id &&
+			                       !image->binding.needs_rebind
+			                   ? ImgSide::C::MissResident
+			                   : ImgSide::C::MissImage);
 			return stale();
 		}
 		// A structural change on the description's first page may alter what FindImage returns:
@@ -366,6 +526,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 			if (!RevalidateEnabled() ||
 			    cache.FindImageWithSameBacking(entry.desc.info, entry.exact_format) !=
 			        entry.image) {
+				ImgSide::Count(ImgSide::C::MissPage);
 				return stale();
 			}
 			entry.has_partner  = HasPartner(cache, entry.page, entry.image, *image);
@@ -375,6 +536,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 			m_totals.revalidated++;
 		}
 		if (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) {
+			ImgSide::Count(ImgSide::C::MissPartner);
 			return stale();
 		}
 		// FindImage's access bookkeeping for the returned image.
@@ -385,6 +547,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		}
 	}
 	ApplyHit(entry, slot, binding);
+	ImgSide::Count(revalidated ? ImgSide::C::TexHitReval : ImgSide::C::TexHit);
 	m_last_revalidated = revalidated;
 	m_last_dcc_hit     = entry.dcc;
 	return true;
@@ -400,6 +563,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	if (view_rebased || binding.image_id != found ||
 	    (dcc_desc && (dcc == nullptr || !dcc->provable))) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
+		ImgSide::Count(ImgSide::C::RecReject);
 		return;
 	}
 	const bool null_image      = desc.info.data.Empty();
@@ -415,6 +579,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 			// FindImage returned the null image of this format; it is never registered or freed.
 			if (image == nullptr || image->registered || !image->info.data.Empty()) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
+				ImgSide::Count(ImgSide::C::RecReject);
 				return;
 			}
 		} else {
@@ -428,6 +593,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 			                                                   image->info.data.size, pages) ||
 			    cache.FindImageWithSameBacking(desc.info, exact_format) != found) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
+				ImgSide::Count(ImgSide::C::RecReject);
 				return;
 			}
 			// What FindImage/FindTexture pass to EnsureResidency for this description; they
@@ -451,6 +617,10 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	}
 	const auto slot  = static_cast<uint32_t>(hash % SlotCount());
 	auto&      entry = m_entries[slot];
+	// KYTY_IMG_MEMO2: the recording this one replaces stays in the second level.
+	if (ImgSide::Memo2Mode() != ImgSide::Mode::Off && entry.tag != 0 && !(entry.key == key)) {
+		Evict(entry);
+	}
 	// FindHint's readers: odd while the key and tag change (the fence orders the odd value before
 	// the new words), even again once both are stored (release).
 	const auto seq = entry.seq.load(std::memory_order_relaxed);
@@ -478,6 +648,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	binding.memo_tag      = entry.tag;
 	binding.memo_slot     = slot;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoFills);
+	ImgSide::Count(ImgSide::C::RecOk);
 	if (dcc_desc) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::CpCommitTexDccRecords);
 	}
@@ -512,6 +683,7 @@ bool TextureBindingMemo::TryAcquireView(TextureCache& cache, TextureBinding& bin
 	const auto* entry = ViewEntry(binding);
 	if (entry == nullptr) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoMisses);
+		ImgSide::Count(ImgSide::C::ViewFindNoEnt);
 		return false;
 	}
 	std::scoped_lock lock {cache.m_lock};
@@ -523,6 +695,7 @@ bool TextureBindingMemo::TryAcquireView(TextureCache& cache, TextureBinding& bin
 	cache.TouchImage(*image);
 	binding.image_view = entry->view;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoHits);
+	ImgSide::Count(ImgSide::C::ViewHit);
 	return true;
 }
 

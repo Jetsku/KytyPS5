@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "graphics/guest_gpu/drawShortcutCounters.h"
 
 #include "common/assert.h"
@@ -1023,6 +1024,25 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	feedback_aspects       = {};
 	m_depth_feedback.valid = false;
 	auto&       cache = m_context.GetTextureCache();
+	if (ImgSide::StatsEnabled()) [[unlikely]] {
+		// The same targets as the previous acquisition: image ids, slots, levels/layers, the depth
+		// image and the command buffer.
+		static uint64_t last_signature = 0;
+		uint64_t        signature      = 0x9e3779b97f4a7c15ull ^ color_count;
+		const auto      mix            = [&](uint64_t v) { signature = (signature ^ v) * 0x100000001b3ull; };
+		for (uint32_t i = 0; i < color_count; i++) {
+			mix(colors[i].image_id.index | (uint64_t {colors[i].image_id.generation} << 32u));
+			mix(colors[i].target_slot | (uint64_t {colors[i].guest_mip_level} << 16u) |
+			    (uint64_t {colors[i].guest_array_layer} << 32u));
+		}
+		mix(depth.image_id.index | (uint64_t {depth.image_id.generation} << 32u));
+		mix(reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(buffer.Identity())));
+		ImgSide::Count(ImgSide::C::Acquire);
+		if (signature == last_signature) {
+			ImgSide::Count(ImgSide::C::AcquireSame);
+		}
+		last_signature = signature;
+	}
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
@@ -3378,6 +3398,7 @@ static void NoteMrtDiag(const CommandBuffer& buffer, const DrawRenderState& stat
 // continuation whose images changed resolves them late, from the same registers).
 void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
                                     uint32_t render_target_slice_offset, DrawRenderState& state) {
+	ImgSide::Count(ImgSide::C::TargetRun);
 	state.color_count         = 0;
 	state.color_slots_written = 0;
 	uint32_t mrt_mask = 0;

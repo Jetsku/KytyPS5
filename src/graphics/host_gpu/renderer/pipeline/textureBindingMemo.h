@@ -186,6 +186,31 @@ public:
 	};
 	[[nodiscard]] const Totals& GetTotals() const noexcept { return m_totals; }
 
+	// KYTY_IMG_MEMO2 (live 0|1|verify, default 0; drawPrep/imgSide.h): a second level behind the
+	// direct-mapped entries. While it is not off, an entry Record() replaces moves into a
+	// set-associative second table (KYTY_IMG_MEMO2_SLOTS, start-up, default 32768, 4 ways) instead
+	// of being lost. On a primary miss TryResolve looks the key up there:
+	//  - on: the entry found is swapped into its primary slot (the primary's occupant moves to the
+	//    second level) and TryResolve continues exactly as for a primary hit. Exact because an
+	//    entry's validity never depends on where it is stored: every condition of a hit is checked
+	//    live against the texture cache at each use (image slot generation, registration, stencil
+	//    association, pending rebind, resident levels, the first page's structure version or its
+	//    revalidation, alias partner, DCC certificate), entries are never invalidated by any other
+	//    path than being overwritten, and tags stay unique per recording, so a binding holding the
+	//    tag and slot of the promoted entry describes it again.
+	//  - verify: nothing is promoted; the claim (the entry's image and description, if all hit
+	//    conditions hold now) is kept and compared with the full resolution that follows
+	//    (VerifySecondClaim), which provides the result.
+	// FindHint readers see the swap through the same sequence protocol as Record().
+	struct SecondClaim {
+		bool                    valid = false;
+		ImageId                 image;
+		TextureCache::ImageDesc desc;
+	};
+	// Verify mode: compares the pending claim of the last TryResolve with the full resolution's
+	// binding and clears it (no-op without a claim).
+	void VerifySecondClaim(const TextureBinding& full);
+
 private:
 	struct Entry;
 	// KYTY_TEXTURE_MEMO_SLOTS (startup, default 4096, 64..4M): the number of direct-mapped entries
@@ -222,6 +247,26 @@ private:
 	// sample count on `page` (so SyncAliasFromOwner may copy into it). Caller holds cache.m_lock.
 	[[nodiscard]] static bool HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
 	                                     const Image& image);
+
+	// KYTY_IMG_MEMO2: the second level (allocated when first used).
+	static constexpr uint32_t SecondWays = 4;
+	[[nodiscard]] static uint32_t SecondSets();
+	[[nodiscard]] static uint32_t SecondSet(uint64_t hash);
+	// Field copy of an entry's recorded answer (key, tag and the rest; the atomics are FindHint's
+	// view, written by Publish).
+	static void CopyAnswer(Entry& to, const Entry& from);
+	// Writes `entry`'s key and tag into FindHint's view (odd/even sequence, as Record).
+	static void Publish(Entry& entry);
+	// The primary entry `slot` holds a recording about to be replaced: keep it in the second level.
+	void Evict(const Entry& entry);
+	// A primary miss of `key`: on - promote the second-level entry into `slot` (true); verify -
+	// set m_claim when its hit conditions hold (false).
+	[[nodiscard]] bool TrySecond(TextureCache& cache, const Key& key, uint64_t hash, uint32_t slot,
+	                             bool verify);
+
+	std::unique_ptr<Entry[]> m_second;
+	std::unique_ptr<uint8_t[]> m_second_next; // round-robin way per set
+	SecondClaim              m_claim;
 
 	std::unique_ptr<Entry[]> m_entries;
 	// m_entries for FindHint's readers: set once, after the entries exist (release).

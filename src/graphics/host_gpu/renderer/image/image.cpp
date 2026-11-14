@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -495,8 +496,10 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	const auto& skip       = TransitSkip();
 	const bool  predicted  = skip.enabled && TransitIsNoOp(destination_layout, destination_access,
 	                                                      range);
+	ImgSide::Count(ImgSide::C::Transit);
 	if (predicted && skip.verify == 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitSkips);
+		ImgSide::Count(ImgSide::C::TransitNoOp);
 		return;
 	}
 	KYTY_GPU_OP_SITE("image.transition");

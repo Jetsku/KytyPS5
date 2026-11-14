@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangTrace.h"
@@ -1566,6 +1567,13 @@ void TextureCache::TouchImage(Image& image) {
 		event.aux     = (image.IsGpuModified() ? 1 : 0) | (image.IsBufferModified() ? 2 : 0);
 		event.size    = image.info.data.size;
 		HangTrace::RecordCp(event);
+	}
+	if (ImgSide::StatsEnabled()) [[unlikely]] {
+		ImgSide::Count(ImgSide::C::Touch);
+		if (image.frame_accessed_last == m_frame.load(std::memory_order_relaxed) && image.registered &&
+		    m_lru_touch_skip && image.lru_tick >= m_gc_tick) {
+			ImgSide::Count(ImgSide::C::TouchSame);
+		}
 	}
 	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
 	if (!image.registered) {
