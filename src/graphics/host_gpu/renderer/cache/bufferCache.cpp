@@ -38,7 +38,11 @@
 
 #include <algorithm>
 #include <bit>
+#if defined(_WIN32)
 #include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include <array>
 #include <atomic>
 #include <chrono>
