@@ -4862,18 +4862,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (owner == nullptr) {
 		return {merged_id};
 	}
-	auto&      cached       = *owner;
-	const auto current_tick = m_scheduler.CurrentTick();
-	const auto current_frame = m_frame.load(std::memory_order_relaxed);
-	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
-	    (!AliasAgeByFrames() || current_frame - std::min(current_frame, cached.frame_accessed_last) >
-	                                AliasFramesBeforeRemoval);
+	auto&      cached         = *owner;
+	const bool safe_to_delete = OverlapSafeToDelete(cached);
+	// KYTY_IMG_OVERLAP: a branch decided by safe_to_delete is pure while it stays false (the memo
+	// re-checks it live for these candidates); taken (a free, or the keep window) it is not.
+	const auto note_timed = [&] {
+		auto& lookup = m_last_overlap;
+		if (safe_to_delete || lookup.timed_count >= OverlapLookup::MaxTimed) {
+			m_overlap_impure = true;
+		} else {
+			lookup.timed[lookup.timed_count++] = cached_id;
+		}
+	};
 
 	// KYTY_DEPTH_GROW_RECREATE: before the pitch/height comparison below, which takes a wider
 	// cached depth image as it is and never sees a taller one.
 	if (binding == BindingType::DepthTarget && IsDepthGrowth(requested, cached.info) &&
 	    cached.registered && !cached.depth_id && cached.backing.samples == 1) {
+		m_overlap_impure = true;
 		if (m_depth_grow_recreate) {
 			if (merged_id) {
 				// A larger image was already chosen for this binding: an older, smaller one at the
@@ -4895,6 +4901,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
+			m_overlap_impure = true;
 			return {depth_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
@@ -4902,15 +4909,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
+			note_timed(); // a time-dependent decision (safe_to_delete)
 			if (safe_to_delete) {
 				FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapLayout);
 			}
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
+			m_overlap_impure = true;
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			m_overlap_impure = true;
 			return {ExpandImage(requested, cached_id)};
 		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
@@ -4921,6 +4931,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent.width == cached.info.extent.width &&
 		      requested.extent.height == cached.info.extent.height &&
 		      requested.extent.depth > cached.info.extent.depth))) {
+			m_overlap_impure = true;
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
@@ -4933,6 +4944,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		         : requested.extent.width > cached.info.extent.width &&
 		               requested.extent.height >= cached.info.extent.height &&
 		               requested.extent.depth >= cached.info.extent.depth)) {
+			m_overlap_impure = true;
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
@@ -4943,6 +4955,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent == cached.info.extent &&
 		      cached.info.resources.levels > 1 &&
 		      requested.resources.layers == cached.info.resources.layers))) {
+			m_overlap_impure = true;
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.type != cached.info.type) {
@@ -4976,8 +4989,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 	const int32_t mip = cached.info.MipOf(requested);
 	if (mip >= 0) {
+		m_overlap_impure = true; // an expansion or a merge
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (!merged_id) {
+			m_overlap_impure = true;
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
@@ -4987,14 +5002,25 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapMipMerge);
 		return {merged_id};
 	}
+	if (requested.data.address >= cached.info.data.address) {
+		note_timed(); // a time-dependent decision (safe_to_delete, then the keep window)
+	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		if (KeepOverlappedImage(cached, current_frame)) {
+		if (KeepOverlappedImage(cached, m_frame.load(std::memory_order_relaxed))) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureOverlapKeeps);
 		} else {
 			FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapStale);
 		}
 	}
 	return {merged_id};
+}
+
+bool TextureCache::OverlapSafeToDelete(const Image& cached) const {
+	const auto current_tick  = m_scheduler.CurrentTick();
+	const auto current_frame = m_frame.load(std::memory_order_relaxed);
+	return current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
+	       (!AliasAgeByFrames() || current_frame - std::min(current_frame, cached.frame_accessed_last) >
+	                                   AliasFramesBeforeRemoval);
 }
 
 bool TextureCache::KeepOverlappedImage(const Image& cached, uint64_t current_frame) const {
@@ -7560,6 +7586,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
+		// KYTY_IMG_STATS / KYTY_IMG_OVERLAP: whether the overlap loop below takes only branches that
+		// are pure functions of the region's owner lists and the images' fixed fields.
+		m_overlap_impure = false;
+		m_last_overlap   = {};
+		if (ImgSide::StatsEnabled()) [[unlikely]] {
+			m_last_overlap.requested = desc.info; // KYTY_IMG_STATS (backing split)
+		}
+		bool inserted    = false;
 		// Levels this lookup can sample. A new image registers only their prefix, and images that
 		// overlap only levels it cannot sample are neither merge candidates nor retired by it.
 		const auto wanted_first    = RequestedFirstLevel(desc, desc.info.resources.levels);
@@ -7575,6 +7609,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			}
 			constexpr size_t CrowdedOverlap = 24;
 			m_overlap_crowded = candidates.size() > CrowdedOverlap;
+			if (!use_legacy) {
+				m_last_overlap.overlap        = true;
+				m_last_overlap.region_address = desc.info.data.address;
+				m_last_overlap.region_size    = wanted_prefix != 0 ? wanted_prefix : desc.info.data.size;
+				m_last_overlap.candidates     = static_cast<uint32_t>(candidates.size());
+			}
 			const bool placement  = ViewPlacementEnabled();
 			ImageId    placed_in  = {};
 			bool       placed_raw = false; // placed against the binding's own address
@@ -7607,6 +7647,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 				result = {};
 			} else if (ImageContainsEnabled() ? !resolved.info.resources.Contains(desc.info.resources)
 			                                  : resolved.info.resources < desc.info.resources) {
+				m_overlap_impure = true;
 				FreeImage(result, HangTrace::ImageFreeReason::SmallerResources);
 				result = {};
 			}
@@ -7623,6 +7664,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			result = InsertImage(desc.info,
 			                     prefix_computed && wanted_prefix == 0 ? 0u : wanted_first,
 			                     wanted_prefix);
+			inserted = true;
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.live.address, inserted.live.size) ||
 			    (AliasBytesEnabled() && OtherImagesOwnBytes(inserted.live, result))) {
@@ -7630,6 +7672,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			}
 		}
 		auto& image = m_slot_images[result];
+		m_last_overlap.pure       = m_last_overlap.overlap && !inserted && !m_overlap_impure;
+		m_last_overlap.inserted   = inserted;
+		m_last_overlap.first_page = first_page_answer;
+		m_last_overlap.result     = result;
 		// KYTY_VIEW_PLACEMENT: the binding's view starts at its place plus its own first mip and
 		// layer (the T#'s BASE_LEVEL and BASE_ARRAY, a target's SLICE_START) when they fit;
 		// otherwise (and without the switch) at its place alone.
@@ -8450,6 +8496,13 @@ static bool SameAliasGrid(const ImageInfo& a, const ImageInfo& b) {
 	       !b.IsVolume();
 }
 
+bool TextureCache::IsAliasSyncSource(const Image& other, const Image& image) {
+	return other.registered && !other.depth_id && other.alias_owner && other.IsGpuModified() &&
+	       !other.IsBufferModified() && !(other.info.HasStencil() && !StencilDepthAliasEnabled()) &&
+	       other.info.data == image.info.data && SameAliasGrid(other.info, image.info) &&
+	       other.backing.samples == image.backing.samples;
+}
+
 bool TextureCache::HasAliasPartner(uint64_t page, ImageId found, const Image& image) const {
 	bool partner = false;
 	if (const auto* owners = m_image_page_table.Find(page); owners != nullptr) {
@@ -8483,11 +8536,8 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	// memory since. Reinterpret the owner's contents, as the recreate path used to, and take over.
 	for (const auto other_id: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
 		const auto* other = m_slot_images.try_get(other_id);
-		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
-		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
-		    (other->info.HasStencil() && !StencilDepthAliasEnabled()) || other->info.data != image.info.data ||
-		    !SameAliasGrid(other->info, image.info) ||
-		    other->backing.samples != image.backing.samples) {
+		// IsAliasSyncSource is this condition (TextureBindingMemo's KYTY_IMG_PARTNER relies on it).
+		if (other_id == id || other == nullptr || !IsAliasSyncSource(*other, image)) {
 			continue;
 		}
 		++m_lookup_side_effects;

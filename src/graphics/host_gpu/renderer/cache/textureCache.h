@@ -189,6 +189,32 @@ public:
 	// Diagnostics (KYTY_DRAW_SEQUENCE_VERIFY): residency extensions and alias synchronizations
 	// FindImage has performed; a repeat must add none.
 	[[nodiscard]] uint64_t      LookupSideEffects() const noexcept { return m_lookup_side_effects; }
+	// KYTY_IMG_STATS / KYTY_IMG_OVERLAP: how the last FindImage reached its answer when the first-page
+	// lookup found nothing. `pure`: every ResolveOverlap branch it took returned without an effect
+	// or a time-dependent decision, and nothing was inserted, so the same lookup over the same
+	// owner lists of the region's pages returns `result` again with nothing else done.
+	struct OverlapLookup {
+		bool     overlap        = false;
+		bool     pure           = false;
+		bool     inserted       = false;
+		bool     first_page     = false; // the first-page lookup answered (no overlap loop)
+		// Candidates whose branch depended on time (safe_to_delete) and was decided "keep, do
+		// nothing" (safe_to_delete false): the same branch is taken again exactly while
+		// OverlapSafeToDelete stays false for each (checked live by the memo). More than
+		// MaxTimed such candidates make the lookup impure.
+		static constexpr uint32_t MaxTimed = 4;
+		uint32_t                  timed_count = 0;
+		std::array<ImageId, MaxTimed> timed {};
+		ImageInfo requested;             // the description's info as FindImage got it
+		uint32_t candidates     = 0;
+		uint64_t region_address = 0;
+		uint64_t region_size    = 0;
+		ImageId  result;
+	};
+	[[nodiscard]] const OverlapLookup& LastOverlap() const noexcept { return m_last_overlap; }
+	// ResolveOverlap's safe_to_delete for a candidate image, as it would be decided now (GPU
+	// thread; caller holds m_lock).
+	[[nodiscard]] bool OverlapSafeToDelete(const Image& cached) const;
 	// Diagnostics (KYTY_CP_COMMIT=texdcc verify): DCC decisions of MaterializeDccClear that did
 	// something (a slice clear, or a native GPU inspection); a memo hit's full resolution adds none.
 	[[nodiscard]] uint64_t      DccDecisionEffects() const noexcept { return m_dcc_decision_effects; }
@@ -686,6 +712,9 @@ private:
 	void EraseSurfaceMeta(uint64_t address);
 	// SyncAliasFromOwner returns before looking for an owner (caller holds m_lock).
 	[[nodiscard]] static bool SyncAliasReturnsAtOnce(const Image& image);
+	// Whether SyncAliasFromOwner, for `image`, would take `other` (another image of its region) as
+	// the owner to copy from (its loop condition; caller holds m_lock).
+	[[nodiscard]] static bool IsAliasSyncSource(const Image& other, const Image& image);
 	// Whether a registered image other than `found` has exactly its backing range, extent and
 	// sample count on `page` (SyncAliasFromOwner's only possible owners). Caller holds m_lock.
 	[[nodiscard]] bool HasAliasPartner(uint64_t page, ImageId found, const Image& image) const;
@@ -1049,6 +1078,11 @@ private:
 	// Set by FindImage for the ResolveOverlap calls of one lookup: many live overlapping
 	// images already share the requested range, so overlapped images are not kept.
 	bool             m_overlap_crowded     = false;
+	// Set by ResolveOverlap when a branch has an effect (free, expansion, merge, depth copy) or a
+	// time-dependent decision (safe_to_delete, the keep window); reset by FindImage per lookup.
+	bool             m_overlap_impure      = false;
+	// The last FindImage's overlap path (GPU thread): see LastOverlap.
+	OverlapLookup    m_last_overlap;
 	uint64_t         m_partial_verify_mismatches = 0;
 	// KYTY_TEXTURE_ASYNC_STAGING=0: null, staging copies stay on the GPU thread.
 	std::unique_ptr<StagingCopier> m_staging_copier;

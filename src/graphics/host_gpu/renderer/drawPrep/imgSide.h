@@ -70,6 +70,68 @@ enum class C : uint8_t {
 	FindTargetRep, // of which: TryRepeatLookup answered
 	Transit,       // Image::Transit
 	TransitNoOp,   // of which: predicted no-op
+	// Record rejects by reason (RecReject is their sum).
+	RejRebased,    // FindImage rebased the view (a mip/slice of a larger image)
+	RejOtherImage, // the binding's image is not FindImage's answer (stencil association redirect)
+	RejDcc,        // DCC description without a provable certificate
+	RejNull,       // null description whose image is not the permanent null image
+	RejMode,       // image lookup mode is not FirstPage
+	RejImage,      // FindImage's answer unregistered / gone / stencil association
+	RejPages,      // the image's range has no page range
+	RejBacking,    // FindImageWithSameBacking of the final description is not FindImage's answer
+	// MissPartner split: what SyncAliasFromOwner would do for that image now.
+	PartnerAtOnce, // returns at once (the image owns the bytes in its sense)
+	PartnerNoOwner, // no registered image qualifies as the owner to copy from: a no-op
+	PartnerOwner,  // an owner qualifies: it copies (or adopts the owner's serial) and takes over
+	// Rejects (rebased / backing) whose FindImage answer came from a pure overlap loop
+	// (TextureCache::OverlapLookup::pure), of which over a region of at most 4 pages, of which with
+	// one candidate.
+	OvlPure,
+	OvlPurePages,
+	OvlPureOne,
+	// Backing rejects split: the lookup's path (first-page answer / overlap loop impure / overlap loop
+	// that inserted), and what FindImageWithSameBacking(final description) finds (none / another
+	// image), and whether several images on the page have that backing.
+	BkFirstPage,
+	BkOvlImpure,
+	BkOvlInserted,
+	BkSbNone,
+	BkSbOther,
+	BkSbMulti,
+	BkDescChanged, // the description FindImage was given differs from the final one (info)
+	// AcquireSame split: why the draw-run acquisition reuse (DrawRunAcquireCandidate) did not take
+	// an acquisition of the same targets as the previous one (first failing condition).
+	AcqWhyCaller,  // not a draw's acquisition (another caller) / reuse not tried
+	AcqWhyOff,     // KYTY_DRAW_RUN(_ACQUIRE) off, or a verify mode of the run
+	AcqWhyNoPrev,  // no recorded previous draw (m_run_prev_valid false)
+	AcqWhyEngine,  // not inside the engine commit
+	AcqWhyRecord,  // the record has no acquisition (record ineligible / no depth slot)
+	AcqWhyCount,   // colour count differs from the record
+	AcqWhyActivity, // activity epoch moved since the record
+	AcqWhyCommand, // another command buffer
+	AcqWhyTick,    // another scheduler tick
+	AcqWhyInstance, // no active rendering instance, or another one
+	AcqWhyWritten, // the scissor union differs
+	AcqWhyTargets, // colour/depth target infos differ
+	AcqWhyFeedback, // a texture is an attachment or lies over one
+	AcqWhyImages,  // an image changed (DrawRunImagesUnchanged)
+	AcqWhyNone,    // the candidate check passes (reuse taken elsewhere / verify)
+	// Of the AcqWhyNoPrev acquisitions: what the previous draw's KYTY_IMG_ACQSEED step did
+	// (RenderExecutor::SeedWhy; the first is "the step was not reached").
+	SeedWhyNotReached,
+	SeedWhyKernel,
+	SeedWhyEligible,
+	SeedWhyOff,
+	SeedWhyNotEngine,
+	SeedWhyFeedback,
+	SeedWhyRendering,
+	SeedWhyWrites,
+	SeedWhyClears,
+	SeedWhyProgram,
+	SeedWhyTextures,
+	SeedWhyDepthPromotion,
+	SeedWhyOverAttachment,
+	SeedWhyRecorded,
 	Count
 };
 
@@ -122,10 +184,28 @@ enum class Mode : uint8_t { Off = 0, On = 1, Verify = 2 };
 
 enum class S : uint8_t {
 	Memo2Evict,    // KYTY_IMG_MEMO2: primary entries moved into the second level
-	Memo2Hit,      // second-level entries promoted (on) / claimed (verify)
+	Memo2Hit,      // second-level entries promoted (on) / claimed (verify) / found (in place)
 	Memo2Miss,     // primary misses the second level did not hold
 	Memo2Checks,   // verify: claims compared with the full resolution
 	Memo2Mismatch, // verify: claims that differed
+	Memo2Copies,   // memo entry copies (~1 KiB each): evictions and promotions
+	InplaceHit,    // KYTY_IMG_INPLACE: second-level entries that answered in place
+	InplaceChecks, // verify: in-place answers and views compared with the full path
+	InplaceMismatch,
+	PartnerHit,    // KYTY_IMG_PARTNER: alias-partner entries answered that the old rule refused
+	PartnerSync,   // ... of which the hit performed SyncAliasFromOwner (an owner qualified)
+	InplaceRunHit, // KYTY_IMG_INPLACE: worker-hinted run hits on second-level entries
+	PartnerChecks, // verify: claims compared with the full resolution (and its side effects)
+	PartnerMismatch,
+	OverlapRecords, // KYTY_IMG_OVERLAP: overlap-loop answers recorded
+	OverlapHit,    // ... that answered
+	OverlapChecks, // verify: claims compared with the full resolution
+	OverlapMismatch,
+	AcqSeedRecords, // KYTY_IMG_ACQSEED: acquisitions seeded by run-ineligible draws
+	AcqSeedHit,     // ... reused by the next draw
+	AcqSeedChecks,  // verify: reusable acquisitions compared with the acquisition
+	AcqSeedMismatch,
+	Frames,        // frame boundaries (per-frame figures of the line)
 	Count
 };
 
@@ -146,6 +226,32 @@ template <typename SameKey, typename Empty>
 	return static_cast<uint32_t>(next++ % ways);
 }
 
+// KYTY_IMG_INPLACE's memo slot numbering: primary slots are [0, primary); the second-level entry of
+// `set`, `way` is primary + set * ways + way (TextureBinding::memo_slot names either kind).
+[[nodiscard]] constexpr uint32_t SecondSlot(uint32_t primary, uint32_t set, uint32_t ways, uint32_t way) {
+	return primary + set * ways + way;
+}
+[[nodiscard]] constexpr bool IsSecondSlot(uint32_t slot, uint32_t primary) {
+	return slot >= primary;
+}
+
+// KYTY_IMG_PARTNER's decision for a memo entry whose image has an alias partner. old_blocks: the
+// old rule refuses it (the image is not the alias owner and has no stencil); sync_noop:
+// SyncAliasFromOwner would do nothing now (returns at once, or no image qualifies as the owner).
+// HitSync: the hit performs SyncAliasFromOwner itself, at the point FindImage performs it.
+enum class PartnerAction : uint8_t { Hit, HitSync, Miss, Claim };
+[[nodiscard]] constexpr PartnerAction PartnerDecision(Mode mode, bool old_blocks, bool sync_noop) {
+	switch (mode) {
+		case Mode::On: return sync_noop ? PartnerAction::Hit : PartnerAction::HitSync;
+		case Mode::Verify:
+			// The old result (a miss: the full resolution), with a claim to compare where the old rule
+			// refused.
+			return !old_blocks ? PartnerAction::Hit : PartnerAction::Claim;
+		case Mode::Off:
+		default: return old_blocks ? PartnerAction::Miss : PartnerAction::Hit;
+	}
+}
+
 // Counters of the commit thread (single writer).
 inline std::array<std::atomic<uint64_t>, static_cast<size_t>(S::Count)>& SwitchCounters() {
 	static std::array<std::atomic<uint64_t>, static_cast<size_t>(S::Count)> counters {};
@@ -160,6 +266,19 @@ void ReportMismatch(S counter, const char* what);
 
 // The switches' current values (registered in imgSide.cpp).
 [[nodiscard]] Mode Memo2Mode();
+// KYTY_IMG_INPLACE (needs KYTY_IMG_MEMO2=1): a second-level entry answers where it is stored
+// instead of being swapped into its primary slot (textureBindingMemo.h).
+[[nodiscard]] Mode InplaceMode();
+// KYTY_IMG_PARTNER: an entry with an alias partner answers while SyncAliasFromOwner would do
+// nothing (no registered image qualifies as the owner to copy from; textureBindingMemo.h).
+[[nodiscard]] Mode PartnerMode();
+// KYTY_IMG_OVERLAP: answers of FindImage's overlap loop (rebased views, other-format views at the
+// same address) are memoized while the loop was pure and the region's pages keep their versions
+// (textureBindingMemo.h).
+[[nodiscard]] Mode OverlapMode();
+// KYTY_IMG_ACQSEED: an ordinary acquisition of a draw that may not seed a draw run seeds the next
+// draw's acquisition reuse (render.h, RenderExecutor::AcquireSeed).
+[[nodiscard]] Mode AcqSeedMode();
 
 // The 10 s lines (stats with KYTY_IMG_STATS; the switches' counters while any is not off).
 void PrintSummary();

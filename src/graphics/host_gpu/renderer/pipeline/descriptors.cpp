@@ -1650,15 +1650,25 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 				binding = std::move(full);
 			}
 		}
+		if (m_texture_memo.LastHitInplaceVerify()) {
+			// KYTY_IMG_INPLACE=verify: the full resolution (without the memo) for an in-place
+			// second-level answer; it replaces the answer when they differ.
+			TextureBinding full;
+			ResolveTextureFull(resource, descriptor, memo_key, hash, false, full);
+			if (m_texture_memo.InplaceDiffers(binding, full)) {
+				binding = std::move(full);
+			}
+		}
 		return;
 	}
 	if (!memo) {
 		ImgSide::Count(ImgSide::C::MissNoMemo);
 	}
 	ResolveTextureFull(resource, descriptor, memo_key, hash, memo, binding);
-	// KYTY_IMG_MEMO2=verify: the second level's claim for this key against the full resolution.
+	// KYTY_IMG_MEMO2=verify / KYTY_IMG_PARTNER=verify: the claim for this key against the full
+	// resolution.
 	if (memo) {
-		m_texture_memo.VerifySecondClaim(binding);
+		m_texture_memo.VerifyClaim(texture_cache, binding);
 	}
 }
 

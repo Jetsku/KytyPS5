@@ -1040,8 +1040,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		ImgSide::Count(ImgSide::C::Acquire);
 		if (signature == last_signature) {
 			ImgSide::Count(ImgSide::C::AcquireSame);
+			ImgSide::Count(static_cast<ImgSide::C>(static_cast<uint8_t>(ImgSide::C::AcqWhyCaller) + m_acq_why));
+			if (m_acq_why == 2) {
+				ImgSide::Count(static_cast<ImgSide::C>(static_cast<uint8_t>(ImgSide::C::SeedWhyNotReached) +
+				                                       m_seed_why_prev));
+			}
 		}
 		last_signature = signature;
+		m_acq_why      = 0;
 	}
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
@@ -3861,6 +3867,10 @@ static void NoteSkipLookup(SkipRefusal reason, uint64_t ns) {
 }
 
 void RenderExecutor::BeginDrawRun() {
+	m_acq_seed_prev      = m_acq_seed.valid; // KYTY_IMG_ACQSEED
+	m_acq_seed.valid     = false;
+	m_seed_why_prev      = m_seed_why;
+	m_seed_why           = 0;
 	m_run_prev_valid     = m_run.valid;
 	m_run_keepable       = m_run.valid;
 	m_run.valid          = false;
@@ -3962,11 +3972,17 @@ static bool DrawRunTextureReady(const Image& image) {
 // states, 10 content serial, 11 unregistered, 12 CPU-dirty, 13 buffer-modified, 14 texture refresh).
 uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachments_only,
                                            bool log_change, bool attachment_serials) const {
+	return DrawRunMarksChange(m_run.images, compare_serials, attachments_only, log_change, attachment_serials);
+}
+
+uint32_t RenderExecutor::DrawRunMarksChange(std::span<const DrawRunImage> marks, bool compare_serials,
+                                          bool attachments_only, bool log_change,
+                                          bool attachment_serials) const {
 	auto&            cache = m_context.GetTextureCache();
 	std::scoped_lock lock {cache.m_lock};
 	const auto&      images = cache.m_slot_images;
-	for (uint32_t index = 0; index < m_run.images.size(); index++) {
-		const auto& mark = m_run.images[index];
+	for (uint32_t index = 0; index < marks.size(); index++) {
+		const auto& mark = marks[index];
 		if (attachments_only && mark.texture) {
 			continue;
 		}
@@ -4761,6 +4777,169 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 		}
 	}
 	return DrawRunImagesUnchanged(true, true);
+}
+
+uint8_t RenderExecutor::DrawRunSeedAcquire(const CommandBuffer& buffer, const DrawRenderState& state,
+                                        const RenderState& rendering, std::span<PreparedBindings* const> stages,
+                                        const vk::Rect2D* written) {
+	auto& seed = m_acq_seed;
+	seed.valid = false;
+	auto& cache = m_context.GetTextureCache();
+	{
+		std::scoped_lock lock {cache.m_lock};
+		// As DrawRunRecordDraw: a draw that just established an unwritten-instance depth proof seeds
+		// nothing (the next acquisition must run to publish the union and its deferred ordering).
+		if (state.depth_info.image_id && DepthFeedbackKeepEnabled() && !DepthFeedbackLazyEnabled() &&
+		    !state.depth_info.AttachmentWriteAspects()) {
+			const auto* depth = cache.m_slot_images.try_get(state.depth_info.image_id);
+			const auto attachment_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+			                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+			if (depth != nullptr && depth->backing.state.access_mask == attachment_access &&
+			    depth->feedback_instance == buffer.ActiveRenderingSerial() &&
+			    depth->feedback_serial == depth->ContentSerial()) {
+				return 11;
+			}
+		}
+		seed.marks.clear();
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			seed.marks.push_back(MakeDrawRunImage(state.color_info[i].image_id, false));
+		}
+		if (state.depth_info.image_id) {
+			seed.marks.push_back(MakeDrawRunImage(state.depth_info.image_id, false));
+		}
+		// As DrawRunRecordDraw: no texture of the draw over an attachment's memory (an alias of it).
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				const auto* image = cache.m_slot_images.try_get(binding.image_id);
+				if (image == nullptr || DrawRunOverAttachment(seed.marks, image->info.data.address,
+				                                              image->info.data.size)) {
+					return 12;
+				}
+			}
+		}
+	}
+	seed.activity         = DrawRun::ActivityEpoch();
+	seed.command          = buffer.Identity();
+	seed.tick             = m_context.GetCommandScheduler().CurrentTick();
+	seed.rendering_serial = buffer.ActiveRenderingSerial();
+	seed.rendering        = rendering;
+	seed.colors.assign(state.color_info, state.color_info + state.color_count);
+	seed.depth.assign(1, state.depth_info);
+	seed.bounded = written != nullptr;
+	seed.written = written != nullptr ? *written : vk::Rect2D {};
+	seed.valid   = true;
+	ImgSide::Bump(ImgSide::S::AcqSeedRecords);
+	return 13;
+}
+
+bool RenderExecutor::DrawRunSeedCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
+                                          std::span<PreparedBindings* const> stages,
+                                          const vk::Rect2D* written) const {
+	// DrawRunAcquireCandidate's conditions, against the seed.
+	const auto& seed = m_acq_seed;
+	// (BeginDrawRun moved the seed's validity into m_acq_seed_prev.)
+	if (!m_acq_seed_prev || !m_in_engine_commit || seed.colors.size() != state.color_count ||
+	    DrawRun::ActivityEpoch() != seed.activity || buffer.Identity() != seed.command ||
+	    m_context.GetCommandScheduler().CurrentTick() != seed.tick || buffer.ActiveRenderingSerial() == 0 ||
+	    buffer.ActiveRenderingSerial() != seed.rendering_serial || (written != nullptr) != seed.bounded ||
+	    (written != nullptr && *written != seed.written)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!SameRenderColorInfo(state.color_info[i], seed.colors[i])) {
+			return false;
+		}
+	}
+	if (seed.depth.size() != 1 || !SameRenderDepthInfo(state.depth_info, seed.depth[0])) {
+		return false;
+	}
+	{
+		auto&            cache = m_context.GetTextureCache();
+		std::scoped_lock lock {cache.m_lock};
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				const auto* image = cache.m_slot_images.try_get(binding.image_id);
+				if (image == nullptr) {
+					return false;
+				}
+				for (const auto& mark: seed.marks) {
+					if (mark.id == binding.image_id) {
+						return false;
+					}
+				}
+				if (DrawRunOverAttachment(seed.marks, image->info.data.address, image->info.data.size)) {
+					return false;
+				}
+			}
+		}
+	}
+	return DrawRunMarksChange(seed.marks, true, true, false, !m_run_recall) == 0;
+}
+
+uint8_t RenderExecutor::DrawRunAcquireRefusal(const CommandBuffer&               buffer,
+                                              const DrawRenderState&             state,
+                                              std::span<PreparedBindings* const> stages,
+                                              const vk::Rect2D*                  written) const {
+	// DrawRunAcquireCandidate's conditions in its order, by reason.
+	const auto& run = m_run;
+	if (!m_run_prev_valid) {
+		return 2;
+	}
+	if (!m_in_engine_commit) {
+		return 3;
+	}
+	if (!run.acquire_valid || run.depth.size() != 1) {
+		return 4;
+	}
+	if (run.colors.size() != run.color_count || state.color_count != run.color_count) {
+		return 5;
+	}
+	if (DrawRun::ActivityEpoch() != run.activity) {
+		return 6;
+	}
+	if (buffer.Identity() != run.command) {
+		return 7;
+	}
+	if (m_context.GetCommandScheduler().CurrentTick() != run.tick) {
+		return 8;
+	}
+	if (buffer.ActiveRenderingSerial() == 0 || buffer.ActiveRenderingSerial() != run.rendering_serial) {
+		return 9;
+	}
+	if ((written != nullptr) != run.bounded || (written != nullptr && *written != run.written)) {
+		return 10;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!SameRenderColorInfo(state.color_info[i], run.colors[i])) {
+			return 11;
+		}
+	}
+	if (!SameRenderDepthInfo(state.depth_info, run.depth[0])) {
+		return 11;
+	}
+	{
+		auto&            cache = m_context.GetTextureCache();
+		std::scoped_lock lock {cache.m_lock};
+		const auto attachments = std::span<const DrawRunImage>(run.images).subspan(
+		    std::min<size_t>(run.attachments_begin, run.images.size()));
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				const auto* image = cache.m_slot_images.try_get(binding.image_id);
+				if (image == nullptr) {
+					return 12;
+				}
+				for (const auto& mark: attachments) {
+					if (!mark.texture && mark.id == binding.image_id) {
+						return 12;
+					}
+				}
+				if (DrawRunOverAttachment(attachments, image->info.data.address, image->info.data.size)) {
+					return 12;
+				}
+			}
+		}
+	}
+	return DrawRunImagesChange(true, true, false, !m_run_recall) != 0 ? 13 : 14;
 }
 
 bool RenderExecutor::DrawRunPartialPush(const CommandBuffer&           buffer,
@@ -7091,6 +7270,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// its rendering instance, with the attachments as it left them: its acquisition, whose
 		// transitions, claims, refreshes and depth-feedback bookkeeping would all be repeats.
 		// (Verify mode checks a would-be continuation's acquisition as the continuation's.)
+		if (ImgSide::StatsEnabled()) [[unlikely]] {
+			m_acq_why = !DrawRun::Enabled() || !DrawRun::AcquireReuseEnabled() || m_run_verify || m_texdelta_verify
+			                ? uint8_t {1}
+			                : DrawRunAcquireRefusal(buffer, state, stages, bounded ? &written : nullptr);
+		}
 		CommitStats::SubScope candidate_scope(CommitStats::Sub::AcqCandidate);
 		const bool acquire_reuse =
 		    DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify && !m_texdelta_verify &&
@@ -7099,9 +7283,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (acquire_reuse) {
 			OwnedCounters::Add(DrawRun::GetTotals().acquire_reused, 1);
 		}
-		if (acquire_reuse && DrawRun::GetMode() == DrawRun::Mode::On) {
+		// KYTY_IMG_ACQSEED: no run record, but the previous draw's acquisition was seeded.
+		const auto seed_mode = ImgSide::AcqSeedMode();
+		const bool seed_reuse = !acquire_reuse && seed_mode != ImgSide::Mode::Off && !m_run_prev_valid &&
+		                        DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify &&
+		                        !m_texdelta_verify &&
+		                        DrawRunSeedCandidate(buffer, state, stages, bounded ? &written : nullptr);
+		if (seed_reuse && seed_mode == ImgSide::Mode::On) {
+			ImgSide::Bump(ImgSide::S::AcqSeedHit);
+			rendering_own          = m_acq_seed.rendering;
+			m_depth_feedback.valid = false;
+		} else if (acquire_reuse && DrawRun::GetMode() == DrawRun::Mode::On) {
 			rendering_own          = m_run.rendering;
 			m_depth_feedback.valid = false;
+		} else if (seed_reuse) {
+			// KYTY_IMG_ACQSEED=verify: the acquisition the seed would skip must be a repeat (the checks
+			// of KYTY_DRAW_RUN_ACQUIRE's verify mode); it provides the result.
+			const auto transitions = Image::RecordedTransitions();
+			rendering_own = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+			                                     state.depth_info, feedback_aspects, stages,
+			                                     bounded ? &written : nullptr);
+			ImgSide::Bump(ImgSide::S::AcqSeedChecks);
+			if (!(*rendering_own == m_acq_seed.rendering) || feedback_aspects) {
+				ImgSide::ReportMismatch(ImgSide::S::AcqSeedMismatch, "acqseed: the acquisition's rendering state differs");
+			} else if (Image::RecordedTransitions() != transitions) {
+				ImgSide::ReportMismatch(ImgSide::S::AcqSeedMismatch, "acqseed: the acquisition recorded transitions");
+			} else if (DrawRunMarksChange(m_acq_seed.marks, false, true, false, true) != 0) {
+				ImgSide::ReportMismatch(ImgSide::S::AcqSeedMismatch, "acqseed: the acquisition changed an attachment's state");
+			}
 		} else {
 			const auto acquire_transitions =
 			    acquire_reuse || texdelta_compare ? Image::RecordedTransitions() : uint64_t {0};
@@ -7746,6 +7955,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                             !graphics_debug_dump_enabled();
 	if (m_kernel && DrawRun::Enabled()) {
 		const CommitStats::SubScope record_scope(CommitStats::Sub::RunRecord);
+		m_seed_why = 1; // KYTY_IMG_STATS: the kernel path seeds nothing
 		if (kernel_eligible) {
 			DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages,
 			                  bounded ? &written : nullptr, pipeline);
@@ -7887,6 +8097,41 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_run.writes = program_writes;
 			if (!continued) {
 				m_run.record_writes_ok = writes_ok;
+			}
+		}
+		if (eligible) {
+			m_seed_why = 2;
+		} else {
+			// KYTY_IMG_ACQSEED: an ordinary acquisition of a draw that may not seed a run seeds the next
+			// draw's acquisition reuse (m_seed_why: which condition refused, for KYTY_IMG_STATS).
+			bool clears = rendering.depth_stencil_attachment.depth_clear ||
+			              rendering.depth_stencil_attachment.stencil_clear;
+			for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+				clears = clears || rendering.color_attachments[i].is_clear;
+			}
+			bool program_ok  = true;
+			bool textures_ok = true;
+			for (const auto* stage: stages) {
+				program_ok = program_ok && stage->gds.buffer == nullptr &&
+				             DrawRunProgramEligible(*stage->runtime->program, false, g_draw_run_fault_buffer.On());
+				for (const auto& binding: stage->images) {
+					textures_ok = textures_ok && !is_attachment(binding.image_id) &&
+					              binding.desc.type != TextureCache::BindingType::Storage;
+				}
+			}
+			m_seed_why = ImgSide::AcqSeedMode() == ImgSide::Mode::Off ? 3
+			             : !m_in_engine_commit                         ? 4
+			             : feedback_aspects                            ? 5
+			             : buffer.ActiveRenderingSerial() == 0 || !RenderStateFastEnabled(RenderStatePart::Reset) ||
+			                       graphics_debug_dump_enabled()
+			                 ? 6
+			             : shader_write_stages ? 7
+			             : clears              ? 8
+			             : !program_ok         ? 9
+			             : !textures_ok        ? 10
+			                                   : 0;
+			if (m_seed_why == 0) {
+				m_seed_why = DrawRunSeedAcquire(buffer, state, rendering, stages, bounded ? &written : nullptr);
 			}
 		}
 		if (kernel_verify) {

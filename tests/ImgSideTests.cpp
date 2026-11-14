@@ -1,5 +1,5 @@
-// KYTY_IMG_* (drawPrep/imgSide.h): the switch parser, the second-level way choice of KYTY_IMG_MEMO2
-// and the switch counters.
+// KYTY_IMG_* (drawPrep/imgSide.h): the switch parser, the second-level way choice of KYTY_IMG_MEMO2,
+// KYTY_IMG_INPLACE's slot numbering, KYTY_IMG_PARTNER's decision table and the switch counters.
 #include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 
 #include <array>
@@ -84,12 +84,71 @@ void TestCounters() {
 	Check(!ImgSide::StatsEnabled(), "stats off by default");
 }
 
+void TestSlots() {
+	// 4096 primary slots, 8192 sets x 4 ways behind them.
+	constexpr uint32_t primary = 4096;
+	Check(!ImgSide::IsSecondSlot(0, primary) && !ImgSide::IsSecondSlot(primary - 1, primary),
+	      "primary slots are below the primary count");
+	Check(ImgSide::SecondSlot(primary, 0, 4, 0) == primary, "first second-level slot follows them");
+	Check(ImgSide::IsSecondSlot(ImgSide::SecondSlot(primary, 0, 4, 0), primary), "and is a second-level slot");
+	Check(ImgSide::SecondSlot(primary, 8191, 4, 3) == primary + 32767, "last second-level slot");
+	// Distinct (set, way) pairs get distinct slots.
+	bool distinct = true;
+	for (uint32_t set = 0; set < 3; set++) {
+		for (uint32_t way = 0; way < 4; way++) {
+			distinct = distinct && ImgSide::SecondSlot(primary, set, 4, way) - primary == set * 4 + way;
+		}
+	}
+	Check(distinct, "slots are set * ways + way after the primary ones");
+}
+
+void TestPartnerDecision() {
+	using ImgSide::Mode;
+	using ImgSide::PartnerAction;
+	// Off: the old rule only.
+	Check(ImgSide::PartnerDecision(Mode::Off, true, true) == PartnerAction::Miss, "off: old rule refuses");
+	Check(ImgSide::PartnerDecision(Mode::Off, false, false) == PartnerAction::Hit, "off: old rule answers");
+	// On: whether SyncAliasFromOwner would do nothing, whatever the old rule says.
+	Check(ImgSide::PartnerDecision(Mode::On, true, true) == PartnerAction::Hit, "on: no owner to sync from");
+	Check(ImgSide::PartnerDecision(Mode::On, true, false) == PartnerAction::HitSync, "on: an owner qualifies: sync in the hit");
+	Check(ImgSide::PartnerDecision(Mode::On, false, false) == PartnerAction::HitSync,
+	      "on: a syncable stencil image the old rule let answer is synchronized");
+	Check(ImgSide::PartnerDecision(Mode::On, false, true) == PartnerAction::Hit, "on: owner of the bytes");
+	// Verify: the old result, with a claim where the new rule would answer.
+	Check(ImgSide::PartnerDecision(Mode::Verify, true, true) == PartnerAction::Claim, "verify: claim");
+	Check(ImgSide::PartnerDecision(Mode::Verify, true, false) == PartnerAction::Claim, "verify: claim (sync)");
+	Check(ImgSide::PartnerDecision(Mode::Verify, false, false) == PartnerAction::Hit, "verify: old hit kept");
+}
+
+void TestReasonOrder() {
+	// renderDraw.cpp counts AcqWhyCaller + n for DrawRunAcquireRefusal's n (2 .. 14).
+	const auto at = [](uint8_t n) { return static_cast<ImgSide::C>(static_cast<uint8_t>(ImgSide::C::AcqWhyCaller) + n); };
+	Check(at(1) == ImgSide::C::AcqWhyOff && at(2) == ImgSide::C::AcqWhyNoPrev && at(9) == ImgSide::C::AcqWhyInstance &&
+	          at(13) == ImgSide::C::AcqWhyImages && at(14) == ImgSide::C::AcqWhyNone,
+	      "acquisition refusal codes map onto the AcqWhy counters");
+	Check(static_cast<uint8_t>(ImgSide::C::AcqWhyNone) + 1 == static_cast<uint8_t>(ImgSide::C::SeedWhyNotReached),
+	      "the seed reasons follow the refusal codes");
+	// renderDraw.cpp counts SeedWhyNotReached + RenderExecutor::m_seed_why (0 .. 13).
+	const auto seed = [](uint8_t n) {
+		return static_cast<ImgSide::C>(static_cast<uint8_t>(ImgSide::C::SeedWhyNotReached) + n);
+	};
+	Check(seed(1) == ImgSide::C::SeedWhyKernel && seed(2) == ImgSide::C::SeedWhyEligible &&
+	          seed(3) == ImgSide::C::SeedWhyOff && seed(10) == ImgSide::C::SeedWhyTextures &&
+	          seed(11) == ImgSide::C::SeedWhyDepthPromotion && seed(13) == ImgSide::C::SeedWhyRecorded,
+	      "seed outcome codes map onto the SeedWhy counters");
+	Check(static_cast<uint8_t>(ImgSide::C::SeedWhyRecorded) + 1 == static_cast<uint8_t>(ImgSide::C::Count),
+	      "SeedWhyRecorded is the last counter");
+}
+
 } // namespace
 
 int main() {
 	TestParse();
 	TestPickWay();
 	TestCounters();
+	TestSlots();
+	TestPartnerDecision();
+	TestReasonOrder();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;

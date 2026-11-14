@@ -1710,6 +1710,10 @@ private:
 	[[nodiscard]] uint32_t DrawRunImagesChange(bool compare_serials,
 	                                           bool attachments_only = false, bool log_change = false,
 	                                           bool attachment_serials = true) const;
+	// DrawRunImagesChange over any marks (the run's, or KYTY_IMG_ACQSEED's).
+	[[nodiscard]] uint32_t DrawRunMarksChange(std::span<const DrawRunImage> marks, bool compare_serials,
+	                                          bool attachments_only, bool log_change,
+	                                          bool attachment_serials) const;
 	[[nodiscard]] bool DrawRunImagesUnchanged(bool compare_serials,
 	                                          bool attachments_only = false) const;
 	// Whether a guest range lies over one of the marked attachments.
@@ -1722,6 +1726,47 @@ private:
 	                                           const DrawRenderState&             state,
 	                                           std::span<PreparedBindings* const> stages,
 	                                           const vk::Rect2D*                  written) const;
+	// KYTY_IMG_STATS (diagnostics): the first condition of DrawRunAcquireCandidate that fails, as
+	// ImgSide::C::AcqWhyCaller + n (n = 2 no record ... 13 images changed, 14 none fails).
+	[[nodiscard]] uint8_t DrawRunAcquireRefusal(const CommandBuffer&               buffer,
+	                                            const DrawRenderState&             state,
+	                                            std::span<PreparedBindings* const> stages,
+	                                            const vk::Rect2D*                  written) const;
+	// The refusal of the draw whose acquisition runs next (0: not a draw's acquisition).
+	uint8_t m_acq_why = 0;
+	// KYTY_IMG_ACQSEED (live 0|1|verify, default 0; drawPrep/imgSide.h): the acquisition of a draw that
+	// may not seed a draw run (a mesh draw, more than one vertex stage, no structure key, ...) but
+	// whose acquisition is an ordinary one (no feedback, no clears, no texture over an attachment, no
+	// shader writes, no storage image) seeds KYTY_DRAW_RUN_ACQUIRE's reuse for the next draw, under
+	// the same proof (DrawRunAcquireCandidate's conditions against this record). Taken after the
+	// draw, as DrawRunRecordDraw takes the run's; valid for the next draw only (BeginDrawRun).
+	struct AcquireSeed {
+		bool                         valid            = false;
+		uint64_t                     activity         = 0;
+		vk::CommandBuffer            command          = nullptr;
+		uint64_t                     tick             = 0;
+		uint64_t                     rendering_serial = 0;
+		RenderState                  rendering;
+		std::vector<DrawRunImage>    marks; // the attachments, as the draw left them
+		std::vector<RenderColorInfo> colors;
+		std::vector<RenderDepthInfo> depth; // one entry (an incomplete type here)
+		vk::Rect2D                   written {};
+		bool                         bounded = false;
+	};
+	AcquireSeed m_acq_seed;
+	bool        m_acq_seed_prev = false; // m_acq_seed.valid when the committed draw began
+	// KYTY_IMG_STATS: what the draw's seeding step did (ImgSide::C::SeedWhyNotReached + n), and the
+	// previous draw's.
+	uint8_t m_seed_why      = 0;
+	uint8_t m_seed_why_prev = 0;
+	// Returns the seed outcome (m_seed_why: 11 depth promotion, 12 a texture over an attachment,
+	// 13 recorded).
+	uint8_t DrawRunSeedAcquire(const CommandBuffer& buffer, const DrawRenderState& state,
+	                        const RenderState& rendering, std::span<PreparedBindings* const> stages,
+	                        const vk::Rect2D* written);
+	[[nodiscard]] bool DrawRunSeedCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
+	                                        std::span<PreparedBindings* const> stages,
+	                                        const vk::Rect2D* written) const;
 	// A continuation's kept textures and attachments are marked bound for the draw as their
 	// resolution marks them (BindImage, BindRenderTarget), before the draw's buffer work.
 	// attachments_only (KYTY_DRAW_RUN_TEXDELTA): the textures are resolved by the draw itself.
