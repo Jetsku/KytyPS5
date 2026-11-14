@@ -6453,6 +6453,11 @@ struct PipelineCache::RtState {
 		// KYTY_COMPUTE_BACKGROUND_WORDS: a huge compute program, not a software RT kernel (its
 		// failure does not turn software RT off; its module is pinned while it builds).
 		bool                                       huge         = false;
+		uint64_t                                   skipped      = 0; // dispatches skipped while it built
+		uint64_t                                   ran          = 0; // dispatches run (KYTY_RT_PIPELINE_LOG)
+		uint64_t                                   first_wait_ns = 0; // the CP's waits for it
+		uint64_t                                   asked_ns     = 0; // its first dispatch
+		bool                                       flip_wait    = false; // the next flip waits for it
 	};
 	struct BuildContext {
 		PipelineCache*                cache  = nullptr;
@@ -6469,19 +6474,107 @@ struct PipelineCache::RtState {
 		return static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 4), 1, 8));
 	}
 
+	// KYTY_RT_PIPELINE_WAIT_MS (default 250): the first-dispatch wait of a huge compute program
+	// (KYTY_COMPUTE_BACKGROUND_WORDS); KYTY_RT_PIPELINE_ASYNC=0 waits for every build.
 	static uint32_t WaitBudgetMs() {
 		if (EnvU64("KYTY_RT_PIPELINE_ASYNC", 1) == 0) return UINT32_MAX;
 		return static_cast<uint32_t>(std::min<uint64_t>(EnvU64("KYTY_RT_PIPELINE_WAIT_MS", 250), 600000));
 	}
 
+	// KYTY_RT_KERNEL_WAIT_MS (default 120000, 0 = skip at once): the first-dispatch wait of a direct
+	// software RT kernel (rtSession.h FirstWaitBudgetMs). Only a cold build ever takes long; a
+	// dispatch past the budget is skipped until the build is ready, as before.
+	static uint32_t KernelWaitBudgetMs() {
+		if (EnvU64("KYTY_RT_PIPELINE_ASYNC", 1) == 0) return UINT32_MAX;
+		return static_cast<uint32_t>(std::min<uint64_t>(EnvU64("KYTY_RT_KERNEL_WAIT_MS", 120000), 600000));
+	}
+
+	static std::string BudgetText(uint32_t ms) {
+		return ms == UINT32_MAX ? std::string("for ever") : std::to_string(ms) + " ms";
+	}
+
+	// KYTY_RT_KERNEL_WAIT_AT=flip (default) | dispatch: where the command processor waits for a
+	// direct RT kernel that is not built at its first dispatch. flip: that frame's dispatches of it
+	// are skipped and the frame's flip waits for every such kernel at once, so kernels first used in
+	// the same frame build side by side (one wait of the longest build, not one wait per kernel);
+	// if no flip comes within KYTY_RT_KERNEL_FLIP_WAIT_MS (default 1000) of its first dispatch, a
+	// later dispatch waits itself. dispatch: the first dispatch waits (as KYTY_RT_PIPELINE_ASYNC=0).
+	static bool KernelWaitAtFlip() {
+		const auto* value = std::getenv("KYTY_RT_KERNEL_WAIT_AT");
+		return value == nullptr || std::string_view(value) != "dispatch";
+	}
+
 	explicit RtState(PipelineCache& owner)
-	    : cache(owner), wait_ms(WaitBudgetMs()),
+	    : cache(owner), wait_ms(WaitBudgetMs()), kernel_wait_ms(KernelWaitBudgetMs()),
+	      wait_at_flip(KernelWaitAtFlip() && kernel_wait_ms != UINT32_MAX && kernel_wait_ms != 0),
+	      flip_fallback_ns(std::min<uint64_t>(EnvU64("KYTY_RT_KERNEL_FLIP_WAIT_MS", 1000), 600000) * 1'000'000ull),
 	      queue(BuildThreads(), 64, Common::PlaceCurrentThreadCold) {
-		PipelineCacheLog("Software RT pipelines: built on {} background thread(s); a dispatch waits at most {} "
-		                 "for its kernel's pipeline, then is skipped until it is ready "
-		                 "(KYTY_RT_PIPELINE_WAIT_MS; KYTY_RT_PIPELINE_ASYNC=0 waits for it)",
-		                 BuildThreads(),
-		                 wait_ms == UINT32_MAX ? std::string("for ever") : std::to_string(wait_ms) + " ms");
+		PipelineCacheLog("Software RT pipelines: built on {} background thread(s); an RT kernel not built at its "
+		                 "first dispatch is waited for at most {} (KYTY_RT_KERNEL_WAIT_MS) {}, a huge compute "
+		                 "program at most {} (KYTY_RT_PIPELINE_WAIT_MS); call-split programs never wait; past the "
+		                 "budget dispatches are skipped until it is ready (KYTY_RT_PIPELINE_ASYNC=0 waits for each)",
+		                 BuildThreads(), BudgetText(kernel_wait_ms),
+		                 wait_at_flip ? "at that frame's flip (KYTY_RT_KERNEL_WAIT_AT)" : "at the dispatch",
+		                 BudgetText(wait_ms));
+	}
+
+	// The command processor at a guest flip: waits for the kernels whose first dispatch this frame
+	// found unbuilt (all at once; each within its budget from its first dispatch).
+	void WaitAtFlip() {
+		struct Pending {
+			uint64_t                                   id;
+			uint64_t                                   shader_hash;
+			std::shared_future<std::shared_ptr<Built>> future;
+		};
+		std::vector<Pending> pending;
+		uint64_t             oldest_ns = UINT64_MAX;
+		{
+			std::scoped_lock lock(mutex);
+			for (const auto id: flip_pending) {
+				if (auto found = jobs.find(id); found != jobs.end() && found->second.flip_wait) {
+					pending.push_back({id, found->second.shader_hash, found->second.future});
+					oldest_ns = std::min(oldest_ns, found->second.asked_ns);
+				}
+			}
+			flip_pending.clear();
+			any_flip_pending.store(false, std::memory_order_relaxed);
+		}
+		if (pending.empty()) return;
+		const auto begin    = CompileClockNs();
+		const auto deadline = oldest_ns + static_cast<uint64_t>(kernel_wait_ms) * 1'000'000ull;
+		size_t     waiting  = 0;
+		for (const auto& each: pending) {
+			if (each.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) waiting++;
+		}
+		if (waiting != 0) {
+			PipelineCacheLog("Software RT: the command processor waits at the flip for {} RT kernel pipeline(s) "
+			                 "first dispatched this frame (at most {}; a cold pipeline cache builds them now)",
+			                 waiting, BudgetText(kernel_wait_ms));
+			CompileWatch::Wait watch("flip", CompileWatch::Kind::RtPipeline, pending.front().shader_hash);
+			for (const auto& each: pending) {
+				const auto now = CompileClockNs();
+				if (now >= deadline) break;
+				(void)each.future.wait_for(std::chrono::nanoseconds(deadline - now));
+			}
+		}
+		const auto waited = CompileClockNs() - begin;
+		if (waiting != 0) {
+			totals.waited.fetch_add(1, std::memory_order_relaxed);
+			totals.wait_ns.fetch_add(waited, std::memory_order_relaxed);
+			AddCompileStall(waited);
+			FlushCompileStall();
+		}
+		std::scoped_lock lock(mutex);
+		for (const auto& each: pending) {
+			if (auto found = jobs.find(each.id); found != jobs.end()) {
+				found->second.flip_wait = false;
+				found->second.first_wait_ns += waited;
+			}
+		}
+		if (waiting != 0) {
+			PipelineCacheLog("Software RT: the flip waited {:.0f} ms for {} RT kernel pipeline(s)",
+			                 static_cast<double>(waited) / 1.0e6, waiting);
+		}
 	}
 
 	// The driver call, kept free of objects with destructors that matter: a structured exception
@@ -6518,6 +6611,26 @@ struct PipelineCache::RtState {
 	static bool RtPipelineLogEnabled() {
 		static const bool enabled = EnvU64("KYTY_RT_PIPELINE_LOG", 0) != 0;
 		return enabled;
+	}
+
+	// KYTY_RT_PIPELINE_LOG: a dispatch of a published kernel ran. Every 10 s one line with the
+	// dispatches each kernel ran and skipped so far.
+	void NoteRan(uint64_t id) {
+		std::scoped_lock lock(mutex);
+		if (const auto found = jobs.find(id); found != jobs.end()) NoteRanLocked(found->second);
+	}
+	void NoteRanLocked(Job& job) {
+		job.ran++;
+		const auto now = CompileClockNs();
+		if (now - last_dispatch_log_ns < 10'000'000'000ull) return;
+		last_dispatch_log_ns = now;
+		std::string line;
+		for (const auto& [id, each]: jobs) {
+			(void)id;
+			if (each.huge || (each.ran == 0 && each.skipped == 0)) continue;
+			line += fmt::format(" 0x{:016x} ran {} skipped {};", each.shader_hash, each.ran, each.skipped);
+		}
+		PipelineCacheLog("Software RT dispatches so far:{}", line);
 	}
 
 	// Under `mutex`. The job of kernel `id`, started when new; null when the queue refused it.
@@ -6639,10 +6752,12 @@ struct PipelineCache::RtState {
 			                          .detail      = "rt-background"});
 		}
 		cache.NotePipelineCreated(built.ns);
+		// requested_ns is the request: a prewarm (shader precompile) or the first dispatch.
 		PipelineCacheLog("{} pipeline of compute shader 0x{:016x} built in {:.0f} ms, ready {} ms "
-		                 "after it was first needed",
+		                 "after it was requested; its first dispatch waited {:.0f} ms, {} dispatch(es) skipped",
 		                 job.huge ? "Huge compute (KYTY_COMPUTE_BACKGROUND_WORDS)" : "Software RT",
-		                 job.shader_hash, static_cast<double>(built.ns) / 1.0e6, waited_ms);
+		                 job.shader_hash, static_cast<double>(built.ns) / 1.0e6, waited_ms,
+		                 static_cast<double>(job.first_wait_ns) / 1.0e6, job.skipped);
 		return slot->second.get();
 	}
 
@@ -6735,6 +6850,12 @@ struct PipelineCache::RtState {
 
 	PipelineCache&                    cache;
 	const uint32_t                    wait_ms;
+	const uint32_t                    kernel_wait_ms;
+	const bool                        wait_at_flip;
+	const uint64_t                    flip_fallback_ns;
+	std::vector<uint64_t>             flip_pending;               // under `mutex`
+	std::atomic<bool>                 any_flip_pending {false};
+	uint64_t                          last_dispatch_log_ns = 0; // KYTY_RT_PIPELINE_LOG dispatch counts
 	CompileWatch::QueueCounter        queued_builds {"background compute"};
 	std::mutex                        mutex;
 	std::unordered_map<uint64_t, Job> jobs;
@@ -11109,6 +11230,11 @@ PipelineCache::RtState& PipelineCache::Rt() {
 	return *m_rt;
 }
 
+void PipelineCache::WaitRtKernelsAtFlip() {
+	if (m_rt == nullptr || !m_rt->any_flip_pending.load(std::memory_order_acquire)) return;
+	m_rt->WaitAtFlip();
+}
+
 PipelineCache::RtPipelineTotals PipelineCache::GetRtPipelineTotals() const {
 	return m_rt != nullptr ? m_rt->Totals() : RtPipelineTotals {};
 }
@@ -11177,15 +11303,27 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		return nullptr;
 	}
 	{
-		Common::LockGuard lock(m_mutex);
-		if (const auto found = m_compute_pipelines.find(id); found != m_compute_pipelines.end()) {
-			return found->second.get();
+		Pipeline* published = nullptr;
+		{
+			Common::LockGuard lock(m_mutex);
+			if (const auto found = m_compute_pipelines.find(id); found != m_compute_pipelines.end()) {
+				published = found->second.get();
+			}
+		}
+		if (published != nullptr) {
+			// rt.mutex is taken before m_mutex elsewhere (Finish): never under it.
+			if (RtState::RtPipelineLogEnabled()) rt.NoteRan(id);
+			return published;
 		}
 	}
 	std::shared_future<std::shared_ptr<RtState::Built>> future;
 	uint64_t                                            ticket = 0;
 	bool                                                first  = false;
 	uint64_t                                            shader_hash = input_info.stage.program->shader_hash;
+	const auto kernel_class = huge ? RtSession::KernelClass::Huge
+	                          : call_split ? RtSession::KernelClass::CallSplit
+	                                       : RtSession::KernelClass::Direct;
+	const auto first_budget_ms = RtSession::FirstWaitBudgetMs(kernel_class, rt.kernel_wait_ms, rt.wait_ms);
 	{
 		std::scoped_lock lock(rt.mutex);
 		auto*            job = rt.Request(id, input_info, compute_program, huge, !huge);
@@ -11205,6 +11343,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		}
 		first       = !job->asked;
 		job->asked  = true;
+		if (first) job->asked_ns = CompileClockNs();
 		// A prewarmed build a dispatch now waits for: ahead of the prewarm builds queued before it
 		// (the shader precompile queues hundreds of RT programs of other areas).
 		if (!huge && !job->promoted) {
@@ -11220,22 +11359,53 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		                 "(KYTY_COMPUTE_BACKGROUND_WORDS); its dispatches are skipped until it is ready",
 		                 shader_hash, g_shader_modules.WordsOf(compute_program.module));
 	}
-	switch (RtSession::DecideDispatch(false, ready, first && !call_split, rt.wait_ms)) {
+	// KYTY_RT_KERNEL_WAIT_AT=flip: a direct kernel's dispatches are skipped until the frame's flip,
+	// which waits for it (RtState::WaitAtFlip); with no flip for flip_fallback_ns a dispatch waits.
+	bool     wait_here = first;
+	uint32_t budget_ms = first_budget_ms;
+	if (!ready && kernel_class == RtSession::KernelClass::Direct && rt.wait_at_flip) {
+		std::scoped_lock lock(rt.mutex);
+		if (auto found = rt.jobs.find(id); found != rt.jobs.end()) {
+			auto&      job = found->second;
+			const auto now = CompileClockNs();
+			if (first) {
+				job.flip_wait = true;
+				rt.flip_pending.push_back(id);
+				rt.any_flip_pending.store(true, std::memory_order_release);
+				wait_here = false;
+			} else if (job.flip_wait) {
+				const auto age = now - job.asked_ns;
+				wait_here      = age >= rt.flip_fallback_ns;
+				if (wait_here) {
+					const auto budget_ns = static_cast<uint64_t>(rt.kernel_wait_ms) * 1'000'000ull;
+					budget_ms = age >= budget_ns ? 0 : static_cast<uint32_t>((budget_ns - age) / 1'000'000ull);
+					job.flip_wait = false; // waited for here, not at the flip
+				}
+			}
+		}
+	}
+	uint64_t waited_ns = 0;
+	switch (RtSession::DecideDispatch(false, ready, wait_here, budget_ms)) {
 		case RtSession::DispatchAction::Run: break;
 		case RtSession::DispatchAction::WaitBounded: {
 			rt.queue.Promote(ticket);
+			if (budget_ms > 1000) {
+				PipelineCacheLog("{}: the command processor waits for the pipeline of compute shader 0x{:016x} "
+				                 "(at most {}; a cold pipeline cache builds it now)",
+				                 huge ? "Huge compute" : "Software RT", shader_hash, RtState::BudgetText(budget_ms));
+			}
 			const auto         begin = CompileClockNs();
 			CompileWatch::Wait watch("dispatch", huge ? CompileWatch::Kind::HugeCompute : CompileWatch::Kind::RtPipeline,
 			                         shader_hash);
-			if (rt.wait_ms == UINT32_MAX) {
+			if (budget_ms == UINT32_MAX) {
 				future.wait();
 			} else {
-				(void)future.wait_for(std::chrono::milliseconds(rt.wait_ms));
+				(void)future.wait_for(std::chrono::milliseconds(budget_ms));
 			}
-			const auto waited = CompileClockNs() - begin;
+			waited_ns = CompileClockNs() - begin;
 			rt.totals.waited.fetch_add(1, std::memory_order_relaxed);
-			rt.totals.wait_ns.fetch_add(waited, std::memory_order_relaxed);
-			AddCompileStall(waited);
+			rt.totals.wait_ns.fetch_add(waited_ns, std::memory_order_relaxed);
+			AddCompileStall(waited_ns);
 			FlushCompileStall();
 			ready = future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 			break;
@@ -11245,18 +11415,26 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	if (!ready) {
 		rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
 		std::scoped_lock lock(rt.mutex);
-		if (const auto job = rt.jobs.find(id); job != rt.jobs.end() && !job->second.logged_skip) {
-			job->second.logged_skip = true;
-			PipelineCacheLog("{}: the pipeline of compute shader 0x{:016x} is still being built; "
-			                 "its dispatches are skipped until it is ready{}",
-			                 huge ? "Huge compute" : "Software RT", shader_hash,
-			                 huge ? "" : " (the lighting it feeds lags)");
+		if (const auto job = rt.jobs.find(id); job != rt.jobs.end()) {
+			job->second.skipped++;
+			job->second.first_wait_ns += waited_ns;
+			if (!job->second.logged_skip) {
+				job->second.logged_skip = true;
+				PipelineCacheLog("{}: the pipeline of compute shader 0x{:016x} is still being built; "
+				                 "its dispatches are skipped until it is ready{}",
+				                 huge ? "Huge compute" : "Software RT", shader_hash,
+				                 job->second.flip_wait ? " (this frame's flip waits for it)"
+				                 : huge                ? ""
+				                                       : " (the lighting it feeds lags)");
+			}
 		}
 		return nullptr;
 	}
 	std::scoped_lock lock(rt.mutex);
 	auto             job = rt.jobs.find(id);
 	if (job == rt.jobs.end()) return nullptr;
+	job->second.first_wait_ns += waited_ns;
+	if (RtState::RtPipelineLogEnabled()) rt.NoteRanLocked(job->second);
 	if (job->second.consumed) {
 		Common::LockGuard map_lock(m_mutex);
 		const auto        found = m_compute_pipelines.find(id);

@@ -382,13 +382,18 @@ public:
 	// The pipeline a compute dispatch runs, or null when the dispatch must be skipped. Programs
 	// without software BVH instructions get GetComputePipeline's (built on this thread). A
 	// software ray-tracing kernel (program.info.uses_bvh, KYTY_RT_SOFTWARE) builds on a background
-	// thread: its first dispatch waits up to KYTY_RT_PIPELINE_WAIT_MS (default 250) for it, then
-	// every dispatch is skipped until it is ready, so a cold 300k-word compile (17 s on an RTX 50
-	// GPU) never freezes the command processor; the lighting it feeds lags. Null also, for every
+	// thread: its first dispatch waits up to KYTY_RT_KERNEL_WAIT_MS (default 120 s) for it, because
+	// a skipped dispatch can leave lighting that is never recomputed (rtSession.h FirstWaitBudgetMs);
+	// a call-split program never waits and a huge compute program (KYTY_COMPUTE_BACKGROUND_WORDS)
+	// waits up to KYTY_RT_PIPELINE_WAIT_MS (default 250); past the budget every dispatch is skipped
+	// until the pipeline is ready. Null also, for every
 	// RT kernel, once any RT pipeline failed to build (rtSession.h: software RT is then off for the
 	// session, logged once). KYTY_RT_PIPELINE_ASYNC=0 builds in the background but waits for it.
 	[[nodiscard]] Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                              const ShaderProgram&          compute_program);
+	// The command processor at every guest flip: waits for the RT kernels whose first dispatch this
+	// frame found unbuilt (KYTY_RT_KERNEL_WAIT_AT=flip, rtSession.h). A relaxed load otherwise.
+	void WaitRtKernelsAtFlip();
 	// Starts the background build of an RT kernel's pipeline without waiting (the shader precompile
 	// replay: the game's first dispatch then finds it built). Does nothing for other programs.
 	void PrewarmComputePipeline(const ShaderComputeInputInfo& input_info,

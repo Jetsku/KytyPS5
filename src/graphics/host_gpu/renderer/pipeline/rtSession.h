@@ -54,4 +54,32 @@ enum class DispatchAction : uint8_t {
 	return DispatchAction::Skip;
 }
 
+// What kind of background-built program a dispatch runs.
+enum class KernelClass : uint8_t {
+	Direct,    // a software RT kernel run as one dispatch (uses_bvh, no call split)
+	CallSplit, // a call-split program (KYTY_SHADER_CALLS_SPLIT): its chain resumes past it
+	Huge,      // KYTY_COMPUTE_BACKGROUND_WORDS: a huge compute program, not an RT kernel
+};
+
+// The first-dispatch wait budgets: kernel_ms for direct RT kernels, other_ms for huge programs.
+// Defaults: KYTY_RT_KERNEL_WAIT_MS (120000) and KYTY_RT_PIPELINE_WAIT_MS (250).
+//
+// A direct RT kernel waits for its build at its first dispatch. Skipping it is not always one frame
+// of lag: some kernels are dispatched only for a short window and never again (Astro Bot, Sky
+// Garden: four kernels 304 times each while the level loads, one about 135 times right after it
+// starts). With a cold driver cache such a kernel (125k-230k SPIR-V words) takes 3-10 s to build;
+// when that outlasts its window it never runs, and the GI lighting it computes stays missing for
+// the whole level (shadowed surfaces much too dark). A warm cache builds them in milliseconds (and
+// the shader precompile starts them before the level), so the wait costs nothing there. A
+// call-split program never waits: its chain resumes past callees that are not built (another
+// title's reflections: some 200 of them per area, about 3 s each).
+[[nodiscard]] inline uint32_t FirstWaitBudgetMs(KernelClass kind, uint32_t kernel_ms, uint32_t other_ms) {
+	switch (kind) {
+		case KernelClass::Direct: return kernel_ms;
+		case KernelClass::CallSplit: return 0;
+		case KernelClass::Huge: return other_ms;
+	}
+	return other_ms;
+}
+
 } // namespace Libs::Graphics::RtSession
