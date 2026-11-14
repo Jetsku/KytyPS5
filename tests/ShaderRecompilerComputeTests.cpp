@@ -9573,9 +9573,18 @@ public:
               "an upload over a redirected page kept the redirect");
       pass();
       Require(name, "after upload", !live(b) && !dirty(b), "an uploaded page was redirected again");
+      // A page a cache binding uploaded is not redirected again for 64 full passes (performance
+      // rule, KYTY_BDA_LIVE_BOUND_PASSES): the pass uploads it meanwhile.
       cpu_write(c + 0x40, 0x5a5a5a5au);
       pass();
-      Require(name, "redirect c", live(c), "the pass did not redirect page c again");
+      Require(name, "bound", !live(c) && !dirty(c) && cache.GetBdaLiveTotals().rejects_bound >= 1,
+              "a page a binding uploaded was redirected again at once, or not uploaded");
+      for (int k = 0; k < 64; k++) {
+        pass();
+      }
+      cpu_write(c + 0x80, 0x5b5b5b5bu);
+      pass();
+      Require(name, "redirect c", live(c), "the pass did not redirect page c again after the bound passes");
 
       // 4: a written binding over page c ends its redirect; the pass never redirects a GPU-dirty page.
       (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + c, 0x100, true, false); });

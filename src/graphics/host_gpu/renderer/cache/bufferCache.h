@@ -182,6 +182,7 @@ public:
 		uint64_t cp_waits         = 0; // of them, GPU waits on the GPU thread
 		uint64_t cp_unordered     = 0; // of them, on another thread (counted only)
 		uint64_t rejects_window   = 0; // candidate pages without an imported window
+		uint64_t rejects_bound    = 0; // candidate pages a cache binding uploaded after a redirect
 		uint64_t blocked_passes   = 0; // passes with BDA-write settles pending (no redirects)
 		uint64_t faults           = 0; // guest write faults on tracked memory
 		uint64_t v1               = 0; // verify: CPU-dirty pages left on the cache entry (must be 0)

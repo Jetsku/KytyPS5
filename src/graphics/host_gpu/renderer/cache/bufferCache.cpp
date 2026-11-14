@@ -6915,7 +6915,8 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	m_bda_count_uploads        = same_submission;
 	const auto pass_start      = BufferLookupStats::Now();
 	// KYTY_BDA_LIVE_PAGES: no new redirect while BDA-write settles are pending (I-W2).
-	m_bda_live_pass = m_bda_live != nullptr && BdaLivePagesMode() != 0 && m_bda_pending.empty();
+	const auto live_mode = BdaLivePagesMode(); // 1 / 2 (verify) redirect; 3 (check) only verifies
+	m_bda_live_pass      = (live_mode == 1 || live_mode == 2) && m_bda_pending.empty();
 	SynchronizeBdaBuffersNow(mapped_ranges);
 	m_bda_live_pass = false;
 	if (m_bda_live != nullptr) {
