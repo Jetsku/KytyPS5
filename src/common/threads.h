@@ -26,6 +26,10 @@ void RaiseCurrentThreadPriority();
 void RaiseServiceThreadPriority();
 [[nodiscard]] int ServiceThreadPriorityLevel();
 
+// KYTY_THREAD_NAMES=1 (measurement, default off): the calling thread gets `name` as its OS thread
+// description (SetThreadDescription), so that a sampler outside the process can tell the threads
+// apart. Nothing with the switch off, and nothing off Windows.
+void NameCurrentThreadForOs(const char* name);
 // sched_yield: gives the processor to another thread that is ready to run on this CPU and
 // returns at once when there is none (FreeBSD sched_relinquish). True when another thread ran.
 bool YieldToReadyThread();

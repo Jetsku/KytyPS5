@@ -3514,6 +3514,7 @@ static void* RunThread(void* arg) {
 
 	g_pthread_self = thread;
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
+	Common::NameCurrentThreadForOs(("G:" + thread->name).c_str());
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
