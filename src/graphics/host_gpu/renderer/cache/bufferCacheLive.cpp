@@ -25,6 +25,11 @@
 //   I-L1 imported windows live until teardown; I-L2 guest unmap restores the pages first;
 //   I-L3 refused with KYTY_DROP_RELEASED (backing pages handed back under an import);
 //   I-A1 / I-A2 import alignment, and 16 KiB + 64 bytes of a page inside one window.
+//   I-B1 KYTY_BDA_LIVE_BATCH=1 (default, live): a read upload over a redirected page only settles
+//        it (the guest bytes the entry reads are at least as new as the uploaded copy); settled
+//        pages go back in one batch at the next pre-pass (verify V5: none of them GPU-written);
+//   I-B2 entry writes of one flush (a pass's redirects, the pre-pass restores) are one copy; a
+//        restore first flushes the queued redirects. KYTY_BDA_LIVE_BATCH=0: one copy per run, at once.
 // Do not combine with KYTY_BDA_REACH=verify, the BdaHotSync / BdaDirtyLog / BdaSyncEpoch verify
 // modes or KYTY_BDA_ACCESS_TAGS=1 / verify (they rewrite entries or rescan pages themselves).
 // With the KYTY_BDA_ACCESS_TAGS codegen option, a page read through its redirect is reported (its
@@ -51,6 +56,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -74,6 +80,7 @@ bool Redirects(int64_t mode) {
 	return mode == 1 || mode == 2;
 }
 Live::Switch g_bda_live_pages("KYTY_BDA_LIVE_PAGES", ParseLivePages);
+Live::Switch g_bda_live_batch("KYTY_BDA_LIVE_BATCH", Live::ParseDefaultOn);
 
 BufferCache* g_live_cache = nullptr; // the cache whose state the StreamCopyDefer hooks reach
 
@@ -83,12 +90,22 @@ uint64_t LiveEnvU64(const char* name, uint64_t fallback) {
 }
 
 constexpr uint64_t PAGE = BufferCache::CACHING_PAGESIZE;
+constexpr uint64_t SUBPAGES = PAGE / TRACKER_PAGE_SIZE;
+
+using LiveWrites = std::vector<std::pair<uint64_t, vk::DeviceAddress>>;
 
 } // namespace
 
 struct BufferCache::BdaLive {
+	struct Page {
+		vk::DeviceAddress entry      = 0; // redirect entry (untagged)
+		uint64_t          pass       = 0; // full-pass number of the redirect
+		uint8_t           cpu_mask   = 0; // verify: CPU-dirty 4 KiB sub-pages at the redirect
+	};
 	mutable std::mutex                     mutex;
-	std::map<uint64_t, vk::DeviceAddress>  pages;      // caching page -> redirect entry (untagged)
+	std::map<uint64_t, Page>               pages;      // caching page -> redirect
+	std::set<uint64_t>                     settled;    // redirected pages a read upload made current (I-B1)
+	LiveWrites                             queued;     // redirect entries of the running pass (I-B2)
 	std::unordered_set<uint64_t>           cp_written; // pages a CP write hit while redirected
 	RangeSet                               forced;     // entries given back without an upload
 	std::unique_ptr<BdaLiveWindows>        windows;
@@ -186,6 +203,22 @@ bool BufferCache::IsBdaLivePage(uint64_t vaddr) const {
 	return m_bda_live->pages.contains(vaddr >> CACHING_PAGEBITS);
 }
 
+bool BufferCache::IsBdaLivePageSettled(uint64_t vaddr) const {
+	if (m_bda_live == nullptr) {
+		return false;
+	}
+	std::scoped_lock lock(m_bda_live->mutex);
+	return m_bda_live->settled.contains(vaddr >> CACHING_PAGEBITS);
+}
+
+void BufferCache::TestingMarkGpuDirty(uint64_t vaddr, uint64_t size, bool mark) {
+	if (mark) {
+		m_memory_tracker.MarkRegionAsGpuModified(vaddr, size);
+	} else {
+		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	}
+}
+
 vk::DeviceAddress BufferCache::LiveEntry(uint64_t page) const {
 	if (m_bda_live == nullptr) {
 		return 0;
@@ -197,78 +230,201 @@ vk::DeviceAddress BufferCache::LiveEntry(uint64_t page) const {
 		if (it == m_bda_live->pages.end()) {
 			return 0;
 		}
-		entry = it->second;
+		entry = it->second.entry;
 	}
 	return BdaTagAccessed(page) ? (entry | BDA_ACCESSED) : entry;
 }
 
+void BufferCache::WriteLiveEntries(LiveWrites& writes, bool batch) {
+	if (writes.empty()) {
+		return;
+	}
+	const auto plan      = PlanBdaLiveEntryWrites(writes);
+	const bool rendering = m_scheduler.Current().ActiveRenderingSerial() != 0;
+	for (const auto& run: plan.runs) {
+		EnsureBdaTableResident(run.first_page, run.count);
+	}
+	constexpr uint64_t E     = sizeof(vk::DeviceAddress);
+	const uint64_t     bytes = plan.data.size() * E;
+	uint64_t           copies = 0;
+	if (batch && plan.runs.size() > 1 && bytes <= m_staging_buffer.Size()) {
+		const auto                  offset = m_staging_buffer.Copy(plan.data.data(), bytes, E);
+		std::vector<vk::BufferCopy> regions;
+		regions.reserve(plan.runs.size());
+		for (const auto& run: plan.runs) {
+			regions.emplace_back(offset + run.data_index * E, m_bda_pagetable_buffer.Offset(run.first_page * E),
+			                     run.count * E);
+		}
+		m_bda_pagetable_buffer.CopyRegionsFrom(m_scheduler.Current(), m_staging_buffer, regions,
+		                                       vk::AccessFlagBits::eHostWrite);
+		copies = 1;
+	} else {
+		for (const auto& run: plan.runs) {
+			WriteDataBuffer(m_bda_pagetable_buffer, run.first_page * E, plan.data.data() + run.data_index,
+			                run.count * E);
+			copies++;
+		}
+	}
+	writes.clear();
+	std::scoped_lock lock(m_bda_live->mutex);
+	auto&            t = m_bda_live->totals;
+	t.entry_copies += copies;
+	t.entry_pages += plan.data.size();
+	if (rendering) {
+		t.entry_copies_rendering += copies;
+	}
+}
+
+void BufferCache::FlushLiveRedirects() {
+	if (m_bda_live == nullptr) {
+		return;
+	}
+	LiveWrites queued;
+	{
+		std::scoped_lock lock(m_bda_live->mutex);
+		if (m_bda_live->queued.empty()) {
+			return;
+		}
+		std::swap(queued, m_bda_live->queued);
+	}
+	WriteLiveEntries(queued, true);
+}
+
+void BufferCache::SettleLivePages(uint64_t vaddr, uint64_t size) {
+	if (m_bda_live == nullptr || size == 0) {
+		return;
+	}
+	if (g_bda_live_batch.Get() == 0) {
+		RestoreLivePages(vaddr, size, LiveRestore::Upload);
+		return;
+	}
+	auto&            live = *m_bda_live;
+	std::scoped_lock lock(live.mutex);
+	const auto       first = vaddr >> CACHING_PAGEBITS;
+	const auto       last  = (vaddr + size - 1) >> CACHING_PAGEBITS;
+	for (auto it = live.pages.lower_bound(first); it != live.pages.end() && it->first <= last; ++it) {
+		if (live.settled.insert(it->first).second) {
+			live.totals.settled++;
+		}
+	}
+}
+
 void BufferCache::LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size, BdaSyncStats* stats) {
-	auto&      buffer = m_slot_buffers[id];
-	auto&      live   = *m_bda_live;
-	const auto end    = start + size;
+	const auto t0         = std::chrono::steady_clock::now();
+	auto&      buffer     = m_slot_buffers[id];
+	auto&      live       = *m_bda_live;
+	const auto end        = start + size;
+	const auto first_page = start >> CACHING_PAGEBITS;
+	const auto last_page  = (end - 1) >> CACHING_PAGEBITS;
+	uint64_t   walked = 0, dirty = 0, segments = 0, bound = 0;
+	const auto account = [&](bool fast) {
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+		std::scoped_lock lock(live.mutex);
+		auto&            t = live.totals;
+		t.qual_calls++;
+		t.qual_fast += fast ? 1 : 0;
+		t.qual_pages += walked;
+		t.qual_dirty += dirty;
+		t.qual_segments += segments;
+		t.qual_ns += ns;
+		t.rejects_bound += bound;
+	};
+	// The redirected pages of the range, under one lock (only this thread changes the map).
+	std::vector<uint64_t> held;
+	{
+		std::scoped_lock lock(live.mutex);
+		for (auto it = live.pages.lower_bound(first_page); it != live.pages.end() && it->first <= last_page; ++it) {
+			held.push_back(it->first);
+		}
+	}
 	// Fast path: no CPU-dirty page in the range and no redirect in it: the plain synchronization
 	// (which then finds nothing either).
 	{
 		bool cpu = true;
-		if (m_memory_tracker.QueryCpuDirtyRelaxed(start, size, cpu) && !cpu) {
-			bool any_live = false;
-			{
-				std::scoped_lock lock(live.mutex);
-				const auto       it = live.pages.lower_bound(start >> CACHING_PAGEBITS);
-				any_live = it != live.pages.end() && it->first <= ((end - 1) >> CACHING_PAGEBITS);
-			}
-			if (!any_live) {
-				(void)SynchronizeBuffer(buffer, start, size, false, false, stats);
-				return;
-			}
+		if (held.empty() && m_memory_tracker.QueryCpuDirtyRelaxed(start, size, cpu) && !cpu) {
+			(void)SynchronizeBuffer(buffer, start, size, false, false, stats);
+			segments = 1;
+			account(true);
+			return;
 		}
 	}
 	// Conservative: no redirect while early-released downloads are pending (their bytes are the GPU's).
 	const bool may_redirect = m_early_released.empty();
-	std::vector<std::pair<uint64_t, vk::DeviceAddress>> fresh;
-	uint64_t run = start;
-	for (auto page = start >> CACHING_PAGEBITS; (page << CACHING_PAGEBITS) < end; ++page) {
-		const auto address = page << CACHING_PAGEBITS;
+	const bool verify       = BdaLivePagesMode() == 2;
+	struct Fresh {
+		uint64_t          page;
+		vk::DeviceAddress entry;
+		uint8_t           cpu_mask;
+	};
+	std::vector<Fresh> fresh;
+	uint64_t           run = start;
+	size_t             h   = 0;
+	for (auto page = first_page; page <= last_page; ++page) {
+		walked++;
+		const auto address   = page << CACHING_PAGEBITS;
 		const bool in_buffer = address >= buffer.CpuAddress() && address + PAGE <= buffer.CpuAddress() + buffer.Size();
-		bool       is_live   = false;
-		bool       blocked   = !may_redirect || !in_buffer;
-		{
-			std::scoped_lock lock(live.mutex);
-			is_live = live.pages.contains(page);
-			blocked = blocked || is_live || live.cp_written.contains(page);
-			// Performance only: a page a cache binding uploaded after its redirect is read by draws
-			// anyway; redirecting it again would only add two entry writes per frame.
-			if (!blocked) {
-				const auto h = live.bound_until.find(page);
-				if (h != live.bound_until.end()) {
-					if (live.passes < h->second) {
-						blocked = true;
-						live.totals.rejects_bound++;
-					} else {
-						live.bound_until.erase(h);
+		while (h < held.size() && held[h] < page) {
+			++h;
+		}
+		const bool        is_live = h < held.size() && held[h] == page;
+		vk::DeviceAddress entry   = 0;
+		uint8_t           mask    = 0;
+		if (!is_live && may_redirect && in_buffer) {
+			// A page the lock-free mirror shows clean synchronizes with its run (nothing to upload).
+			bool page_cpu = true;
+			if (!(m_memory_tracker.QueryCpuDirtyRelaxed(address, PAGE, page_cpu) && !page_cpu)) {
+				dirty++;
+				bool blocked = false;
+				{
+					std::scoped_lock lock(live.mutex);
+					blocked = live.cp_written.contains(page);
+					// Performance only: a page a cache binding uploaded after its redirect is read by
+					// draws anyway; redirecting it again would only add entry writes every frame.
+					if (!blocked) {
+						const auto b = live.bound_until.find(page);
+						if (b != live.bound_until.end()) {
+							if (live.passes < b->second) {
+								blocked = true;
+								bound++;
+							} else {
+								live.bound_until.erase(b);
+							}
+						}
 					}
 				}
-			}
-		}
-		vk::DeviceAddress entry = 0;
-		if (!blocked) {
-			// Cheapest checks first: the lock-free dirty mirrors (exact on the GPU thread), then the
-			// window (I-A2: the page and the 64 bytes after it lie in one imported window), then the
-			// locked queries.
-			MemoryTracker::DirtyState state;
-			if (!m_memory_tracker.QueryDirtyRelaxed(address, PAGE, state)) {
-				state = m_memory_tracker.QueryDirty(address, PAGE);
-			}
-			if (state.cpu && !state.gpu) {
-				const auto* host = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(address, PAGE));
-				const auto  dev  = host != nullptr ? live.windows->Translate(reinterpret_cast<uint64_t>(host), PAGE + 64) : 0;
-				if (dev == 0) {
-					std::scoped_lock lock(live.mutex);
-					live.totals.rejects_window++;
-				} else if (!BdaTagAccessed(page) && !m_memory_tracker.IsRegionHot(address, PAGE) &&
-				           !HasGpuDirtyBytes(address, PAGE) && !HasPendingBackingPublication(address, PAGE) &&
-				           !m_texture_cache.IsRegionGpuModified(address, PAGE)) {
-					entry = dev;
+				if (!blocked) {
+					// Cheapest checks first: the lock-free dirty mirrors (exact on the GPU thread), then
+					// the window (I-A2: the page and the 64 bytes after it lie in one imported window),
+					// then the locked queries.
+					MemoryTracker::DirtyState state;
+					if (!m_memory_tracker.QueryDirtyRelaxed(address, PAGE, state)) {
+						state = m_memory_tracker.QueryDirty(address, PAGE);
+					}
+					if (state.cpu && !state.gpu) {
+						const auto* host =
+						    static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(address, PAGE));
+						const auto dev =
+						    host != nullptr ? live.windows->Translate(reinterpret_cast<uint64_t>(host), PAGE + 64) : 0;
+						if (dev == 0) {
+							std::scoped_lock lock(live.mutex);
+							live.totals.rejects_window++;
+						} else if (!BdaTagAccessed(page) && !m_memory_tracker.IsRegionHot(address, PAGE) &&
+						           !HasGpuDirtyBytes(address, PAGE) && !HasPendingBackingPublication(address, PAGE) &&
+						           !m_texture_cache.IsRegionGpuModified(address, PAGE)) {
+							entry = dev;
+							if (verify) {
+								for (uint64_t k = 0; k < SUBPAGES; ++k) {
+									bool sub = false;
+									if (m_memory_tracker.QueryCpuDirtyRelaxed(address + k * TRACKER_PAGE_SIZE,
+									                                          TRACKER_PAGE_SIZE, sub) &&
+									    sub) {
+										mask |= static_cast<uint8_t>(1u << k);
+									}
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -279,55 +435,58 @@ void BufferCache::LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size
 		const auto seg_end   = std::min(address + PAGE, end);
 		if (seg_begin > run) {
 			(void)SynchronizeBuffer(buffer, run, seg_begin - run, false, false, stats);
+			segments++;
 		}
 		run = seg_end;
 		if (!is_live) {
-			fresh.emplace_back(page, entry);
+			fresh.push_back({page, entry, mask});
 		}
 	}
 	if (run < end) {
 		(void)SynchronizeBuffer(buffer, run, end - run, false, false, stats);
+		segments++;
 	}
-	if (fresh.empty()) {
-		return;
-	}
-	{
-		std::scoped_lock lock(live.mutex);
-		for (const auto& [page, entry]: fresh) {
-			live.pages.emplace(page, entry);
-			live.Note(page, 1);
+	if (!fresh.empty()) {
+		// The entries, in stream order before the operation: queued for one write at the end of the
+		// pass (I-B2), or written now per run of consecutive pages (KYTY_BDA_LIVE_BATCH=0).
+		const bool batch = g_bda_live_batch.Get() != 0;
+		LiveWrites writes;
+		{
+			std::scoped_lock lock(live.mutex);
+			for (const auto& f: fresh) {
+				live.pages.emplace(f.page, BdaLive::Page {f.entry, live.passes, f.cpu_mask});
+				live.Note(f.page, 1);
+				if (batch) {
+					live.queued.emplace_back(f.page, f.entry);
+				} else {
+					writes.emplace_back(f.page, f.entry);
+				}
+			}
+			live.totals.redirects += fresh.size();
+			m_bda_live_count.store(live.pages.size(), std::memory_order_relaxed);
 		}
-		live.totals.redirects += fresh.size();
-		m_bda_live_count.store(live.pages.size(), std::memory_order_relaxed);
+		WriteLiveEntries(writes, false);
 	}
-	// The entries, in stream order before the operation (consecutive pages in one write).
-	std::vector<vk::DeviceAddress> run_entries;
-	for (size_t first = 0; first < fresh.size();) {
-		size_t last = first + 1;
-		while (last < fresh.size() && fresh[last].first == fresh[last - 1].first + 1) {
-			++last;
-		}
-		run_entries.clear();
-		for (size_t k = first; k < last; ++k) {
-			run_entries.push_back(fresh[k].second);
-		}
-		EnsureBdaTableResident(fresh[first].first, last - first);
-		WriteDataBuffer(m_bda_pagetable_buffer, fresh[first].first * sizeof(vk::DeviceAddress), run_entries.data(),
-		                run_entries.size() * sizeof(vk::DeviceAddress));
-		first = last;
-	}
+	account(false);
 }
 
-void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore why) {
+void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore why, LiveWrites* writes) {
 	if (m_bda_live == nullptr || size == 0) {
 		return;
 	}
-	auto&                 live = *m_bda_live;
+	auto&                 live  = *m_bda_live;
+	const auto            first = vaddr >> CACHING_PAGEBITS;
+	const auto            last  = (vaddr + size - 1) >> CACHING_PAGEBITS;
+	if (why == LiveRestore::Register) {
+		// ChangeRegister rewrote these entries already: a queued redirect of them must not land after.
+		std::scoped_lock lock(live.mutex);
+		std::erase_if(live.queued, [&](const auto& w) { return w.first >= first && w.first <= last; });
+	} else {
+		FlushLiveRedirects(); // I-B2: a queued redirect never lands after the restore of its page
+	}
 	std::vector<uint64_t> pages;
 	{
 		std::scoped_lock lock(live.mutex);
-		const auto       first = vaddr >> CACHING_PAGEBITS;
-		const auto       last  = (vaddr + size - 1) >> CACHING_PAGEBITS;
 		for (auto it = live.pages.lower_bound(first); it != live.pages.end() && it->first <= last;) {
 			pages.push_back(it->first);
 			live.Note(it->first, static_cast<uint8_t>(2 + static_cast<uint8_t>(why)));
@@ -335,6 +494,7 @@ void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore wh
 			    live.bound_until.size() < (1u << 20u)) {
 				live.bound_until[it->first] = live.passes + live.bound_passes;
 			}
+			live.settled.erase(it->first);
 			it = live.pages.erase(it);
 		}
 		m_bda_live_count.store(live.pages.size(), std::memory_order_relaxed);
@@ -362,37 +522,65 @@ void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore wh
 	if (why == LiveRestore::Register) {
 		return; // ChangeRegister wrote these entries itself
 	}
-	std::vector<vk::DeviceAddress> entries;
-	for (size_t first = 0; first < pages.size();) {
-		size_t last = first + 1;
-		while (last < pages.size() && pages[last] == pages[last - 1] + 1) {
-			++last;
+	LiveWrites local;
+	auto&      out = writes != nullptr ? *writes : local;
+	for (const auto page: pages) {
+		vk::DeviceAddress entry = 0;
+		const auto*       owner = m_page_table.Find(page);
+		if (owner != nullptr && *owner) {
+			const auto& buffer = m_slot_buffers[*owner];
+			entry = buffer.BufferDeviceAddress() + ((page - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS);
 		}
-		entries.clear();
-		for (size_t k = first; k < last; ++k) {
-			vk::DeviceAddress entry = 0;
-			const auto*       owner = m_page_table.Find(pages[k]);
-			if (owner != nullptr && *owner) {
-				const auto& buffer = m_slot_buffers[*owner];
-				entry              = buffer.BufferDeviceAddress() +
-				        ((pages[k] - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS);
-			}
-			entries.push_back(TaggedBdaEntry(pages[k], entry));
-		}
-		WriteDataBuffer(m_bda_pagetable_buffer, pages[first] * sizeof(vk::DeviceAddress), entries.data(),
-		                entries.size() * sizeof(vk::DeviceAddress));
-		first = last;
+		out.emplace_back(page, TaggedBdaEntry(page, entry));
 	}
+	if (writes == nullptr) {
+		WriteLiveEntries(local, g_bda_live_batch.Get() != 0);
+	}
+}
+
+uint64_t BufferCache::CheckSettledLivePages() {
+	if (m_bda_live == nullptr) {
+		return 0;
+	}
+	auto&                 live = *m_bda_live;
+	std::vector<uint64_t> settled;
+	{
+		std::scoped_lock lock(live.mutex);
+		settled.assign(live.settled.begin(), live.settled.end());
+	}
+	// V5 (I-B1): a settled page kept its redirect after a read upload; nothing may have written GPU
+	// bytes over it since (a written binding restores at once).
+	uint64_t v5 = 0;
+	for (const auto page: settled) {
+		const auto address = page << CACHING_PAGEBITS;
+		const bool gpu     = m_memory_tracker.QueryDirty(address, PAGE).gpu || HasGpuDirtyBytes(address, PAGE);
+		const bool image   = m_texture_cache.IsRegionGpuModified(address, PAGE);
+		if (gpu || image) {
+			v5++;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr, "BdaLiveVerify V5: settled page 0x%" PRIx64 " is%s%s at the pre-pass\n", address,
+				             gpu ? " GPU-dirty" : "", image ? " image-written" : "");
+			}
+		}
+	}
+	std::scoped_lock lock(live.mutex);
+	live.totals.v5 += v5;
+	live.totals.v5_checks++;
+	return v5;
 }
 
 void BufferCache::LivePagesPrePass() {
 	if (m_bda_live == nullptr) {
 		return;
 	}
-	auto&                 live = *m_bda_live;
-	const auto            mode = BdaLivePagesMode();
+	FlushLiveRedirects();
+	auto&                 live  = *m_bda_live;
+	const auto            mode  = BdaLivePagesMode();
+	const bool            batch = g_bda_live_batch.Get() != 0;
 	std::vector<uint64_t> read_pages;
 	std::vector<uint64_t> cp_pages;
+	std::vector<uint64_t> settled;
 	bool                  all = false;
 	{
 		std::scoped_lock lock(live.mutex);
@@ -401,21 +589,30 @@ void BufferCache::LivePagesPrePass() {
 		}
 		all = !Redirects(mode) && !live.pages.empty();
 		if (!all) {
-			for (const auto& [page, entry]: live.pages) {
+			for (const auto& [page, info]: live.pages) {
 				if (live.cp_written.contains(page)) {
 					cp_pages.push_back(page);
 				}
 			}
+			settled.assign(live.settled.begin(), live.settled.end());
 		}
 	}
+	// The restores of this pre-pass, written as one flush.
+	LiveWrites writes;
 	if (all) {
-		RestoreLivePages(0, uint64_t {1} << 40u, LiveRestore::Off);
+		RestoreLivePages(0, uint64_t {1} << 40u, LiveRestore::Off, &writes);
 	} else {
+		if (mode == 2 && !settled.empty()) {
+			(void)CheckSettledLivePages();
+		}
+		for (const auto page: settled) {
+			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Upload, &writes);
+		}
 		if (m_bda_tags != nullptr) {
 			std::vector<uint64_t> held;
 			{
 				std::scoped_lock lock(live.mutex);
-				for (const auto& [page, entry]: live.pages) {
+				for (const auto& [page, info]: live.pages) {
 					held.push_back(page);
 				}
 			}
@@ -430,12 +627,13 @@ void BufferCache::LivePagesPrePass() {
 			}
 		}
 		for (const auto page: read_pages) {
-			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Read);
+			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Read, &writes);
 		}
 		for (const auto page: cp_pages) {
-			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Cp);
+			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Cp, &writes);
 		}
 	}
+	WriteLiveEntries(writes, batch);
 	RangeSet forced;
 	{
 		std::scoped_lock lock(live.mutex);
@@ -484,6 +682,7 @@ void BufferCache::LivePagesBeforeBdaWrites() {
 	if (m_bda_live == nullptr) {
 		return;
 	}
+	FlushLiveRedirects();
 	if (m_bda_live_count.load(std::memory_order_relaxed) != 0) {
 		RestoreLivePages(0, uint64_t {1} << 40u, LiveRestore::Writes);
 	}
@@ -554,6 +753,7 @@ void BufferCache::LivePagesBeforeCpWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fault_epoch_before) {
+	FlushLiveRedirects(); // I-B2: the pass's redirect entries, before the operation is recorded
 	auto&      live = *m_bda_live;
 	const auto mode = BdaLivePagesMode();
 	{
@@ -569,29 +769,53 @@ void BufferCache::LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fau
 	if (mode != 2 && mode != 3) {
 		return;
 	}
-	// V2 (I1): every redirect is still CPU-dirty-only and not hot / image-written.
-	std::vector<uint64_t> held;
+	// V2 (I1): every redirect is still not GPU-dirty, not hot and not image-written. Split by cause;
+	// hot alone is not a stale read (a hot page is CPU-dirty: the redirect reads the guest bytes).
+	std::vector<std::pair<uint64_t, BdaLive::Page>> held;
 	{
 		std::scoped_lock lock(live.mutex);
-		for (const auto& [page, entry]: live.pages) {
-			held.push_back(page);
+		for (const auto& [page, info]: live.pages) {
+			held.emplace_back(page, info);
 		}
 	}
-	uint64_t v2 = 0;
-	for (const auto page: held) {
+	uint64_t v2 = 0, v2_gpu = 0, v2_hot = 0, v2_image = 0;
+	for (const auto& [page, info]: held) {
 		const auto address = page << CACHING_PAGEBITS;
-		const auto state = m_memory_tracker.QueryDirty(address, PAGE);
-		const bool hot   = m_memory_tracker.IsRegionHot(address, PAGE);
-		const bool image = m_texture_cache.IsRegionGpuModified(address, PAGE);
-		if (state.gpu || hot || image) {
-			v2++;
-			static std::atomic<uint32_t> logged {0};
-			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-				std::fprintf(stderr,
-				             "BdaLiveVerify V2: redirected page 0x%" PRIx64 " is%s%s%s (CPU-dirty %d)\n", address,
-				             state.gpu ? " GPU-dirty" : "", hot ? " hot" : "", image ? " image-written" : "",
-				             state.cpu ? 1 : 0);
+		const auto state   = m_memory_tracker.QueryDirty(address, PAGE);
+		const bool gpu     = state.gpu || HasGpuDirtyBytes(address, PAGE);
+		const bool hot     = m_memory_tracker.IsRegionHot(address, PAGE);
+		const bool image   = m_texture_cache.IsRegionGpuModified(address, PAGE);
+		if (!gpu && !hot && !image) {
+			continue;
+		}
+		v2++;
+		v2_gpu += gpu ? 1 : 0;
+		v2_hot += hot ? 1 : 0;
+		v2_image += image ? 1 : 0;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			// Diagnostics: the 4 KiB sub-page bits (bit k = sub-page k) now and at the redirect, the
+			// passes since the redirect, settled, and the page's last live-pages event.
+			uint32_t cpu_now = 0, hot_now = 0, gpu_now = 0;
+			for (uint64_t k = 0; k < SUBPAGES; ++k) {
+				const auto sub = address + k * TRACKER_PAGE_SIZE;
+				const auto s   = m_memory_tracker.QueryDirty(sub, TRACKER_PAGE_SIZE);
+				cpu_now |= s.cpu ? (1u << k) : 0u;
+				gpu_now |= s.gpu ? (1u << k) : 0u;
+				hot_now |= m_memory_tracker.IsRegionHot(sub, TRACKER_PAGE_SIZE) ? (1u << k) : 0u;
 			}
+			bool     settled = false;
+			uint64_t passes  = 0;
+			{
+				std::scoped_lock lock(live.mutex);
+				settled = live.settled.contains(page);
+				passes  = live.passes - info.pass;
+			}
+			std::fprintf(stderr,
+			             "BdaLiveVerify V2: redirected page 0x%" PRIx64 " is%s%s%s | sub-pages now cpu 0x%x gpu 0x%x hot 0x%x, "
+			             "cpu at redirect 0x%x, %" PRIu64 " passes since the redirect, settled %d, tags %d\n",
+			             address, gpu ? " GPU-dirty" : "", hot ? " hot" : "", image ? " image-written" : "", cpu_now,
+			             gpu_now, hot_now, info.cpu_mask, passes, settled ? 1 : 0, BdaTagAccessed(page) ? 1 : 0);
 		}
 	}
 	// V1 (I2): only when no fault moved the epoch during the pass (racing guest writes are allowed).
@@ -652,6 +876,9 @@ void BufferCache::LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fau
 	}
 	std::scoped_lock lock(live.mutex);
 	live.totals.v2 += v2;
+	live.totals.v2_gpu += v2_gpu;
+	live.totals.v2_hot += v2_hot;
+	live.totals.v2_image += v2_image;
 	live.totals.v1 += v1;
 	if (checked) {
 		live.totals.v1_checks++;
@@ -712,6 +939,17 @@ void BufferCache::ReportBdaLive() {
 	            per(t.rejects_bound, r.rejects_bound),
 	            per(t.blocked_passes, r.blocked_passes), t.windows, t.pinned_bytes >> 20u, t.import_failures, t.v1,
 	            t.v1_checks, t.v1_skipped, t.v2, t.v3, t.v4, t.v4_checks);
+	// KYTY_BDA_LIVE_BATCH and the qualification walk (DESIGN.md 4.4). Entry copies are page-table
+	// copy commands of this switch; "in rendering" ones ended an active rendering instance.
+	std::printf("BdaLivePages batch (%s): per frame: entry copies %.2f (in rendering %.2f, %.1f entries), settled %.1f | "
+	            "qualification calls %.1f (fast %.1f), pages walked %.1f, dirty candidates %.1f, sync segments %.1f, "
+	            "%.3f ms in the walk incl. its synchronizations | V2 split gpu %" PRIu64 " image %" PRIu64 " hot %" PRIu64
+	            ", V5 %" PRIu64 " (checks %" PRIu64 ") (totals)\n",
+	            g_bda_live_batch.Get() != 0 ? "on" : "off", per(t.entry_copies, r.entry_copies),
+	            per(t.entry_copies_rendering, r.entry_copies_rendering), per(t.entry_pages, r.entry_pages),
+	            per(t.settled, r.settled), per(t.qual_calls, r.qual_calls), per(t.qual_fast, r.qual_fast),
+	            per(t.qual_pages, r.qual_pages), per(t.qual_dirty, r.qual_dirty), per(t.qual_segments, r.qual_segments),
+	            per(t.qual_ns, r.qual_ns) / 1e6, t.v2_gpu, t.v2_image, t.v2_hot, t.v5, t.v5_checks);
 	std::fflush(stdout);
 	live.report_time   = now;
 	live.reported      = t;

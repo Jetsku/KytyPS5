@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <span>
+#include <utility>
+#include <vector>
 
 // KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): bookkeeping of the imported windows of the guest
 // backing alias. A window is [base + k * window_bytes, + window_bytes) of the backing (the last one
@@ -54,6 +57,21 @@ private:
 	uint64_t                     m_cap_rejects   = 0;
 	uint64_t                     m_range_rejects = 0;
 };
+
+// KYTY_BDA_LIVE_BATCH (rtskip DESIGN.md 4.4, I-B2): the page-table entry writes of one flush as one
+// copy. `writes` are (page, entry) in issue order; a later write of a page replaces an earlier one, so
+// no two regions of the copy overlap. `data` holds the entries in page order; each run is a range of
+// consecutive pages whose entries start at data[data_index].
+struct BdaLiveEntryRun {
+	uint64_t first_page = 0;
+	uint64_t count      = 0;
+	uint64_t data_index = 0;
+};
+struct BdaLiveEntryPlan {
+	std::vector<uint64_t>        data;
+	std::vector<BdaLiveEntryRun> runs;
+};
+[[nodiscard]] BdaLiveEntryPlan PlanBdaLiveEntryWrites(std::span<const std::pair<uint64_t, uint64_t>> writes);
 
 } // namespace Libs::Graphics
 

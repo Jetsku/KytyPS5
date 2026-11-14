@@ -91,6 +91,10 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
+	// Several non-overlapping regions from `source` in one copy command, with one barrier pair over
+	// the spans the regions cover (KYTY_BDA_LIVE_BATCH page-table entry writes).
+	void CopyRegionsFrom(CommandBuffer& command, const Buffer& source, std::span<const vk::BufferCopy> regions,
+	                     vk::AccessFlags source_before = vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.

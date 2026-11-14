@@ -406,6 +406,49 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
+void Buffer::CopyRegionsFrom(CommandBuffer& command, const Buffer& source, std::span<const vk::BufferCopy> regions,
+                             vk::AccessFlags source_before) {
+	KYTY_GPU_OP_SITE("buffer.copy");
+	if (regions.empty()) {
+		return;
+	}
+	uint64_t src_lo = UINT64_MAX, src_hi = 0, dst_lo = UINT64_MAX, dst_hi = 0;
+	for (const auto& r: regions) {
+		if (r.size == 0 || r.srcOffset > source.Size() || r.size > source.Size() - r.srcOffset ||
+		    r.dstOffset > Size() || r.size > Size() - r.dstOffset) {
+			EXIT("Buffer: invalid copy range\n");
+		}
+		src_lo = std::min(src_lo, r.srcOffset);
+		src_hi = std::max(src_hi, r.srcOffset + r.size);
+		dst_lo = std::min(dst_lo, r.dstOffset);
+		dst_hi = std::max(dst_hi, r.dstOffset + r.size);
+	}
+	if (source.Handle() == Handle()) {
+		EXIT("Buffer: self-copy of regions\n");
+	}
+	command.EndRendering();
+	const auto any_read_write = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	const vk::BufferMemoryBarrier before[] = {
+	    source.Barrier(src_lo, src_hi - src_lo, source_before, vk::AccessFlagBits::eTransferRead),
+	    Barrier(dst_lo, dst_hi - dst_lo, any_read_write, vk::AccessFlagBits::eTransferWrite),
+	};
+	auto before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
+	if (static_cast<bool>(source_before & (vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite))) {
+		before_stage |= vk::PipelineStageFlagBits::eHost;
+	}
+	const auto native = command.HelperSink();
+	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 0,
+	                       nullptr, 2, before, 0, nullptr);
+	native.copyBuffer(source.Handle(), Handle(), static_cast<uint32_t>(regions.size()), regions.data());
+	MarkContentWritten();
+	const vk::BufferMemoryBarrier after[] = {
+	    source.Barrier(src_lo, src_hi - src_lo, vk::AccessFlagBits::eTransferRead, any_read_write),
+	    Barrier(dst_lo, dst_hi - dst_lo, vk::AccessFlagBits::eTransferWrite, any_read_write),
+	};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+}
+
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	KYTY_GPU_OP_SITE("buffer.fill");
 	if (((offset | size) & 3u) != 0) {

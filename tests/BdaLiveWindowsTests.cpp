@@ -94,9 +94,40 @@ void TestInvalidConfigurations() {
 	CHECK(invalid.Translate(Base + 0x4000, 0x4000) == 0);
 }
 
+// KYTY_BDA_LIVE_BATCH: the entry writes of one flush as one copy (PlanBdaLiveEntryWrites).
+void TestEntryPlan() {
+	using Libs::Graphics::PlanBdaLiveEntryWrites;
+	using W = std::pair<uint64_t, uint64_t>;
+	CHECK(PlanBdaLiveEntryWrites({}).runs.empty());
+	// Unordered pages: runs of consecutive pages, entries in page order.
+	const std::vector<W> a = {{12, 0xc}, {10, 0xa}, {11, 0xb}, {20, 0x14}, {13, 0xd}, {5, 0x5}};
+	const auto           pa = PlanBdaLiveEntryWrites(a);
+	CHECK(pa.runs.size() == 3);
+	CHECK(pa.runs[0].first_page == 5 && pa.runs[0].count == 1 && pa.runs[0].data_index == 0);
+	CHECK(pa.runs[1].first_page == 10 && pa.runs[1].count == 4 && pa.runs[1].data_index == 1);
+	CHECK(pa.runs[2].first_page == 20 && pa.runs[2].count == 1 && pa.runs[2].data_index == 5);
+	CHECK((pa.data == std::vector<uint64_t> {0x5, 0xa, 0xb, 0xc, 0xd, 0x14}));
+	// A page written twice (a redirect, then its restore): the later write wins, one region only.
+	const std::vector<W> b  = {{7, 0x1000}, {8, 0x2000}, {7, 0x3000}, {9, 0x4000}, {8, 0x5000}, {8, 0x6000}};
+	const auto           pb = PlanBdaLiveEntryWrites(b);
+	CHECK(pb.runs.size() == 1 && pb.runs[0].first_page == 7 && pb.runs[0].count == 3);
+	CHECK((pb.data == std::vector<uint64_t> {0x3000, 0x6000, 0x4000}));
+	// Every page appears once in the data; regions never overlap.
+	uint64_t total = 0;
+	for (const auto& run: pb.runs) {
+		total += run.count;
+	}
+	CHECK(total == pb.data.size());
+	// A 0 entry (a page without a buffer) is kept as written.
+	const std::vector<W> c  = {{3, 0}, {4, 0x4}};
+	const auto           pc = PlanBdaLiveEntryWrites(c);
+	CHECK(pc.runs.size() == 1 && (pc.data == std::vector<uint64_t> {0, 0x4}));
+}
+
 } // namespace
 
 int main() {
+	TestEntryPlan();
 	TestTranslateImportsOnce();
 	TestLastWindowIsShorter();
 	TestRangeRules();

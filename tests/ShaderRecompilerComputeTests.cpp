@@ -9566,13 +9566,30 @@ public:
       shader_read(base + a, fresh, table->Handle(), table->Size());
 
       // 3: an upload (read binding over the page; a small one is copied into the stream ring and
-      // leaves the page CPU-dirty and redirected) ends its redirect.
+      // leaves the page CPU-dirty and redirected) ends its redirect. KYTY_BDA_LIVE_BATCH=1 (default):
+      // the upload only settles the pages (their redirect entries stay; the guest bytes equal the
+      // uploaded copy), and the next pre-pass restores them in one batch.
       // A read of more than one caching page is uploaded into the cache buffer (pages b and c).
+      const auto copies_before = cache.GetBdaLiveTotals().entry_copies;
       (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + b, page + 0x40, false, false); });
-      Require(name, "upload restore", !live(b) && !dirty(b) && !live(c),
-              "an upload over a redirected page kept the redirect");
+      Require(name, "upload settles", live(b) && live(c) && !dirty(b) && cache.IsBdaLivePageSettled(base + b) &&
+                                          cache.IsBdaLivePageSettled(base + c),
+              "a read upload over a redirected page did not settle it (batched restore)");
+      Require(name, "no mid-stream copy", cache.GetBdaLiveTotals().entry_copies == copies_before,
+              "a read upload wrote page-table entries at once with batching on");
+      // A settled page still reads, through its redirect, the guest bytes (= the uploaded copy).
+      {
+        u32 value_b = 0; // LivePageRead loads the dword at guest + 4
+        std::memcpy(&value_b, memory + b + 4, sizeof(value_b));
+        OnGpuThread(context, [&] { scheduler.Finish(); });
+        shader_read(base + b, value_b, table->Handle(), table->Size());
+      }
+      const auto restores_before = cache.GetBdaLiveTotals().restore_upload;
       pass();
-      Require(name, "after upload", !live(b) && !dirty(b), "an uploaded page was redirected again");
+      Require(name, "after upload", !live(b) && !dirty(b) && !live(c) && !cache.IsBdaLivePageSettled(base + b),
+              "the pre-pass did not restore the settled pages, or redirected an uploaded page again");
+      Require(name, "batched restore", cache.GetBdaLiveTotals().restore_upload == restores_before + 2,
+              "the pre-pass restored a different number of settled pages");
       // A page a cache binding uploaded is not redirected again for 64 full passes (performance
       // rule, KYTY_BDA_LIVE_BOUND_PASSES): the pass uploads it meanwhile.
       cpu_write(c + 0x40, 0x5a5a5a5au);
@@ -9636,9 +9653,48 @@ public:
                   static_cast<unsigned long long>(totals.v1_checks), static_cast<unsigned long long>(totals.v1_skipped),
                   static_cast<unsigned long long>(totals.v2), static_cast<unsigned long long>(totals.v3));
       Require(name, "verify",
-              totals.v1 == 0 && totals.v2 == 0 && totals.v3 == 0 && totals.v4 == 0 && totals.v1_checks >= 1 &&
-                  totals.v4_checks >= 1,
-              "a verify counter is not 0, or V1 / V4 never ran");
+              totals.v1 == 0 && totals.v2 == 0 && totals.v3 == 0 && totals.v4 == 0 && totals.v5 == 0 &&
+                  totals.v1_checks >= 1 && totals.v4_checks >= 1 && totals.v5_checks >= 1,
+              "a verify counter is not 0, or V1 / V4 / V5 never ran");
+
+      // 9: KYTY_BDA_LIVE_BATCH=0: a read upload restores at once (one entry copy per run).
+      set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BATCH=0\n");
+      cpu_write(d + 0x100, 0x21222324u);
+      pass();
+      Require(name, "redirect d again", live(d), "the pass did not redirect page d again");
+      {
+        const auto before = cache.GetBdaLiveTotals();
+        (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + c, page + 0x40, false, false); });
+        const auto after = cache.GetBdaLiveTotals();
+        Require(name, "unbatched restore",
+                !live(d) && !cache.IsBdaLivePageSettled(base + d) && after.restore_upload == before.restore_upload + 1 &&
+                    after.entry_copies == before.entry_copies + 1,
+                "with KYTY_BDA_LIVE_BATCH=0 a read upload did not restore its redirect at once");
+      }
+
+      // 10: V5 catches a settled page that turned GPU-dirty without a written binding (injected).
+      set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BATCH=1\n");
+      for (int k = 0; k < 64; k++) {
+        pass(); // past the bound passes of page d
+      }
+      cpu_write(d + 0x180, 0x31323334u);
+      pass();
+      Require(name, "redirect d for V5", live(d), "the pass did not redirect page d for the V5 check");
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + c, page + 0x40, false, false); });
+      Require(name, "settled d", cache.IsBdaLivePageSettled(base + d), "the read upload did not settle page d");
+      // The injected bit is taken back after the check: nothing else in the cache knows of it (a
+      // synchronization of a GPU-dirty page without its written-binding records is not a real state).
+      uint64_t injected = 0;
+      OnGpuThread(context, [&] {
+        cache.TestingMarkGpuDirty(base + d, page);
+        injected = cache.CheckSettledLivePages();
+        cache.TestingMarkGpuDirty(base + d, page, false);
+      });
+      Require(name, "V5", injected == 1 && cache.GetBdaLiveTotals().v5 == 1,
+              "V5 did not count the settled page made GPU-dirty");
+      pass();
+      Require(name, "settled restored", !live(d) && !cache.IsBdaLivePageSettled(base + d),
+              "the pre-pass did not restore the settled page d");
       scheduler.Finish();
       context.UnmapMemory(base, allocation_size);
       Require(name, "unmap", cache.GetBdaLiveTotals().held == 0, "unmap left redirects");

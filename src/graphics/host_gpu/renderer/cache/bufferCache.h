@@ -165,6 +165,13 @@ public:
 	void                   DropLivePages(uint64_t vaddr, uint64_t size);
 	// Whether the caching page of `vaddr` is served live (tests).
 	[[nodiscard]] bool     IsBdaLivePage(uint64_t vaddr) const;
+	// Whether it is served live and settled (a read upload made its cache copy current; tests).
+	[[nodiscard]] bool     IsBdaLivePageSettled(uint64_t vaddr) const;
+	// Tests only: marks the range GPU-dirty in the tracker without a written binding (the injection
+	// the V5 check must catch).
+	void                   TestingMarkGpuDirty(uint64_t vaddr, uint64_t size, bool mark = true);
+	// Verify V5 over the settled pages now (the pre-pass runs it in verify mode); returns the count.
+	uint64_t               CheckSettledLivePages();
 	struct BdaLiveTotals {
 		uint64_t redirects        = 0; // pages a full pass redirected instead of uploading
 		uint64_t held             = 0; // pages redirected now
@@ -189,9 +196,26 @@ public:
 		uint64_t v1_checks        = 0;
 		uint64_t v1_skipped       = 0; // checks skipped: the fault epoch moved during the pass
 		uint64_t v2               = 0; // verify: redirected pages that are GPU-dirty / hot / image-written
+		uint64_t v2_gpu           = 0; //   of them GPU-dirty (bits or bytes)
+		uint64_t v2_image         = 0; //   of them under a GPU-modified image range
+		uint64_t v2_hot           = 0; //   of them hot (a hot page is CPU-dirty: not a stale read by itself)
 		uint64_t v3               = 0; // verify: redirects alive at a BDA-writing program
 		uint64_t v4               = 0; // verify: forced pages still CPU-dirty after their upload (I3, must be 0)
 		uint64_t v4_checks        = 0;
+		uint64_t v5               = 0; // verify: settled pages GPU-dirty / image-written at the pre-pass (I-B1)
+		uint64_t v5_checks        = 0;
+		// KYTY_BDA_LIVE_BATCH (DESIGN.md 4.4)
+		uint64_t settled          = 0; // read uploads over a redirected page (restore left to the pre-pass)
+		uint64_t entry_copies     = 0; // page-table copy commands written for redirects / restores
+		uint64_t entry_copies_rendering = 0; // of them issued inside an active rendering instance
+		uint64_t entry_pages      = 0; // entries written by them
+		// Qualification (LiveSyncBufferRange)
+		uint64_t qual_calls       = 0; // calls during full passes
+		uint64_t qual_fast        = 0; // of them taking the no-dirty, no-redirect fast path
+		uint64_t qual_pages       = 0; // caching pages walked
+		uint64_t qual_dirty       = 0; // of them CPU-dirty candidates that reached the locked checks
+		uint64_t qual_segments    = 0; // SynchronizeBuffer calls the walk split the range into
+		uint64_t qual_ns          = 0; // time in LiveSyncBufferRange (includes those synchronizations)
 		uint64_t windows          = 0;
 		uint64_t pinned_bytes     = 0;
 		uint64_t import_failures  = 0;
@@ -1177,7 +1201,16 @@ private:
 	enum class LiveRestore : uint8_t { Upload, Written, Register, Unmap, Read, Cp, Off, Writes };
 	// Gives the redirected pages of [vaddr, vaddr + size) their cache entries back (0 without a buffer)
 	// and queues them in the forced set. Register: the caller rewrote the entries already. GPU thread.
-	void RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore why);
+	// With `writes` the entries are appended there for one later flush (WriteLiveEntries).
+	void RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore why,
+	                      std::vector<std::pair<uint64_t, vk::DeviceAddress>>* writes = nullptr);
+	// KYTY_BDA_LIVE_BATCH (I-B1): a read upload over redirected pages of [vaddr, vaddr + size) marks
+	// them settled (restored at the next pre-pass) instead of restoring them; 0 = restore at once.
+	void SettleLivePages(uint64_t vaddr, uint64_t size);
+	// Writes page-table entries (page, entry): one copy when batching, else one copy per run.
+	void WriteLiveEntries(std::vector<std::pair<uint64_t, vk::DeviceAddress>>& writes, bool batch);
+	// The redirect entries a full pass queued (I-B2), written before the operation.
+	void FlushLiveRedirects();
 	// After a full pass ran: V1/V2 (verify), and the tick later CP writes wait for.
 	void LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fault_epoch_before);
 	// KYTY_BDA_WRITES: before a BDA-writing program, every redirect is restored and uploaded (I-W1).

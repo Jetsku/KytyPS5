@@ -4240,10 +4240,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): an upload (the cache copy is current again) or a
 	// written binding (GPU-dirty bytes must not be served from guest memory, I-W3) ends the redirect
-	// of every caching page it touches.
+	// of every caching page it touches. KYTY_BDA_LIVE_BATCH (I-B1): a read upload only settles the
+	// pages; their entries go back in one batch at the next pre-pass.
 	if (m_bda_live_count.load(std::memory_order_relaxed) != 0 &&
 	    (is_written || !copies.empty() || !late_copies.empty())) {
-		RestoreLivePages(vaddr, size, is_written ? LiveRestore::Written : LiveRestore::Upload);
+		if (is_written) {
+			RestoreLivePages(vaddr, size, LiveRestore::Written);
+		} else {
+			SettleLivePages(vaddr, size);
+		}
 	}
 	if (written_skip_verify) {
 		// Nothing a CPU access could have changed since the check: it waits for this thread.

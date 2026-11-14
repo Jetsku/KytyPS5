@@ -51,4 +51,32 @@ uint64_t BdaLiveWindows::Translate(uint64_t host, uint64_t bytes) {
 	return it->second.device + (offset - start);
 }
 
+BdaLiveEntryPlan PlanBdaLiveEntryWrites(std::span<const std::pair<uint64_t, uint64_t>> writes) {
+	BdaLiveEntryPlan plan;
+	if (writes.empty()) {
+		return plan;
+	}
+	// (page, issue index): sorted by page, the last issue of each page kept.
+	std::vector<std::pair<uint64_t, size_t>> order;
+	order.reserve(writes.size());
+	for (size_t k = 0; k < writes.size(); ++k) {
+		order.emplace_back(writes[k].first, k);
+	}
+	std::sort(order.begin(), order.end());
+	plan.data.reserve(order.size());
+	for (size_t k = 0; k < order.size(); ++k) {
+		if (k + 1 < order.size() && order[k + 1].first == order[k].first) {
+			continue; // a later write of the same page follows
+		}
+		const auto page = order[k].first;
+		if (!plan.runs.empty() && plan.runs.back().first_page + plan.runs.back().count == page) {
+			plan.runs.back().count++;
+		} else {
+			plan.runs.push_back({page, 1, plan.data.size()});
+		}
+		plan.data.push_back(writes[order[k].second].second);
+	}
+	return plan;
+}
+
 } // namespace Libs::Graphics
