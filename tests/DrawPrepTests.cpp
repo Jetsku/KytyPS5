@@ -945,14 +945,43 @@ void TestCodeDigestCache() {
 
 // KYTY_DRAW_PREP_ADAPT: the active-worker cap formula.
 void TestAdaptiveCap() {
-	// ceil(1.3 x busy) + 1, bounded by (affinity processors - 4) / 2 and the workers.
+	// ceil(1.3 x busy) + 1, bounded by the workers and by the affinity processors minus one.
 	Check(DrawPrep::AdaptiveCap(0.0, 6, 32, 1, 0) == 1, "idle: one worker");
 	Check(DrawPrep::AdaptiveCap(1.0, 6, 32, 1, 0) == 3, "1 busy core: ceil(1.3) + 1 = 3");
 	Check(DrawPrep::AdaptiveCap(2.4, 6, 32, 1, 0) == 5, "2.4 busy cores: ceil(3.12) + 1 = 5");
 	Check(DrawPrep::AdaptiveCap(5.0, 6, 32, 1, 0) == 6, "never more than the workers");
-	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 0) == 4, "6-core mask (12 processors): (12 - 4) / 2 = 4");
-	Check(DrawPrep::AdaptiveCap(5.0, 6, 16, 1, 0) == 6, "8-core mask (16 processors): (16 - 4) / 2 = 6");
-	Check(DrawPrep::AdaptiveCap(5.0, 6, 4, 1, 0) == 1, "tiny masks still get one worker");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 0) == 6, "6-core mask (12 processors): the workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 16, 1, 0) == 6, "8-core mask (16 processors): the workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 4, 1, 0) == 3, "4 processors: 3 workers + the commit thread");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 1, 1, 0) == 1, "one processor still gets one worker");
+	// The bound never cuts the pool below the commit thread's demand (the busy term) while the
+	// workers and the commit thread fit on the processors: at 4, 6, 8, 12, 16 and 32 logical
+	// processors. The old bound (logical - 4) / 2 gave 1 / 1 / 2 / 4 / 6 / 14.
+	const uint32_t lps_list[] = {4, 6, 8, 12, 16, 32};
+	const double   busy_list[] = {0.0, 0.5, 1.0, 1.6, 2.4, 3.1, 5.0};
+	bool           demand_kept = true;
+	for (const auto lps: lps_list) {
+		for (const auto busy: busy_list) {
+			const auto demand = std::min(static_cast<uint32_t>(std::ceil(1.3 * busy)) + 1u, 6u);
+			const auto cap    = DrawPrep::AdaptiveCap(busy, 6, lps, 1, 0);
+			demand_kept &= cap == std::min(demand, lps - 1u);
+		}
+	}
+	Check(demand_kept, "cap = min(demand, workers, processors - 1) at 4, 6, 8, 12, 16, 32 processors");
+	Check(DrawPrep::AdaptiveProcessorBound(4) == 3 && DrawPrep::AdaptiveProcessorBound(6) == 5 &&
+	          DrawPrep::AdaptiveProcessorBound(8) == 7 && DrawPrep::AdaptiveProcessorBound(12) == 11 &&
+	          DrawPrep::AdaptiveProcessorBound(16) == 15 && DrawPrep::AdaptiveProcessorBound(32) == 31,
+	      "processor bound = logical processors - 1");
+	// 16 processors and more: the same caps as the old bound for six workers (it never bound there).
+	bool unchanged = true;
+	for (const auto lps: {16u, 32u}) {
+		for (const auto busy: busy_list) {
+			const auto old_bound = (lps - 4u) / 2u;
+			const auto old_cap   = std::min({static_cast<uint32_t>(std::ceil(1.3 * busy)) + 1u, old_bound, 6u});
+			unchanged &= DrawPrep::AdaptiveCap(busy, 6, lps, 1, 0) == old_cap;
+		}
+	}
+	Check(unchanged, "16 and 32 processors: caps unchanged for six workers");
 	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 2) == 2, "KYTY_DRAW_PREP_ADAPT_MAX overrides the bound");
 	Check(DrawPrep::AdaptiveCap(0.0, 6, 32, 3, 0) == 3, "KYTY_DRAW_PREP_ADAPT_MIN raises the floor");
 	Check(DrawPrep::AdaptiveCap(0.0, 2, 32, 3, 0) == 2, "the floor never exceeds the workers");

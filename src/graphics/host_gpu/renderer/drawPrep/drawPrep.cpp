@@ -1746,7 +1746,7 @@ private:
 struct AdaptConfig {
 	uint64_t spin_ns     = 0;
 	uint32_t min_cap     = 1;
-	uint32_t max_cap     = 0; // 0: (affinity processors - 4) / 2
+	uint32_t max_cap     = 0; // 0: affinity processors - 1 (AdaptiveProcessorBound)
 	uint64_t interval_ns = 250'000'000;
 };
 
@@ -1765,8 +1765,24 @@ std::atomic<uint64_t> g_adapt_busy_milli {0}; // busy cores x 1000 of the last i
 // below (Engine::Workers is private to the engine).
 std::atomic<void*> g_live_workers {nullptr};
 void (*g_live_set_adapt)(void*, bool) = nullptr;
+void (*g_live_set_active)(void*, uint32_t) = nullptr;
 void ApplyAdaptMode(int64_t previous, int64_t value);
+void ApplyActiveWorkers(int64_t previous, int64_t value);
 } // namespace
+
+// KYTY_DRAW_PREP_ACTIVE=<n> (live, default unset or 0 = every worker): only the first n draw-prep
+// workers run the hot/cold gate loop (KYTY_DRAW_PREP_HOT of them hot, the rest cold); the others park
+// until the value changes. With the six default workers, n = 3 is KYTY_DRAW_PREP_WORKERS=3 (2 hot +
+// 1 cold) switchable inside one boot. A worker that is retired while parked cold leaves when its
+// next cold wake reaches it, so that one wake is lost (the commit thread prepares an unclaimed head
+// itself, as always). No effect while KYTY_DRAW_PREP_ADAPT is on (its cap decides); applies again
+// when the gate loop resumes.
+static Live::Switch g_active_workers(
+    "KYTY_DRAW_PREP_ACTIVE",
+    [](const char* value) -> int64_t {
+	    return value != nullptr ? static_cast<int64_t>(std::min(std::strtoul(value, nullptr, 10), 32ul)) : 0;
+    },
+    [](int64_t previous, int64_t value) { ApplyActiveWorkers(previous, value); });
 
 // KYTY_DRAW_PREP_ADAPT=1 (live, default 0): the adaptive pool instead of the hot/cold gate. Both
 // exist from the start; a change moves the workers from one loop to the other (on the command
@@ -1799,7 +1815,7 @@ struct Engine::Workers {
 	        bool cold_token, const AdaptConfig& config)
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
 	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token),
-	      adapt_config(config) {
+	      adapt_config(config), threads_count(std::min(count, AdaptivePool::MaxWorkers)) {
 		// KYTY_SPIN_BUDGET (common/spinGate.h): the commit thread may park on a held head; the
 		// workers' Complete then wakes it. Decided before any worker starts.
 		if (Common::SpinGate::BudgetAvailable()) {
@@ -1815,10 +1831,14 @@ struct Engine::Workers {
 		adapt_on.store(on, std::memory_order_seq_cst);
 		leave_adapt.store(!on, std::memory_order_seq_cst);
 		leave_gate.store(on, std::memory_order_seq_cst);
+		const auto active_value = static_cast<uint32_t>(g_active_workers.Get());
+		active.store(active_value == 0 ? count : std::min(active_value, count), std::memory_order_seq_cst);
+		PublishLeaves();
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
-		g_live_set_adapt = [](void* workers, bool on) { static_cast<Workers*>(workers)->SetAdapt(on); };
+		g_live_set_adapt  = [](void* workers, bool on) { static_cast<Workers*>(workers)->SetAdapt(on); };
+		g_live_set_active = [](void* workers, uint32_t n) { static_cast<Workers*>(workers)->SetActive(n); };
 		g_live_workers.store(this, std::memory_order_seq_cst);
 	}
 
@@ -1827,11 +1847,35 @@ struct Engine::Workers {
 		stop.store(true, std::memory_order_seq_cst);
 		leave_gate.store(true, std::memory_order_seq_cst);
 		leave_adapt.store(true, std::memory_order_seq_cst);
+		PublishLeaves();
 		gate.WakeAll();
 		adapt->WakeAll();
+		NotifyActive();
 		for (auto& thread: threads) {
 			thread.join();
 		}
+	}
+
+	// KYTY_DRAW_PREP_ACTIVE: each worker's leave flag for the gate loop = the loop's own leave flag,
+	// or the worker is beyond the active count (command processor thread, and the constructor).
+	void PublishLeaves() {
+		const bool all = leave_gate.load(std::memory_order_seq_cst);
+		const auto n   = active.load(std::memory_order_seq_cst);
+		for (uint32_t index = 0; index < threads_count; index++) {
+			leave_worker[index].store(all || index >= n, std::memory_order_seq_cst);
+		}
+	}
+	// Wakes the workers parked beyond the active count, so they re-read it (and the mode, and stop).
+	void NotifyActive() {
+		active_word.fetch_add(1, std::memory_order_seq_cst);
+		active_word.notify_all();
+	}
+	// KYTY_DRAW_PREP_ACTIVE live change (command processor thread). 0 = every worker.
+	void SetActive(uint32_t n) {
+		n = n == 0 ? threads_count : std::min(n, threads_count);
+		active.store(n, std::memory_order_seq_cst);
+		PublishLeaves();
+		NotifyActive();
 	}
 
 	Workers(const Workers&)            = delete;
@@ -1843,11 +1887,14 @@ struct Engine::Workers {
 			leave_adapt.store(false, std::memory_order_seq_cst);
 			adapt_on.store(true, std::memory_order_seq_cst);
 			leave_gate.store(true, std::memory_order_seq_cst);
+			PublishLeaves();
 			gate.WakeAll();
+			NotifyActive();
 		} else {
 			// WakeAll left the cold token in its shutdown state; no worker is parked in the gate now.
 			gate.Rearm();
 			leave_gate.store(false, std::memory_order_seq_cst);
+			PublishLeaves();
 			adapt_on.store(false, std::memory_order_seq_cst);
 			leave_adapt.store(true, std::memory_order_seq_cst);
 			adapt->WakeAll();
@@ -1935,6 +1982,15 @@ struct Engine::Workers {
 					WorkerRelax();
 					continue;
 				}
+				// KYTY_DRAW_PREP_ACTIVE: beyond the active count, park until it (or the mode) changes.
+				if (index >= active.load(std::memory_order_seq_cst)) {
+					const auto observed = active_word.load(std::memory_order_seq_cst);
+					if (index >= active.load(std::memory_order_seq_cst) &&
+					    !adapt_on.load(std::memory_order_seq_cst) && !stop.load(std::memory_order_seq_cst)) {
+						active_word.wait(observed, std::memory_order_seq_cst);
+					}
+					continue;
+				}
 				// KYTY_SPIN_BUDGET (common/spinGate.h): a short idle spin while the core budget is
 				// exceeded; the idle periods' spin and parks go to the site counters.
 				struct BudgetHooks {
@@ -1949,7 +2005,7 @@ struct Engine::Workers {
 					}
 				};
 				RunPreparationWorkerBatched(
-				    gate, window, index, spin_ns, cold_spin_ns, leave_gate, prepare,
+				    gate, window, index, spin_ns, cold_spin_ns, leave_worker[index], prepare,
 				    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); }, batch,
 				    BudgetHooks {});
 			}
@@ -1970,6 +2026,12 @@ struct Engine::Workers {
 	std::atomic<bool> leave_gate {false};
 	std::atomic<bool> leave_adapt {true};
 	std::atomic<bool>        stop {false};
+	// KYTY_DRAW_PREP_ACTIVE: the workers that run the gate loop, the parked others' wake word, and
+	// each worker's leave flag for that loop (PublishLeaves).
+	const uint32_t                                       threads_count;
+	std::atomic<uint32_t>                                active {0};
+	std::atomic<uint32_t>                                active_word {0};
+	std::array<std::atomic<bool>, AdaptivePool::MaxWorkers> leave_worker {};
 	std::vector<std::thread> threads;
 };
 
@@ -1981,6 +2043,13 @@ void ApplyAdaptMode(int64_t /*previous*/, int64_t value) {
 		g_live_set_adapt(workers, on);
 	}
 	g_stats_due.store(true, std::memory_order_relaxed); // closes the A/B slot's PrepStats period
+}
+void ApplyActiveWorkers(int64_t /*previous*/, int64_t value) {
+	// Command processor thread only.
+	if (auto* workers = g_live_workers.load(std::memory_order_seq_cst); workers != nullptr) {
+		g_live_set_active(workers, static_cast<uint32_t>(value));
+	}
+	g_stats_due.store(true, std::memory_order_relaxed);
 }
 } // namespace
 
