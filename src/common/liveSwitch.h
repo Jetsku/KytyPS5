@@ -72,6 +72,7 @@ public:
 
 private:
 	friend struct Registry;
+	friend bool ReloadFromEnvironment(const char* name);
 
 	const char*          m_name;
 	Parser               m_parse;
@@ -79,6 +80,11 @@ private:
 	std::atomic<int64_t> m_value {0};
 	Switch*              m_next = nullptr;
 };
+
+// Start-up only (main thread, before the threads that read switches start): re-parses the named
+// switch(es) from the process environment, without the on-change hook. For start-up code that sets
+// variables after the switches registered (KYTY_SMALL_CPU_RULE). False: no such switch.
+bool ReloadFromEnvironment(const char* name);
 
 // Common parsers.
 // 0 only for "0"; unset and anything else: 1 (flags that default on).

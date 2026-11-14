@@ -28,8 +28,8 @@ struct Setting {
 [[nodiscard]] std::string Describe(const std::vector<Setting>& settings);
 
 // Called by main before the CPU placement starts (InitializeThreads): with KYTY_SMALL_CPU_RULE=1 it
-// reads the budget, sets the selected variables in the process environment (start-up readers) and
-// stages them as live values (live switches, applied at the first guest flip), and logs the line.
+// reads the budget, sets the selected variables in the process environment (start-up readers),
+// re-reads the live switches among them (Live::ReloadFromEnvironment), and logs the line.
 void ApplyAtStartup();
 
 } // namespace Common::TopologyRule

@@ -53,19 +53,14 @@ void ApplyAtStartup() {
 	uint64_t   affinity = 0;
 	const auto budget   = ComputeCoreBudget(ReadProcessCpuSets(&affinity));
 	const auto settings = Select(budget.cores, budget.smt_cores, budget.logical);
-	std::string staged;
 	for (const auto& setting: settings) {
 #if defined(_WIN32)
 		(void)_putenv_s(setting.key.c_str(), setting.value.c_str());
 #else
 		(void)setenv(setting.key.c_str(), setting.value.c_str(), 1);
 #endif
-		staged += setting.key + "=" + setting.value + "\n";
-	}
-	if (!staged.empty()) {
-		// Live switches registered before main and read the environment then: stage the same values
-		// (applied at the first guest flip, as a live file's would be).
-		Live::Testing::StageText(staged);
+		// Live switches registered before main and read the environment then.
+		(void)Live::ReloadFromEnvironment(setting.key.c_str());
 	}
 	std::printf("Kyty small-CPU rule (KYTY_SMALL_CPU_RULE): %s: %s\n", budget.description.c_str(),
 	            Describe(settings).c_str());

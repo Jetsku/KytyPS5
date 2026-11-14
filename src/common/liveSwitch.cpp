@@ -293,6 +293,19 @@ Switch::Switch(const char* name, Parser parse, OnChange on_change) noexcept
 	registry.head = this;
 }
 
+bool ReloadFromEnvironment(const char* name) {
+	auto&           registry = Registry::Get();
+	std::lock_guard lock(registry.mutex);
+	bool            found = false;
+	for (Switch* s = registry.head; s != nullptr; s = s->m_next) {
+		if (std::strcmp(s->m_name, name) == 0) {
+			s->m_value.store(s->m_parse(EnvValue(name)), std::memory_order_relaxed);
+			found = true;
+		}
+	}
+	return found;
+}
+
 std::string Registry::Names() {
 	auto&                    registry = Get();
 	std::vector<std::string> names;
