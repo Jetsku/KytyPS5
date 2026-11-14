@@ -902,6 +902,10 @@ target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+# Software RT kernels: dispatch decision and first-dispatch wait budgets (pipeline/rtSession.h).
+add_executable(rt_session_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/RtSessionTests.cpp")
+target_include_directories(rt_session_tests PRIVATE ${inc_headers})
+
 # Shader precompile (KYTY_SHADER_PRECOMPILE): the journal file and the replay driver.
 add_executable(shader_precompile_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderPrecompileTests.cpp"
@@ -1643,6 +1647,7 @@ if(BUILD_TESTING)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
+	add_test(NAME rt_session COMMAND $<TARGET_FILE:rt_session_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
 	add_test(NAME shader_precompile COMMAND $<TARGET_FILE:shader_precompile_tests>)
 	set_tests_properties(shader_precompile PROPERTIES TIMEOUT 60)

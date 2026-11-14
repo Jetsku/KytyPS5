@@ -5366,7 +5366,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, flip.handle, flip.index,
 			                               flip.flip_mode, flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
+			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); m_renderer.GetPipelineCache().WaitRtKernelsAtFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
 			return;
 		}
 		case CpSeq::FlipVariant::Label: {
@@ -5394,7 +5394,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			                                 flip.handle, flip.index, flip.flip_mode,
 			                                 flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip();
+			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); m_renderer.GetPipelineCache().WaitRtKernelsAtFlip();
 			return;
 		}
 		case CpSeq::FlipVariant::LabelInterrupt: {
@@ -5427,7 +5427,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				                                 flip.handle, flip.index, flip.flip_mode,
 				                                 flip.flip_arg, request);
 				GetScheduler().Flush();
-				Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip();
+				Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); m_renderer.GetPipelineCache().WaitRtKernelsAtFlip();
 				return;
 			}
 			StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
@@ -5439,7 +5439,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
 			    flip.index, flip.flip_mode, flip.flip_arg, request, m_interrupt_event_id);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip();
+			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); m_renderer.GetPipelineCache().WaitRtKernelsAtFlip();
 			return;
 		}
 	}
@@ -5462,7 +5462,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
-	Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
+	Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); m_renderer.GetPipelineCache().WaitRtKernelsAtFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
 }
 
 void CommandProcessor::SynchronizeGpu() {
