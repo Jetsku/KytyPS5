@@ -5,6 +5,7 @@
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 
 #include <algorithm>
 #include <array>
@@ -1291,6 +1292,7 @@ void EndBlock() {
 
 void SetThreadName(const char* name) {
 	if (name != nullptr) HangWatchdog::SetThreadName(name);
+	Common::NameCurrentThreadForOs(name);
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

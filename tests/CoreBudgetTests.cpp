@@ -7,6 +7,8 @@
 #include "common/coreBudget.h"
 #include "common/cpuPlacement.h"
 #include "common/spinGate.h"
+#include "common/guestPriority.h"
+#include "common/topologyRule.h"
 
 #include <bit>
 #include <cstdint>
@@ -430,12 +432,46 @@ void TestPlacement() {
 	std::puts("CoreBudgetTests: placement rules ok");
 }
 
+// KYTY_SMALL_CPU_RULE (common/topologyRule.h) and KYTY_GUEST_PRIORITY_FLAT (common/guestPriority.h).
+std::string RuleFor(uint64_t mask) {
+	const auto budget = Common::ComputeCoreBudget(MachineTable(mask));
+	return Common::TopologyRule::Describe(
+	    Common::TopologyRule::Select(budget.cores, budget.smt_cores, budget.logical));
+}
+
+void TestSmallCpuRule() {
+	using Common::GuestPriority::BandHost;
+	Check(BandHost(0, 0) == 0 && BandHost(-1, 0) == -1 && BandHost(-2, 0) == -2, "flat 0: bands unchanged");
+	Check(BandHost(0, 1) == -1 && BandHost(-1, 1) == -1 && BandHost(-2, 1) == -2, "flat 1: high band down");
+	Check(BandHost(0, 2) == 0 && BandHost(-1, 2) == 0 && BandHost(-2, 2) == -2, "flat 2: normal band up");
+
+	// The full machine and 8C/16T: nothing changes.
+	Check(RuleFor(0xFFFFFFFFull) == "nothing", "rule: 16C/32T changes nothing");
+	Check(RuleFor(0xFFFF) == "nothing", "rule: 8C/16T changes nothing");
+	Check(RuleFor(0xFFFF0000ull) == "nothing", "rule: 8C/16T on the other CCD changes nothing");
+	// 6C/12T (both CCDs' masks as the timing scripts use them).
+	const char* six = "KYTY_GUEST_PRIORITY_FLAT=1, KYTY_SPIN_BUDGET=1";
+	Check(RuleFor(0x0FFF) == six, "rule: 6C/12T");
+	Check(RuleFor(0x0FFF0000ull) == six, "rule: 6C/12T other CCD");
+	// 4C/8T and 6 cores without SMT: flat bands only.
+	const char* few = "KYTY_GUEST_PRIORITY_FLAT=1";
+	Check(RuleFor(0x0555) == few, "rule: 6 cores without SMT");
+	Check(RuleFor(0x05550000ull) == few, "rule: 6 cores without SMT other CCD");
+	Check(RuleFor(0x00FF) == few, "rule: 4C/8T");
+	Check(RuleFor(0x00FF0000ull) == few, "rule: 4C/8T other CCD");
+	// 5C/10T: 10 logical processors still get the spin budget.
+	Check(RuleFor(0x03FF) == six, "rule: 5C/10T");
+	Check(Common::TopologyRule::Select(0, 0, 0).empty(), "rule: no budget, nothing");
+	std::puts("CoreBudgetTests: small-CPU rule ok");
+}
+
 } // namespace
 
 int main() {
 	TestBudget();
 	TestGate();
 	TestPlacement();
+	TestSmallCpuRule();
 	std::puts("CoreBudgetTests: all ok");
 	return 0;
 }

@@ -3,6 +3,7 @@
 
 #include "common/handoffLean.h"
 #include "common/hangWatchdog.h"
+#include "common/helperPriority.h"
 #include "common/spinGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
@@ -807,6 +808,7 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 	if (available()) {
 		return true;
 	}
+	Common::HelperPriority::Check(1); // KYTY_HELPER_PRIORITY (measurement)
 	HangWatchdog::Scope wait("recorder-ring-published", reinterpret_cast<uint64_t>(this), m_read,
 	                         m_published_cache);
 	const auto start = NowNs();

@@ -26,6 +26,13 @@ void RaiseCurrentThreadPriority();
 void RaiseServiceThreadPriority();
 [[nodiscard]] int ServiceThreadPriorityLevel();
 
+// KYTY_THREAD_NAMES=1 (measurement, default off): the calling thread gets `name` as its OS thread
+// description (SetThreadDescription), so that a sampler outside the process can tell the threads
+// apart. Nothing with the switch off, and nothing off Windows.
+void NameCurrentThreadForOs(const char* name);
+// The calling thread's host priority: 2 highest, 1 above normal, 0 normal, -1 below normal, -2 lowest
+// (KYTY_HELPER_PRIORITY, common/helperPriority.h). No-op off Windows.
+void SetCurrentThreadPriorityStep(int step);
 // sched_yield: gives the processor to another thread that is ready to run on this CPU and
 // returns at once when there is none (FreeBSD sched_relinquish). True when another thread ran.
 bool YieldToReadyThread();

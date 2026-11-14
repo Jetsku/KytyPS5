@@ -1,3 +1,4 @@
+﻿#include "common/hleWaitStats.h"
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
@@ -608,6 +609,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
+	HleWait::Scope hle_wait_scope(HleWait::EqNone); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 	GThreadStats::FpProbe();
 
@@ -644,6 +646,14 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		} else {
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
+	}
+	if (*out > 0) {
+		const auto f = ev[0].filter;
+		const auto id = static_cast<uint64_t>(ev[0].ident);
+		hle_wait_scope.Set(f == KERNEL_EVFILT_VIDEO_OUT ? (id == 0 ? HleWait::EqFlip : id == 1 ? HleWait::EqVblank : HleWait::EqVideoOutOther)
+		                   : f == KERNEL_EVFILT_GRAPHICS ? HleWait::EqGraphics
+		                   : f == KERNEL_EVFILT_USER     ? HleWait::EqUser
+		                                                 : HleWait::EqOther);
 	}
 	if (pace_begin != 0) {
 		const bool got = *out > 0;

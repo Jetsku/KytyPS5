@@ -1,3 +1,4 @@
+#include "common/hleWaitStats.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -142,7 +143,9 @@ static bool LowerCoreBoundThread(KernelCpumask affinity) {
 /// Host priority a guest thread runs at: the priority of its band, or one step below it (but not
 /// below the lowest band value) when the thread is pinned to a single core.
 static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
-	const int host = GuestPriorityToHost(guest_priority);
+	// KYTY_GUEST_PRIORITY_FLAT (common/guestPriority.h, live) moves a band by one step.
+	const int host = Common::GuestPriority::BandHost(GuestPriorityToHost(guest_priority),
+	                                                 Common::GuestPriority::Mode());
 	return core_bound ? std::max(host - 1, -2) : host;
 }
 
@@ -2039,6 +2042,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	HleWait::Scope hle_wait_scope(HleWait::MutexLock); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
 	GThreadStats::FpProbe();
 
@@ -2715,6 +2719,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 }
 
 int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
+	HleWait::Scope hle_wait_scope(HleWait::RwRead); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// Hot path for some PS5 titles; per-call name logging can dominate runtime.
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2732,6 +2737,7 @@ int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec) {
+	HleWait::Scope hle_wait_scope(HleWait::RwRead); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2749,6 +2755,7 @@ int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec) {
+	HleWait::Scope hle_wait_scope(HleWait::RwWrite); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2866,6 +2873,7 @@ int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockWrlock(PthreadRwlock* rwlock) {
+	HleWait::Scope hle_wait_scope(HleWait::RwWrite); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3144,6 +3152,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	HleWait::Scope hle_wait_scope(HleWait::CondTimed); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
 	GThreadStats::FpProbe();
 
@@ -3212,6 +3221,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	HleWait::Scope hle_wait_scope(HleWait::CondTimed); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3276,6 +3286,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	HleWait::Scope hle_wait_scope(HleWait::CondWait); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 	GThreadStats::FpProbe();
 
@@ -3485,6 +3496,18 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// KYTY_GUEST_PRIORITY_FLAT (live): re-applies the calling guest thread's host priority after a change.
+static void ApplyGuestPriorityToSelf() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto* thread = g_pthread_self;
+	if (thread == nullptr || thread->attr == nullptr) {
+		return;
+	}
+	SetThreadPriority(GetCurrentThread(),
+	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+#endif
+}
+
 /// Entry point of the host thread behind every guest thread: records its identity, applies the guest
 /// priority, then runs the guest entry function on the guest stack and cleans up afterwards.
 /// @param arg the Pthread that this host thread runs
@@ -3505,6 +3528,7 @@ static void* RunThread(void* arg) {
 
 	g_pthread_self = thread;
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
+	Common::NameCurrentThreadForOs(("G:" + thread->name).c_str());
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3530,6 +3554,7 @@ static void* RunThread(void* arg) {
 	thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
 	SetThreadPriority(GetCurrentThread(),
 	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+	Common::GuestPriority::g_apply.store(&ApplyGuestPriorityToSelf, std::memory_order_release);
 #endif
 	Common::PlaceCurrentThreadGuest();
 	GThreadStats::MarkGuestThread();
@@ -3949,6 +3974,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	HleWait::Scope hle_wait_scope(HleWait::Yield); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
 	if ((++placement_yields & 4095u) == 0u) {
@@ -4178,6 +4204,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	HleWait::Scope hle_wait_scope(HleWait::Usleep); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	GThreadStats::FpProbe();
 	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
@@ -4191,6 +4218,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	HleWait::Scope hle_wait_scope(HleWait::Nanosleep); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}

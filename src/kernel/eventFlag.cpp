@@ -1,3 +1,4 @@
+#include "common/hleWaitStats.h"
 #include "kernel/eventFlag.h"
 
 #include "common/assert.h"
@@ -289,6 +290,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
+	HleWait::Scope hle_wait_scope(HleWait::EventFlag); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 	GThreadStats::FpProbe();
 

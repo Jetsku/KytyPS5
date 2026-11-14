@@ -2151,6 +2151,11 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 	// KYTY_LIVE_FILE (common/liveSwitch.h): live switches, applied at this thread's flips.
 	Live::Start();
+	// wholecp measurement: the CP idle buckets (PrepStats::g_cp_idle, TSC ticks) on every live line.
+	Live::SetCpIdleProvider([]() -> Live::CpIdleTotals {
+		const auto& i = DrawPrep::PrepStats::g_cp_idle;
+		return {DrawPrep::PrepStats::Tsc(), i.nowork, i.empty, i.blocked, i.fence, i.starved};
+	});
 	// KYTY_CP_SAMPLER (diagnostics): stack samples of this thread (threadSampler.h).
 	StartThreadSampler("cp");
 	// KYTY_CP_COMMIT: parsed (and its process-wide switches set) before the first command.
@@ -2179,7 +2184,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
 				const CpGaps::Scope gap(CpGaps::Cat::Idle);
+				const auto          nowork_start = DrawPrep::PrepStats::Tsc();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				DrawPrep::PrepStats::g_cp_idle.nowork += DrawPrep::PrepStats::Tsc() - nowork_start;
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;

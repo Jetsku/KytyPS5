@@ -24,10 +24,17 @@
 //   stream needs.
 // - Only workers below the active cap claim and are woken; the others park. The publisher
 //   recomputes the cap about every 250 ms from the workers' busy time (PrepStats):
-//     cap = ceil(1.3 x busy cores) + 1, at most (logical processors in the process affinity - 4) / 2
-//   and at most the configured workers (KYTY_DRAW_PREP_ADAPT_MAX overrides that bound,
-//   KYTY_DRAW_PREP_ADAPT_MIN raises the floor, default 1). The bound counts the processors the
+//     cap = ceil(1.3 x busy cores) + 1, at most the configured workers and at most the logical
+//   processors in the process affinity minus one (the workers and the commit thread all fit on
+//   the allowed processors at once). KYTY_DRAW_PREP_ADAPT_MAX overrides that bound,
+//   KYTY_DRAW_PREP_ADAPT_MIN raises the floor, default 1. The bound counts the processors the
 //   process may run on (its affinity mask), not the machine's idle processors.
+//   Intended bound: the pool never runs fewer workers than the commit thread's demand (the busy
+//   term). Until 2026-11-14 the bound was (logical - 4) / 2, which cut the pool below that demand
+//   on small masks (6 logical processors: 1 worker, 8: 2); the commit thread then prepared the
+//   heads itself (Playroom at 6 threads: commit 16.9 -> 26.0 ms per flip, heads ready 12.5%).
+//   At 16 logical processors and more the old bound was never below the six workers, so nothing
+//   changes there.
 // - The lowest-numbered parked worker is woken first, so the same few stay warm.
 //
 // No wakeup is lost. A parking worker sets its parked bit and leaves the spinning count (both
@@ -41,13 +48,17 @@
 // unclaimed head.
 namespace Libs::Graphics::DrawPrep {
 
+// The processor bound of the active-worker cap (pure: unit tests): logical processors minus the
+// commit thread's, at least 1.
+[[nodiscard]] constexpr uint32_t AdaptiveProcessorBound(uint32_t affinity_lps) noexcept {
+	return affinity_lps > 2u ? affinity_lps - 1u : 1u;
+}
+
 // The active-worker cap (pure: unit tests). `busy_cores`: the workers' busy time over the last
 // interval divided by its length.
 [[nodiscard]] inline uint32_t AdaptiveCap(double busy_cores, uint32_t workers, uint32_t affinity_lps,
                                           uint32_t min_cap, uint32_t max_override) {
-	const uint32_t bound = max_override != 0
-	                           ? max_override
-	                           : (affinity_lps > 4u ? (affinity_lps - 4u) / 2u : 1u);
+	const uint32_t bound = max_override != 0 ? max_override : AdaptiveProcessorBound(affinity_lps);
 	const auto     wanted = static_cast<uint32_t>(std::ceil(1.3 * std::max(busy_cores, 0.0))) + 1u;
 	auto           cap    = std::min({wanted, std::max(bound, 1u), workers});
 	cap                   = std::max({cap, std::min(min_cap, workers), 1u});

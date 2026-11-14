@@ -210,6 +210,43 @@ void RaiseServiceThreadPriority() {
 #endif
 }
 
+void NameCurrentThreadForOs(const char* name) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_THREAD_NAMES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (!on || name == nullptr || name[0] == '\0') {
+		return;
+	}
+	using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+	static const auto set = reinterpret_cast<SetDescription>(reinterpret_cast<void*>(
+	    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
+	if (set == nullptr) {
+		return;
+	}
+	wchar_t wide[96] = {};
+	if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 95) > 0) {
+		(void)set(GetCurrentThread(), wide);
+	}
+#else
+	(void)name;
+#endif
+}
+
+void SetCurrentThreadPriorityStep(int step) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const int priority = step >= 2    ? THREAD_PRIORITY_HIGHEST
+	                     : step == 1  ? THREAD_PRIORITY_ABOVE_NORMAL
+	                     : step == 0  ? THREAD_PRIORITY_NORMAL
+	                     : step == -1 ? THREAD_PRIORITY_BELOW_NORMAL
+	                                  : THREAD_PRIORITY_LOWEST;
+	(void)SetThreadPriority(GetCurrentThread(), priority);
+#else
+	(void)step;
+#endif
+}
+
 bool YieldToReadyThread() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return SwitchToThread() != 0;
