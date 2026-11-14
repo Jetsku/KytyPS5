@@ -6493,15 +6493,17 @@ struct PipelineCache::RtState {
 		return ms == UINT32_MAX ? std::string("for ever") : std::to_string(ms) + " ms";
 	}
 
-	// KYTY_RT_KERNEL_WAIT_AT=flip (default) | dispatch: where the command processor waits for a
-	// direct RT kernel that is not built at its first dispatch. flip: that frame's dispatches of it
-	// are skipped and the frame's flip waits for every such kernel at once, so kernels first used in
-	// the same frame build side by side (one wait of the longest build, not one wait per kernel);
-	// if no flip comes within KYTY_RT_KERNEL_FLIP_WAIT_MS (default 1000) of its first dispatch, a
-	// later dispatch waits itself. dispatch: the first dispatch waits (as KYTY_RT_PIPELINE_ASYNC=0).
+	// KYTY_RT_KERNEL_WAIT_AT=dispatch (default) | flip: where the command processor waits for a
+	// direct RT kernel that is not built at its first dispatch. dispatch: the first dispatch waits
+	// (as KYTY_RT_PIPELINE_ASYNC=0), so no dispatch is lost; kernels first used in one frame then
+	// build one after another (cold Sky Garden: nine waits of 2-3 s). flip: that frame's dispatches
+	// of it are skipped and the frame's flip waits for every such kernel at once (one wait of the
+	// longest build); if no flip comes within KYTY_RT_KERNEL_FLIP_WAIT_MS (default 1000) of its first
+	// dispatch, a later dispatch waits itself. Not the default: a kernel dispatched only once is lost
+	// (Playroom has four such kernels).
 	static bool KernelWaitAtFlip() {
 		const auto* value = std::getenv("KYTY_RT_KERNEL_WAIT_AT");
-		return value == nullptr || std::string_view(value) != "dispatch";
+		return value != nullptr && std::string_view(value) == "flip";
 	}
 
 	explicit RtState(PipelineCache& owner)
