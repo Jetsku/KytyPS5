@@ -7,6 +7,7 @@
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/helperPriority.h"
 #include "common/spinGate.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -164,6 +165,7 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 	// KYTY_SPIN_GATE: the wait spins only while the PC keeps CPUs idle. KYTY_SPIN_BUDGET: only a
 	// short spin while the core budget is exceeded (common/spinGate.h).
 	using Common::SpinGate::Site;
+	Common::HelperPriority::Check(1); // KYTY_HELPER_PRIORITY (measurement)
 	const uint64_t spin_ns = Common::SpinGate::SpinNs(Site::Sequencer, m_spin_ns);
 	// PrepStats: the sequencer's spin time (until it is ready or parks).
 	auto       spin_tsc  = DrawPrep::PrepStats::Tsc();

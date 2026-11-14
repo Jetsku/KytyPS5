@@ -9,6 +9,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/helperPriority.h"
 #include "common/spinGate.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1914,6 +1915,7 @@ struct Engine::Workers {
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
 		t_worker_number = index + 1u;
 		const auto prepare = [this, &placement_count](Slot& slot, uint64_t seq) {
+			Common::HelperPriority::Check(0); // KYTY_HELPER_PRIORITY (measurement)
 			PrepareClaimed(slot, seq);
 			if ((++placement_count & 63u) == 0u) {
 				Common::SamplePlacement(Common::ThreadRole::Host);

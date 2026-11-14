@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 
 #include "common/assert.h"
+#include "common/helperPriority.h"
 #include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/gpuReadDelegate.h"
@@ -103,6 +104,7 @@ void StagePrepWorker::Run() {
 	Profiler::SetThreadName("DrawPrep#0");
 	uint64_t seen = 0;
 	for (;;) {
+		Common::HelperPriority::Check(0); // KYTY_HELPER_PRIORITY (measurement)
 		auto     idle_start = NowNs();
 		uint32_t spins      = 0;
 		uint64_t posted     = 0;
