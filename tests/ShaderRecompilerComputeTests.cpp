@@ -9487,7 +9487,8 @@ public:
       Live::Testing::StageText(text);
       Live::OnCpFlip();
     };
-    set_live("KYTY_BDA_LIVE_PAGES=verify\n");
+    // The bound rule (KYTY_BDA_LIVE_BOUND_PASSES, default 0) is on for steps 3-10.
+    set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BOUND_PASSES=64\n");
     const auto context_owner = MakeRenderContext();
     auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
@@ -9695,6 +9696,24 @@ public:
       pass();
       Require(name, "settled restored", !live(d) && !cache.IsBdaLivePageSettled(base + d),
               "the pre-pass did not restore the settled page d");
+
+      // 11: KYTY_BDA_LIVE_BOUND_PASSES=0 (default): a page a binding uploaded is redirected again by
+      // the next pass that finds it CPU-dirty.
+      set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BOUND_PASSES=0\n");
+      for (int k = 0; k < 64; k++) {
+        pass(); // past any bound passes set earlier for page b
+      }
+      cpu_write(b + 0x200, 0x41424344u);
+      pass();
+      Require(name, "redirect b", live(b), "the pass did not redirect page b");
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + b, page + 0x40, false, false); });
+      pass(); // restores the settled page b
+      Require(name, "b restored", !live(b) && !dirty(b), "the pre-pass did not restore and upload page b");
+      cpu_write(b + 0x240, 0x45464748u);
+      const auto rejects = cache.GetBdaLiveTotals().rejects_bound;
+      pass();
+      Require(name, "no bound rule", live(b) && cache.GetBdaLiveTotals().rejects_bound == rejects,
+              "with KYTY_BDA_LIVE_BOUND_PASSES=0 an uploaded page was not redirected again");
       scheduler.Finish();
       context.UnmapMemory(base, allocation_size);
       Require(name, "unmap", cache.GetBdaLiveTotals().held == 0, "unmap left redirects");
@@ -9707,7 +9726,7 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "live-pages direct-memory allocation release failed");
-    set_live("KYTY_BDA_LIVE_PAGES=\n");
+    set_live("KYTY_BDA_LIVE_PAGES=\nKYTY_BDA_LIVE_BOUND_PASSES=\nKYTY_BDA_LIVE_BATCH=\n");
     std::printf("[host]    %-32s ok\n", name);
   }
 

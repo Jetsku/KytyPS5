@@ -81,6 +81,9 @@ bool Redirects(int64_t mode) {
 }
 Live::Switch g_bda_live_pages("KYTY_BDA_LIVE_PAGES", ParseLivePages);
 Live::Switch g_bda_live_batch("KYTY_BDA_LIVE_BATCH", Live::ParseDefaultOn);
+Live::Switch g_bda_live_bound("KYTY_BDA_LIVE_BOUND_PASSES", [](const char* value) -> int64_t {
+	return value != nullptr && value[0] != '\0' ? static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 0), 1u << 20u)) : 0;
+});
 
 BufferCache* g_live_cache = nullptr; // the cache whose state the StreamCopyDefer hooks reach
 
@@ -116,9 +119,10 @@ struct BufferCache::BdaLive {
 	// Verify diagnostics: the last event of each page (1 = redirected, 2 + LiveRestore = restored).
 	std::unordered_map<uint64_t, uint8_t>  history;
 	// Performance only: pages a cache binding uploaded after their redirect are not redirected again
-	// until this many full passes later (KYTY_BDA_LIVE_BOUND_PASSES, default 64; 0 = off).
+	// until this many full passes later (KYTY_BDA_LIVE_BOUND_PASSES, live, default 0 = off: with the
+	// batched restores the churn costs one batched entry write per pass, while a blocked page is uploaded,
+	// re-protected and faults again; Astro's Playroom: 35 rejects/f, faults 15 -> 19/f, 0.7 -> 1.5 MB/f).
 	std::unordered_map<uint64_t, uint64_t> bound_until;
-	uint64_t                               bound_passes = 64;
 	uint64_t                               passes       = 0;
 	void Note(uint64_t page, uint8_t event) {
 		if (history.size() < (1u << 20u) || history.contains(page)) {
@@ -154,7 +158,6 @@ void BufferCache::CreateBdaLive() {
 	}
 	auto live          = std::make_shared<BdaLive>();
 	live->owner        = this;
-	live->bound_passes = LiveEnvU64("KYTY_BDA_LIVE_BOUND_PASSES", 64);
 	auto* state = live.get();
 	const uint64_t window = std::clamp<uint64_t>(LiveEnvU64("KYTY_BDA_LIVE_WINDOW_MB", 64), 1, 1024) << 20u;
 	const uint64_t cap    = LiveEnvU64("KYTY_BDA_LIVE_MAX_MB", 1024) << 20u;
@@ -502,9 +505,9 @@ void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore wh
 		for (auto it = live.pages.lower_bound(first); it != live.pages.end() && it->first <= last;) {
 			pages.push_back(it->first);
 			live.Note(it->first, static_cast<uint8_t>(2 + static_cast<uint8_t>(why)));
-			if ((why == LiveRestore::Upload || why == LiveRestore::Written) && live.bound_passes != 0 &&
+			if ((why == LiveRestore::Upload || why == LiveRestore::Written) && g_bda_live_bound.Get() != 0 &&
 			    live.bound_until.size() < (1u << 20u)) {
-				live.bound_until[it->first] = live.passes + live.bound_passes;
+				live.bound_until[it->first] = live.passes + static_cast<uint64_t>(g_bda_live_bound.Get());
 			}
 			live.settled.erase(it->first);
 			live.cp_pending.erase(it->first);
