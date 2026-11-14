@@ -107,6 +107,8 @@ struct BufferCache::BdaLive {
 	std::set<uint64_t>                     settled;    // redirected pages a read upload made current (I-B1)
 	LiveWrites                             queued;     // redirect entries of the running pass (I-B2)
 	std::unordered_set<uint64_t>           cp_written; // pages a CP write hit while redirected
+	std::set<uint64_t>                     cp_pending;   // redirected pages a CP write hit (restored at the pre-pass)
+	std::set<uint64_t>                     read_pending; // redirected pages a shader read (tag report)
 	RangeSet                               forced;     // entries given back without an upload
 	std::unique_ptr<BdaLiveWindows>        windows;
 	std::vector<std::unique_ptr<Buffer>>   imports;
@@ -288,6 +290,16 @@ void BufferCache::FlushLiveRedirects() {
 		std::swap(queued, m_bda_live->queued);
 	}
 	WriteLiveEntries(queued, true);
+}
+
+void BufferCache::LiveNoteTagRead(uint64_t page) {
+	if (m_bda_live == nullptr || m_bda_live_count.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::scoped_lock lock(m_bda_live->mutex);
+	if (m_bda_live->pages.contains(page)) {
+		m_bda_live->read_pending.insert(page); // I5: uploaded at the next pre-pass
+	}
 }
 
 void BufferCache::SettleLivePages(uint64_t vaddr, uint64_t size) {
@@ -495,6 +507,8 @@ void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore wh
 				live.bound_until[it->first] = live.passes + live.bound_passes;
 			}
 			live.settled.erase(it->first);
+			live.cp_pending.erase(it->first);
+			live.read_pending.erase(it->first);
 			it = live.pages.erase(it);
 		}
 		m_bda_live_count.store(live.pages.size(), std::memory_order_relaxed);
@@ -574,6 +588,8 @@ void BufferCache::LivePagesPrePass() {
 	if (m_bda_live == nullptr) {
 		return;
 	}
+	// Runs before every PrepareBda (about 200 per frame on Sky Garden with reach 0), so it only
+	// touches pages that have something pending, never all redirected pages.
 	FlushLiveRedirects();
 	auto&                 live  = *m_bda_live;
 	const auto            mode  = BdaLivePagesMode();
@@ -584,17 +600,18 @@ void BufferCache::LivePagesPrePass() {
 	bool                  all = false;
 	{
 		std::scoped_lock lock(live.mutex);
-		if (live.pages.empty() && live.forced.Empty()) {
+		live.totals.prepass_calls++;
+		all = !Redirects(mode) && !live.pages.empty();
+		if (!all && live.settled.empty() && live.cp_pending.empty() && live.read_pending.empty() &&
+		    live.forced.Empty()) {
 			return;
 		}
-		all = !Redirects(mode) && !live.pages.empty();
+		live.totals.prepass_work++;
 		if (!all) {
-			for (const auto& [page, info]: live.pages) {
-				if (live.cp_written.contains(page)) {
-					cp_pages.push_back(page);
-				}
-			}
+			cp_pages.assign(live.cp_pending.begin(), live.cp_pending.end());
+			read_pages.assign(live.read_pending.begin(), live.read_pending.end());
 			settled.assign(live.settled.begin(), live.settled.end());
+			live.totals.live_reads += read_pages.size();
 		}
 	}
 	// The restores of this pre-pass, written as one flush.
@@ -607,24 +624,6 @@ void BufferCache::LivePagesPrePass() {
 		}
 		for (const auto page: settled) {
 			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Upload, &writes);
-		}
-		if (m_bda_tags != nullptr) {
-			std::vector<uint64_t> held;
-			{
-				std::scoped_lock lock(live.mutex);
-				for (const auto& [page, info]: live.pages) {
-					held.push_back(page);
-				}
-			}
-			for (const auto page: held) {
-				if (BdaTagAccessed(page)) {
-					read_pages.push_back(page);
-				}
-			}
-			if (!read_pages.empty()) {
-				std::scoped_lock lock(live.mutex);
-				live.totals.live_reads += read_pages.size();
-			}
 		}
 		for (const auto page: read_pages) {
 			RestoreLivePages(page << CACHING_PAGEBITS, PAGE, LiveRestore::Read, &writes);
@@ -731,6 +730,7 @@ void BufferCache::LivePagesBeforeCpWrite(uint64_t vaddr, uint64_t size) {
 			if (live.cp_written.size() < (1u << 20u)) {
 				live.cp_written.insert(it->first); // never redirected again; restored at the next pre-pass
 			}
+			live.cp_pending.insert(it->first);
 		}
 		if (!hit) {
 			return;
@@ -943,13 +943,13 @@ void BufferCache::ReportBdaLive() {
 	// copy commands of this switch; "in rendering" ones ended an active rendering instance.
 	std::printf("BdaLivePages batch (%s): per frame: entry copies %.2f (in rendering %.2f, %.1f entries), settled %.1f | "
 	            "qualification calls %.1f (fast %.1f), pages walked %.1f, dirty candidates %.1f, sync segments %.1f, "
-	            "%.3f ms in the walk incl. its synchronizations | V2 split gpu %" PRIu64 " image %" PRIu64 " hot %" PRIu64
+	            "%.3f ms in the walk incl. its synchronizations | pre-pass calls %.1f (with work %.1f) | V2 split gpu %" PRIu64 " image %" PRIu64 " hot %" PRIu64
 	            ", V5 %" PRIu64 " (checks %" PRIu64 ") (totals)\n",
 	            g_bda_live_batch.Get() != 0 ? "on" : "off", per(t.entry_copies, r.entry_copies),
 	            per(t.entry_copies_rendering, r.entry_copies_rendering), per(t.entry_pages, r.entry_pages),
 	            per(t.settled, r.settled), per(t.qual_calls, r.qual_calls), per(t.qual_fast, r.qual_fast),
 	            per(t.qual_pages, r.qual_pages), per(t.qual_dirty, r.qual_dirty), per(t.qual_segments, r.qual_segments),
-	            per(t.qual_ns, r.qual_ns) / 1e6, t.v2_gpu, t.v2_image, t.v2_hot, t.v5, t.v5_checks);
+	            per(t.qual_ns, r.qual_ns) / 1e6, per(t.prepass_calls, r.prepass_calls), per(t.prepass_work, r.prepass_work), t.v2_gpu, t.v2_image, t.v2_hot, t.v5, t.v5_checks);
 	std::fflush(stdout);
 	live.report_time   = now;
 	live.reported      = t;

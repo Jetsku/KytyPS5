@@ -159,6 +159,9 @@ void BufferCache::NoteBdaTagFault(uint64_t start, uint64_t size) {
 			pages.push_back(page);
 		}
 	}
+	for (const auto page: pages) {
+		LiveNoteTagRead(page); // KYTY_BDA_LIVE_PAGES (I5)
+	}
 	// The tagged entries of the backed pages (sorted: the loop runs upwards).
 	std::vector<vk::DeviceAddress> entries;
 	for (size_t first = 0; first < pages.size();) {

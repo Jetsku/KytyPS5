@@ -216,6 +216,8 @@ public:
 		uint64_t qual_dirty       = 0; // of them CPU-dirty candidates that reached the locked checks
 		uint64_t qual_segments    = 0; // SynchronizeBuffer calls the walk split the range into
 		uint64_t qual_ns          = 0; // time in LiveSyncBufferRange (includes those synchronizations)
+		uint64_t prepass_calls    = 0; // LivePagesPrePass calls (one per PrepareBda)
+		uint64_t prepass_work     = 0; // of them with something pending
 		uint64_t windows          = 0;
 		uint64_t pinned_bytes     = 0;
 		uint64_t import_failures  = 0;
@@ -1211,6 +1213,8 @@ private:
 	void WriteLiveEntries(std::vector<std::pair<uint64_t, vk::DeviceAddress>>& writes, bool batch);
 	// The redirect entries a full pass queued (I-B2), written before the operation.
 	void FlushLiveRedirects();
+	// NoteBdaTagFault: a shader reported `page`; a redirected one is restored at the next pre-pass (I5).
+	void LiveNoteTagRead(uint64_t page);
 	// After a full pass ran: V1/V2 (verify), and the tick later CP writes wait for.
 	void LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fault_epoch_before);
 	// KYTY_BDA_WRITES: before a BDA-writing program, every redirect is restored and uploaded (I-W1).
