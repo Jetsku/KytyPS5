@@ -453,12 +453,14 @@ void TestSmallCpuRule() {
 	const char* six = "KYTY_GUEST_PRIORITY_FLAT=1, KYTY_SPIN_BUDGET=1";
 	Check(RuleFor(0x0FFF) == six, "rule: 6C/12T");
 	Check(RuleFor(0x0FFF0000ull) == six, "rule: 6C/12T other CCD");
-	// 6 cores without SMT: nothing is reserved there anyway.
-	Check(RuleFor(0x0555) == six, "rule: 6 cores without SMT");
-	// 4C/8T: also no reserved core.
-	const char* four = "KYTY_GUEST_PRIORITY_FLAT=1, KYTY_SPIN_BUDGET=1, KYTY_CPU_RESERVE=off";
-	Check(RuleFor(0x00FF) == four, "rule: 4C/8T");
-	Check(RuleFor(0x00FF0000ull) == four, "rule: 4C/8T other CCD");
+	// 4C/8T and 6 cores without SMT: flat bands only.
+	const char* few = "KYTY_GUEST_PRIORITY_FLAT=1";
+	Check(RuleFor(0x0555) == few, "rule: 6 cores without SMT");
+	Check(RuleFor(0x05550000ull) == few, "rule: 6 cores without SMT other CCD");
+	Check(RuleFor(0x00FF) == few, "rule: 4C/8T");
+	Check(RuleFor(0x00FF0000ull) == few, "rule: 4C/8T other CCD");
+	// 5C/10T: 10 logical processors still get the spin budget.
+	Check(RuleFor(0x03FF) == six, "rule: 5C/10T");
 	Check(Common::TopologyRule::Select(0, 0, 0).empty(), "rule: no budget, nothing");
 	std::puts("CoreBudgetTests: small-CPU rule ok");
 }
