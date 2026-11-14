@@ -538,10 +538,12 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
+	m_reservation_pending = true;
 	return {Mapped().data() + m_offset, m_offset};
 }
 
 void StreamBuffer::Commit() {
+	m_reservation_pending = false;
 	if (Usage() != MemoryUsage::Download && m_mapped_size != 0) {
 		Flush(m_offset, m_mapped_size);
 	}

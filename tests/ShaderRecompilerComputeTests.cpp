@@ -9714,6 +9714,35 @@ public:
       pass();
       Require(name, "no bound rule", live(b) && cache.GetBdaLiveTotals().rejects_bound == rejects,
               "with KYTY_BDA_LIVE_BOUND_PASSES=0 an uploaded page was not redirected again");
+
+      // 12 (I-S1): a written binding over a redirected CPU-dirty page uploads the guest bytes, also when
+      // the upload is staged in a reservation of the staging ring (KYTY_RENDERER_BATCH=1, the test
+      // bda_live_pages_batch): the restore's page-table entries must not land in that reservation. The
+      // guest writes the page without a fault (it is writable), the binding takes GPU ownership, and a
+      // guest read of the page then publishes the GPU's bytes: they must be the guest's (Astro Bot's
+      // pirate level lost the device when they were page-table entries).
+      {
+        constexpr u32 head = 0x61626364u, tail = 0x65666768u;
+        std::memcpy(memory + b, &head, sizeof(head));             // first bytes of the staged page
+        std::memcpy(memory + b + 0x2c0, &tail, sizeof(tail));     // inside the written range
+        const auto v6_before = cache.GetBdaLiveTotals().v6;
+        (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + b, 0x300, true, false); });
+        Require(name, "written restore b", !live(b), "a written binding over redirected page b kept the redirect");
+        OnGpuThread(context, [&] { scheduler.Finish(); });
+        Require(name, "written readback", context.HandleFault(PageFaultAccess::Read, base + b),
+                "a guest read of the GPU-owned page did not publish its GPU bytes");
+        u32 head_after = 0, tail_after = 0;
+        std::memcpy(&head_after, memory + b, sizeof(head_after));
+        std::memcpy(&tail_after, memory + b + 0x2c0, sizeof(tail_after));
+        std::printf("BdaLivePages step 12: renderer batch %d, GPU bytes after the written binding 0x%08x 0x%08x "
+                    "(guest wrote 0x%08x 0x%08x), V6 %llu\n",
+                    Common::RendererBatchEnabled() ? 1 : 0, head_after, tail_after, head, tail,
+                    static_cast<unsigned long long>(cache.GetBdaLiveTotals().v6));
+        Require(name, "written upload bytes", head_after == head && tail_after == tail,
+                "the written binding's upload did not carry the guest bytes of a redirected page");
+        Require(name, "V6", cache.GetBdaLiveTotals().v6 == v6_before,
+                "page-table entries were written while a staging reservation was open");
+      }
       scheduler.Finish();
       context.UnmapMemory(base, allocation_size);
       Require(name, "unmap", cache.GetBdaLiveTotals().held == 0, "unmap left redirects");

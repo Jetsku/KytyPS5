@@ -46,6 +46,7 @@
 #include "graphics/host_gpu/renderer/cache/bdaLiveWindows.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/watchRange.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -57,6 +58,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -124,6 +126,17 @@ struct BufferCache::BdaLive {
 	// re-protected and faults again; Astro's Playroom: 35 rejects/f, faults 15 -> 19/f, 0.7 -> 1.5 MB/f).
 	std::unordered_map<uint64_t, uint64_t> bound_until;
 	uint64_t                               passes       = 0;
+	// KYTY_BDA_LIVE_LOG=N (diagnostic, default 0): the first N full passes that redirect print one line
+	// each (tick, new redirects as guest ranges, held, windows); imports name the page that made them.
+	uint64_t                               log_left     = 0;
+	std::vector<uint64_t>                  pass_new;      // pages the running pass redirected (log only)
+	uint64_t                               trigger        = 0; // page address whose window is imported
+	uint64_t                               trigger_buffer = 0;
+	uint64_t                               trigger_size   = 0;
+	uint64_t                               first_tick     = 0; // tick of the first pass that redirected
+	uint64_t                               last_tick      = 0; // tick of the latest pass that redirected
+	uint64_t                               last_pass_new  = 0;
+	std::vector<uint64_t>                  last_new;      // pages the latest redirecting pass added (sorted)
 	void Note(uint64_t page, uint8_t event) {
 		if (history.size() < (1u << 20u) || history.contains(page)) {
 			history[page] = event;
@@ -177,8 +190,11 @@ void BufferCache::CreateBdaLive() {
             const auto device = buffer->BufferDeviceAddress();
             state->imports.push_back(std::move(buffer));
             std::printf("Kyty BDA live pages: imported backing window 0x%" PRIx64 " + %" PRIu64
-                        " MiB in %.1f ms (%zu windows)\n",
-                        host - LibKernel::Memory::GuestBackingBase(), bytes >> 20u, ms, state->imports.size());
+                        " MiB in %.1f ms (%zu windows; device 0x%" PRIx64 ", for page 0x%" PRIx64
+                        " of buffer 0x%" PRIx64 " + 0x%" PRIx64 ", tick %" PRIu64 ")\n",
+                        host - LibKernel::Memory::GuestBackingBase(), bytes >> 20u, ms, state->imports.size(),
+                        static_cast<uint64_t>(device), state->trigger, state->trigger_buffer, state->trigger_size,
+                        m_scheduler.CurrentTick());
             std::fflush(stdout);
             return device;
         });
@@ -188,8 +204,10 @@ void BufferCache::CreateBdaLive() {
 		            base, size);
 		return;
 	}
+	live->log_left = LiveEnvU64("KYTY_BDA_LIVE_LOG", 0);
 	m_bda_live   = std::move(live);
 	g_live_cache = this;
+	SetDeviceLossNote(&BufferCache::LiveDeviceLossNote);
 	std::printf("Kyty BDA live pages: built (KYTY_BDA_LIVE_PAGES=%s), windows %" PRIu64 " MiB, cap %" PRIu64
 	            " MiB, backing %" PRIu64 " MiB\n",
 	            value, window >> 20u, cap >> 20u, size >> 20u);
@@ -243,6 +261,17 @@ vk::DeviceAddress BufferCache::LiveEntry(uint64_t page) const {
 void BufferCache::WriteLiveEntries(LiveWrites& writes, bool batch) {
 	if (writes.empty()) {
 		return;
+	}
+	// I-S1 (DESIGN.md 7): the entries go through the staging ring; an open reservation there (an
+	// upload staged but not committed) would be overwritten by them. Every caller restores only after
+	// the reservation is committed; V6 counts a regression (always on, one stderr line).
+	if (m_staging_buffer.ReservationPending()) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::fprintf(stderr, "BdaLiveVerify V6: page-table entries written while a staging reservation is open\n");
+		}
+		std::scoped_lock lock(m_bda_live->mutex);
+		m_bda_live->totals.v6++;
 	}
 	const auto plan      = PlanBdaLiveEntryWrites(writes);
 	const bool rendering = m_scheduler.Current().ActiveRenderingSerial() != 0;
@@ -320,6 +349,9 @@ void BufferCache::SettleLivePages(uint64_t vaddr, uint64_t size) {
 	for (auto it = live.pages.lower_bound(first); it != live.pages.end() && it->first <= last; ++it) {
 		if (live.settled.insert(it->first).second) {
 			live.totals.settled++;
+			if (WatchRange::Enabled()) {
+				WatchRange::Note("live pages: settle", it->first << CACHING_PAGEBITS, PAGE);
+			}
 		}
 	}
 }
@@ -417,6 +449,9 @@ void BufferCache::LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size
 						state = m_memory_tracker.QueryDirty(address, PAGE);
 					}
 					if (state.cpu && !state.gpu) {
+						live.trigger        = address; // names the page in an import line
+						live.trigger_buffer = buffer.CpuAddress();
+						live.trigger_size   = buffer.Size();
 						const auto* host =
 						    static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(address, PAGE));
 						const auto dev =
@@ -471,6 +506,7 @@ void BufferCache::LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size
 			for (const auto& f: fresh) {
 				live.pages.emplace(f.page, BdaLive::Page {f.entry, live.passes, f.cpu_mask});
 				live.Note(f.page, 1);
+				live.pass_new.push_back(f.page);
 				if (batch) {
 					live.queued.emplace_back(f.page, f.entry);
 				} else {
@@ -479,6 +515,11 @@ void BufferCache::LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size
 			}
 			live.totals.redirects += fresh.size();
 			m_bda_live_count.store(live.pages.size(), std::memory_order_relaxed);
+		}
+		if (WatchRange::Enabled()) {
+			for (const auto& f: fresh) {
+				WatchRange::Note("live pages: redirect", f.page << CACHING_PAGEBITS, PAGE);
+			}
 		}
 		WriteLiveEntries(writes, false);
 	}
@@ -534,6 +575,14 @@ void BufferCache::RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore wh
 			for (const auto page: pages) {
 				live.forced.Add(page << CACHING_PAGEBITS, PAGE);
 			}
+		}
+	}
+	if (WatchRange::Enabled()) {
+		static const char* const kWhy[] = {"upload", "written", "register", "unmap", "read", "cp", "off", "writers"};
+		const auto               index  = static_cast<size_t>(why);
+		const std::string        what   = std::string("live pages: restore ") + (index < std::size(kWhy) ? kWhy[index] : "?");
+		for (const auto page: pages) {
+			WatchRange::Note(what.c_str(), page << CACHING_PAGEBITS, PAGE);
 		}
 	}
 	if (why == LiveRestore::Register) {
@@ -765,6 +814,39 @@ void BufferCache::LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fau
 		if (!live.pages.empty()) {
 			live.read_tick = m_scheduler.CurrentTick();
 		}
+		if (!live.pass_new.empty()) {
+			const auto tick = m_scheduler.CurrentTick();
+			live.first_tick = live.first_tick != 0 ? live.first_tick : tick;
+			live.last_tick     = tick;
+			live.last_pass_new = live.pass_new.size();
+			std::sort(live.pass_new.begin(), live.pass_new.end());
+			live.last_new = live.pass_new;
+			if (live.log_left != 0) {
+				live.log_left--;
+				std::string ranges;
+				uint32_t    listed = 0;
+				for (size_t k = 0; k < live.pass_new.size();) {
+					size_t j = k + 1;
+					while (j < live.pass_new.size() && live.pass_new[j] == live.pass_new[j - 1] + 1) {
+						++j;
+					}
+					if (listed++ < 24u) {
+						char text[64];
+						std::snprintf(text, sizeof(text), " 0x%" PRIx64 "+0x%" PRIx64, live.pass_new[k] << CACHING_PAGEBITS,
+						              static_cast<uint64_t>(j - k) << CACHING_PAGEBITS);
+						ranges += text;
+					}
+					k = j;
+				}
+				std::printf("BdaLiveLog: pass %" PRIu64 " tick %" PRIu64 " kind %u: +%zu redirects in %u range(s)%s%s | held %zu, "
+				            "windows %" PRIu64 " (%" PRIu64 " MiB)\n",
+				            live.passes, tick, static_cast<uint32_t>(m_bda_pass_kind), live.pass_new.size(), listed,
+				            ranges.c_str(), listed > 24u ? " ..." : "", live.pages.size(), live.windows->Windows(),
+				            live.windows->PinnedBytes() >> 20u);
+				std::fflush(stdout);
+			}
+			live.pass_new.clear();
+		}
 		if (mode != 0 && !m_bda_pending.empty()) {
 			live.totals.blocked_passes++;
 		}
@@ -890,6 +972,57 @@ void BufferCache::LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fau
 	}
 }
 
+void BufferCache::LiveDeviceLossNote() {
+	auto* cache = g_live_cache;
+	if (cache == nullptr || cache->m_bda_live == nullptr) {
+		return;
+	}
+	auto&             live = *cache->m_bda_live;
+	std::unique_lock lock(live.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		std::printf("  BDA live pages: state locked by another thread at the loss (mode %" PRId64 ")\n",
+		            cache->BdaLivePagesMode());
+		return;
+	}
+	std::printf("  BDA live pages at the loss: mode %" PRId64 ", held %zu pages, settled %zu, passes %" PRIu64
+	            ", first redirecting pass at tick %" PRIu64 ", latest at tick %" PRIu64 " (+%" PRIu64
+	            "), last read tick %" PRIu64 ", windows %" PRIu64 " (%" PRIu64 " MiB), redirects %" PRIu64 " total\n",
+	            cache->BdaLivePagesMode(), live.pages.size(), live.settled.size(), live.passes, live.first_tick,
+	            live.last_tick, live.last_pass_new, live.read_tick, live.windows->Windows(),
+	            live.windows->PinnedBytes() >> 20u, live.totals.redirects);
+	{
+		std::string ranges;
+		uint32_t    runs = 0;
+		for (size_t k = 0; k < live.last_new.size();) {
+			size_t j = k + 1;
+			while (j < live.last_new.size() && live.last_new[j] == live.last_new[j - 1] + 1) {
+				++j;
+			}
+			if (runs++ < 64u) {
+				char text[64];
+				std::snprintf(text, sizeof(text), " 0x%" PRIx64 "+0x%" PRIx64, live.last_new[k] << CACHING_PAGEBITS,
+				              static_cast<uint64_t>(j - k) << CACHING_PAGEBITS);
+				ranges += text;
+			}
+			k = j;
+		}
+		std::printf("  latest redirecting pass (tick %" PRIu64 ") added %zu pages in %u run(s):%s%s\n", live.last_tick,
+		            live.last_new.size(), runs, ranges.c_str(), runs > 64u ? " ..." : "");
+	}
+	uint32_t listed = 0;
+	for (auto it = live.pages.begin(); it != live.pages.end() && listed < 96u;) {
+		auto next = std::next(it);
+		auto last = it;
+		while (next != live.pages.end() && next->first == last->first + 1) {
+			last = next++;
+		}
+		std::printf("    held 0x%" PRIx64 "+0x%" PRIx64 " -> device 0x%" PRIx64 "\n", it->first << CACHING_PAGEBITS,
+		            (last->first - it->first + 1) << CACHING_PAGEBITS, static_cast<uint64_t>(it->second.entry));
+		listed++;
+		it = next;
+	}
+}
+
 BufferCache::BdaLiveTotals BufferCache::GetBdaLiveTotals() const {
 	if (m_bda_live == nullptr) {
 		return {};
@@ -947,12 +1080,12 @@ void BufferCache::ReportBdaLive() {
 	std::printf("BdaLivePages batch (%s): per frame: entry copies %.2f (in rendering %.2f, %.1f entries), settled %.1f | "
 	            "qualification calls %.1f (fast %.1f), pages walked %.1f, dirty candidates %.1f, sync segments %.1f, "
 	            "%.3f ms in the walk incl. its synchronizations | pre-pass calls %.1f (with work %.1f) | V2 split gpu %" PRIu64 " image %" PRIu64 " hot %" PRIu64
-	            ", V5 %" PRIu64 " (checks %" PRIu64 ") (totals)\n",
+	            ", V5 %" PRIu64 " (checks %" PRIu64 "), V6 %" PRIu64 " (totals)\n",
 	            g_bda_live_batch.Get() != 0 ? "on" : "off", per(t.entry_copies, r.entry_copies),
 	            per(t.entry_copies_rendering, r.entry_copies_rendering), per(t.entry_pages, r.entry_pages),
 	            per(t.settled, r.settled), per(t.qual_calls, r.qual_calls), per(t.qual_fast, r.qual_fast),
 	            per(t.qual_pages, r.qual_pages), per(t.qual_dirty, r.qual_dirty), per(t.qual_segments, r.qual_segments),
-	            per(t.qual_ns, r.qual_ns) / 1e6, per(t.prepass_calls, r.prepass_calls), per(t.prepass_work, r.prepass_work), t.v2_gpu, t.v2_image, t.v2_hot, t.v5, t.v5_checks);
+	            per(t.qual_ns, r.qual_ns) / 1e6, per(t.prepass_calls, r.prepass_calls), per(t.prepass_work, r.prepass_work), t.v2_gpu, t.v2_image, t.v2_hot, t.v5, t.v5_checks, t.v6);
 	std::fflush(stdout);
 	live.report_time   = now;
 	live.reported      = t;

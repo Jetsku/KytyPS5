@@ -4133,6 +4133,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		copies.reserve(static_cast<size_t>(reserved_size / CACHING_PAGESIZE));
 		std::tie(reserved, reserved_offset) = m_staging_buffer.Map(reserved_size, 4);
 	}
+	const bool reservation_made = reserved != nullptr;
 	// Hot pages (MemoryTracker) stay CPU-dirty: they are reported separately and copied only when
 	// they differ from the shadow of the last copy this buffer received (CollectHotPages).
 	std::vector<GuestRange> hot_ranges;
@@ -4238,18 +4239,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	} else {
 		m_memory_tracker.ForEachUploadRange(vaddr, size, is_written, collect, upload);
 	}
-	// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): an upload (the cache copy is current again) or a
-	// written binding (GPU-dirty bytes must not be served from guest memory, I-W3) ends the redirect
-	// of every caching page it touches. KYTY_BDA_LIVE_BATCH (I-B1): a read upload only settles the
-	// pages; their entries go back in one batch at the next pre-pass.
-	if (m_bda_live_count.load(std::memory_order_relaxed) != 0 &&
-	    (is_written || !copies.empty() || !late_copies.empty())) {
-		if (is_written) {
-			RestoreLivePages(vaddr, size, LiveRestore::Written);
-		} else {
-			SettleLivePages(vaddr, size);
-		}
-	}
 	if (written_skip_verify) {
 		// Nothing a CPU access could have changed since the check: it waits for this thread.
 		Profiler::CountFrameEvent(Profiler::FrameEvent::WrittenSyncSkipVerifyChecks);
@@ -4299,6 +4288,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// finish before native copy recording.
 		m_staging_buffer.Commit();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
+	}
+	if (reservation_made && m_staging_buffer.ReservationPending()) {
+		m_staging_buffer.AbandonReservation(); // nothing staged in it is read by a copy
+	}
+	// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): an upload (the cache copy is current again) or a
+	// written binding (GPU-dirty bytes must not be served from guest memory, I-W3) ends the redirect
+	// of every caching page it touches. KYTY_BDA_LIVE_BATCH (I-B1): a read upload only settles the
+	// pages; their entries go back in one batch at the next pre-pass.
+	// I-S1 (rtskip DESIGN.md 7): only after the staging reservation above is committed. A restore writes
+	// its page-table entries through the same staging ring (StreamBuffer::Copy maps at the uncommitted
+	// offset), so before the commit it overwrote the guest bytes staged for this upload: the cache
+	// buffer received page-table entries instead (Astro Bot pirate level: a header whose loop bound
+	// became a device address hung a one-workgroup dispatch until the device was lost).
+	if (m_bda_live_count.load(std::memory_order_relaxed) != 0 &&
+	    (is_written || !copies.empty() || !late_copies.empty())) {
+		if (is_written) {
+			RestoreLivePages(vaddr, size, LiveRestore::Written);
+		} else {
+			SettleLivePages(vaddr, size);
+		}
 	}
 	if (source || late_source) {
 		if (InplaceStats::Enabled()) {

@@ -56,6 +56,8 @@ RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 void               AddressBindingReportCreateMessenger(vk::Instance instance);
 void               AddressBindingReportDump(uint64_t address);
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
+// A component's own lines for the device-loss report (printed after the device fault; up to 4 notes).
+void SetDeviceLossNote(void (*note)());
 // A thread about to exit on a device loss: lets a device-loss report another thread is writing
 // (the VK_EXT_device_fault vendor dump, _device_fault.nv-gpudmp) finish first. Waits up to
 // `start_ms` for one to begin and then up to 10 s for it to end.

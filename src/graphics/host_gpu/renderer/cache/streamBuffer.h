@@ -149,6 +149,10 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// A Map() whose Commit() has not run yet: any Map() / Copy() now reuses its bytes.
+	[[nodiscard]] bool ReservationPending() const noexcept { return m_reservation_pending; }
+	// The caller drops its Map() without committing it (nothing was staged that a copy reads).
+	void AbandonReservation() noexcept { m_reservation_pending = false; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -167,6 +171,7 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
+	bool                  m_reservation_pending = false;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;

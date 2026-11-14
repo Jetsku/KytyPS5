@@ -161,6 +161,8 @@ public:
 	void                   LivePagesBeforeCpWrite(uint64_t vaddr, uint64_t size);
 	// The same for the StreamCopyDefer write hooks, on the cache that built the state (if any).
 	static void            LiveCpWriteHook(uint64_t vaddr, uint64_t size);
+	// Device-loss report lines of the state (SetDeviceLossNote; tries the lock, never waits).
+	static void            LiveDeviceLossNote();
 	// Guest unmap of [vaddr, vaddr + size): every redirect in it goes back (GPU thread).
 	void                   DropLivePages(uint64_t vaddr, uint64_t size);
 	// Whether the caching page of `vaddr` is served live (tests).
@@ -204,6 +206,7 @@ public:
 		uint64_t v4_checks        = 0;
 		uint64_t v5               = 0; // verify: settled pages GPU-dirty / image-written at the pre-pass (I-B1)
 		uint64_t v5_checks        = 0;
+		uint64_t v6               = 0; // entry writes while a staging reservation was open (I-S1, must be 0)
 		// KYTY_BDA_LIVE_BATCH (DESIGN.md 4.4)
 		uint64_t settled          = 0; // read uploads over a redirected page (restore left to the pre-pass)
 		uint64_t entry_copies     = 0; // page-table copy commands written for redirects / restores

@@ -1948,6 +1948,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-live-pages-only)
 	set_tests_properties(bda_live_pages_incremental PROPERTIES
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	# Written uploads staged in a reservation of the staging ring (KYTY_RENDERER_BATCH=1): the restore
+	# of a redirected page must not write its page-table entries into that reservation (step 12).
+	add_test(NAME bda_live_pages_batch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-live-pages-only)
+	set_tests_properties(bda_live_pages_batch PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_RENDERER_BATCH=1")
 	# KYTY_BDA_DIRTY_LOG (with incremental BDA synchronization): verify mode and off.
 	add_test(NAME bda_sync_dirty_log_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)

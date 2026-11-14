@@ -433,6 +433,20 @@ void WaitForDeviceLossDiagnostics(uint32_t start_ms) {
 	}
 }
 
+namespace {
+std::array<std::atomic<void (*)()>, 4> g_device_loss_notes {};
+} // namespace
+
+void SetDeviceLossNote(void (*note)()) {
+	for (auto& slot: g_device_loss_notes) {
+		void (*expected)() = nullptr;
+		if (slot.load(std::memory_order_acquire) == note ||
+		    slot.compare_exchange_strong(expected, note, std::memory_order_acq_rel)) {
+			return;
+		}
+	}
+}
+
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool queue_locked) {
 	HangWatchdog::Scope diagnostics(
 	    "device-loss-diagnostics",
@@ -449,6 +463,12 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool que
 	            tick, DeviceFaultDiagnosticsEnabled());
 	LOGF("--- Device loss: submission/wait tick=%" PRIu64 " ---\n", tick);
 	DumpDeviceFault(graphics);
+	for (auto& slot: g_device_loss_notes) {
+		if (auto* note = slot.load(std::memory_order_acquire); note != nullptr) {
+			note();
+			std::fflush(stdout);
+		}
+	}
 	if (const auto violations = CommandRecorder::GuardViolations(); violations != 0) {
 		std::printf("  Kyty command guard (KYTY_CMD_GUARD): %" PRIu64 " violation(s) before the loss\n", violations);
 	}

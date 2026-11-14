@@ -1055,6 +1055,119 @@ static void DispatchPeek(RenderContext& context, CommandBuffer& command,
 	});
 }
 
+// KYTY_BDA_LIVE_PROBE_CS=<cs hash> (hexadecimal, diagnostic, default off; rtskip DESIGN.md 7): for every
+// dispatch of this program, right before the dispatch command, the first 64 bytes of each bound buffer as
+// the GPU holds them (the registered cache buffer, no synchronization) are copied to a host-visible ring.
+// The guest's bytes and the pages' states (redirected / settled by KYTY_BDA_LIVE_PAGES, CPU-dirty,
+// GPU-dirty) are taken when the dispatch is recorded. A device loss prints the newest records with the
+// GPU bytes (copies ordered before the hung dispatch completed); the first records print at once.
+namespace LiveProbe {
+constexpr uint32_t Slots    = 64;
+constexpr uint32_t Bindings = 8;
+constexpr uint32_t Bytes    = 64;
+struct Binding {
+	uint64_t base = 0, size = 0;
+	bool     written = false, copied = false;
+	uint32_t pages = 0, live = 0, settled = 0, cpu = 0, gpu = 0;
+	bool     sub_cpu = false, sub_gpu = false; // the 4 KiB tracker page of `base`
+	uint32_t guest[Bytes / 4] {};
+};
+struct Record {
+	uint64_t ordinal = 0, tick = 0, frame = 0;
+	uint32_t count   = 0;
+	Binding  b[Bindings];
+};
+std::mutex              g_mutex;
+std::unique_ptr<Buffer> g_download;
+Record                  g_records[Slots];
+uint64_t                g_next = 0;
+uint64_t Hash() {
+	static const uint64_t hash = [] {
+		const auto* value = std::getenv("KYTY_BDA_LIVE_PROBE_CS");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t {0};
+	}();
+	return hash;
+}
+std::string Words(const uint32_t* words) {
+	std::string text;
+	for (uint32_t k = 0; k < Bytes / 4; ++k) text += fmt::format(" {:08x}", words[k]);
+	return text;
+}
+void Print(const Record& r, bool gpu) {
+	std::printf("BdaLiveProbe #%" PRIu64 " frame %" PRIu64 " tick %" PRIu64 ":\n", r.ordinal, r.frame, r.tick);
+	const auto slot = r.ordinal % Slots;
+	for (uint32_t i = 0; i < r.count; ++i) {
+		const auto& b = r.b[i];
+		std::printf("  b%u%s 0x%" PRIx64 "+0x%" PRIx64 ": caching pages %u, redirected %u (settled %u), tracker CPU-dirty %u, "
+		            "GPU-dirty %u; 4 KiB page of the base: cpu %d gpu %d\n    guest:%s\n",
+		            i, b.written ? "w" : "", b.base, b.size, b.pages, b.live, b.settled, b.cpu, b.gpu, b.sub_cpu ? 1 : 0,
+		            b.sub_gpu ? 1 : 0, Words(b.guest).c_str());
+		if (gpu && b.copied && g_download != nullptr) {
+			uint32_t words[Bytes / 4] {};
+			std::memcpy(words, g_download->Mapped().data() + (slot * Bindings + i) * Bytes, Bytes);
+			std::printf("    gpu:  %s\n", Words(words).c_str());
+		}
+	}
+}
+void Note() {
+	std::unique_lock lock(g_mutex, std::try_to_lock);
+	if (!lock.owns_lock() || g_next == 0) return;
+	if (g_download != nullptr) g_download->Invalidate(0, uint64_t {Slots} * Bindings * Bytes);
+	std::printf("  BDA live probe at the loss: %" PRIu64 " dispatches recorded; the newest (GPU bytes: copies made "
+	            "right before each dispatch):\n", g_next);
+	for (uint64_t k = g_next > 4 ? g_next - 4 : 0; k < g_next; ++k) Print(g_records[k % Slots], true);
+}
+void Dispatch(RenderContext& context, CommandBuffer& command, const ShaderComputeInputInfo& input_info) {
+	auto&            cache   = context.GetBufferCache();
+	const auto&      program = *input_info.stage.program;
+	std::scoped_lock lock(g_mutex);
+	if (g_download == nullptr) {
+		g_download = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(), MemoryUsage::Download,
+		                                      0, AllFlags, uint64_t {Slots} * Bindings * Bytes);
+		SetDeviceLossNote(&Note);
+	}
+	const auto slot = g_next % Slots;
+	auto&      r    = g_records[slot];
+	r               = {};
+	r.ordinal       = g_next++;
+	r.tick          = context.GetCommandScheduler().CurrentTick();
+	r.frame         = context.GetGpu().GetFrameNum();
+	for (uint32_t i = 0; i < program.info.buffers.size() && r.count < Bindings; ++i) {
+		const auto d    = DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]);
+		auto&      b    = r.b[r.count++];
+		b.base          = d.Base48();
+		b.size          = d.GetSize();
+		b.written       = program.info.buffers[i].written;
+		if (b.base < 0x100000000ull || b.size == 0) continue;
+		const auto peek = std::min<uint64_t>(Bytes, b.size) & ~uint64_t {3};
+		(void)LibKernel::Memory::TryReadBacking(b.base, b.guest, peek);
+		b.sub_cpu        = cache.DebugCpuDirty(b.base & ~uint64_t {4095}, 4096);
+		b.sub_gpu        = cache.IsRegionGpuModified(b.base & ~uint64_t {4095}, 4096);
+		const auto first = b.base >> BufferCache::CACHING_PAGEBITS;
+		const auto last  = (b.base + b.size - 1) >> BufferCache::CACHING_PAGEBITS;
+		for (auto page = first; page <= last && b.pages < 4096; ++page) {
+			const auto address = page << BufferCache::CACHING_PAGEBITS;
+			b.pages++;
+			b.live += cache.IsBdaLivePage(address) ? 1u : 0u;
+			b.settled += cache.IsBdaLivePageSettled(address) ? 1u : 0u;
+			b.cpu += cache.DebugCpuDirty(address, BufferCache::CACHING_PAGESIZE) ? 1u : 0u;
+			b.gpu += cache.IsRegionGpuModified(address, BufferCache::CACHING_PAGESIZE) ? 1u : 0u;
+		}
+		const auto [source, offset] = cache.DebugPeekBuffer(b.base, peek);
+		if (source == nullptr) continue;
+		g_download->CopyFrom(command, *source, offset, (slot * Bindings + (r.count - 1)) * Bytes, peek,
+		                     vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                     vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                     vk::AccessFlagBits::eHostRead);
+		b.copied = true;
+	}
+	if (r.ordinal < 24) {
+		Print(r, false);
+		std::fflush(stdout);
+	}
+}
+} // namespace LiveProbe
+
 static void PrintDispatchOverlap(bool enabled) {
 	const auto now = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                          std::chrono::steady_clock::now().time_since_epoch())
@@ -2228,6 +2341,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	} else {
 		if (CsVerifyHash() != 0 && program.shader_hash == CsVerifyHash()) [[unlikely]] {
 			CsVerifyDispatch(m_context, buffer, input_info, thread_group_x * thread_group_y * thread_group_z);
+		}
+		if (LiveProbe::Hash() != 0 && program.shader_hash == LiveProbe::Hash()) [[unlikely]] {
+			LiveProbe::Dispatch(m_context, buffer, input_info);
 		}
 		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
