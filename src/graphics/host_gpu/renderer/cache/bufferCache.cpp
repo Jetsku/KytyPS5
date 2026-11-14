@@ -1373,6 +1373,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		buffer.is_deleted = true;
 	}
 	NoteBdaReachRegister(pages.first, pages.last_exclusive, insert); // KYTY_BDA_REACH=verify
+	if (m_bda_live_count.load(std::memory_order_relaxed) != 0) {
+		// KYTY_BDA_LIVE_PAGES: the entries were just rewritten; the redirects of these pages end.
+		RestoreLivePages(pages.first << CACHING_PAGEBITS, size_pages << CACHING_PAGEBITS, LiveRestore::Register);
+	}
 }
 
 // KYTY_BUFFER_LRU_SKIP=1 (default off): draws touch the same buffers many times per GC tick. The
@@ -1725,6 +1729,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		                                                 BDA_PAGETABLE_ALLOCATION);
 	}
 	CreateBdaTags(); // KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp)
+	CreateBdaLive(); // KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp)
 	// Buffers have their own switches: shaders reach guest memory through BDA pointers without a
 	// binding, which never touches a buffer's LRU entry, so "unused for N frames" can be wrong for a
 	// buffer only BDA code reads (its draws then fault until the buffer is recreated). The image
@@ -1811,6 +1816,9 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 		return;
 	}
 	InplaceStats::NoteFault(vaddr);
+	if (m_bda_live != nullptr) {
+		m_bda_live_faults.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (m_inplace != nullptr) {
 		m_inplace->NoteFault(vaddr);
 	}
@@ -1860,6 +1868,9 @@ void BufferCache::AdvanceFrame() noexcept {
 		m_inplace->AdvanceFrame();
 	}
 	FaultCost::AdvanceFrame();
+	if (m_bda_live != nullptr) {
+		ReportBdaLive(); // KYTY_BDA_LIVE_PAGES: one line every 10 s
+	}
 	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 	MemoryTracker::SetSequentialAhead(g_fault_ahead_sequential.Get() != 0);
@@ -4122,6 +4133,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		copies.reserve(static_cast<size_t>(reserved_size / CACHING_PAGESIZE));
 		std::tie(reserved, reserved_offset) = m_staging_buffer.Map(reserved_size, 4);
 	}
+	const bool reservation_made = reserved != nullptr;
 	// Hot pages (MemoryTracker) stay CPU-dirty: they are reported separately and copied only when
 	// they differ from the shadow of the last copy this buffer received (CollectHotPages).
 	std::vector<GuestRange> hot_ranges;
@@ -4276,6 +4288,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// finish before native copy recording.
 		m_staging_buffer.Commit();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
+	}
+	if (reservation_made && m_staging_buffer.ReservationPending()) {
+		m_staging_buffer.AbandonReservation(); // nothing staged in it is read by a copy
+	}
+	// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): an upload (the cache copy is current again) or a
+	// written binding (GPU-dirty bytes must not be served from guest memory, I-W3) ends the redirect
+	// of every caching page it touches. KYTY_BDA_LIVE_BATCH (I-B1): a read upload only settles the
+	// pages; their entries go back in one batch at the next pre-pass.
+	// I-S1 (rtskip DESIGN.md 7): only after the staging reservation above is committed. A restore writes
+	// its page-table entries through the same staging ring (StreamBuffer::Copy maps at the uncommitted
+	// offset), so before the commit it overwrote the guest bytes staged for this upload: the cache
+	// buffer received page-table entries instead (Astro Bot pirate level: a header whose loop bound
+	// became a device address hung a one-workgroup dispatch until the device was lost).
+	if (m_bda_live_count.load(std::memory_order_relaxed) != 0 &&
+	    (is_written || !copies.empty() || !late_copies.empty())) {
+		if (is_written) {
+			RestoreLivePages(vaddr, size, LiveRestore::Written);
+		} else {
+			SettleLivePages(vaddr, size);
+		}
 	}
 	if (source || late_source) {
 		if (InplaceStats::Enabled()) {
@@ -4736,6 +4768,7 @@ void BufferCache::InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size) {
 	if (m_inplace != nullptr) {
 		m_inplace->BeforeCpWrite(vaddr, size);
 	}
+	LivePagesBeforeCpWrite(vaddr, size); // KYTY_BDA_LIVE_PAGES (I-C1): DMA_DATA
 }
 
 void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find) const noexcept {
@@ -5324,6 +5357,7 @@ void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
 	if (auto* inplace = g_inplace_heap; inplace != nullptr && size != 0) {
 		inplace->BeforeCpWrite(address, size);
 	}
+	BufferCache::LiveCpWriteHook(address, size); // KYTY_BDA_LIVE_PAGES (I-C1)
 	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {
 		(void)dma->DrainHostCopies(address, size, false);
@@ -5351,6 +5385,7 @@ void StreamCopyDefer::NoteGuestWrite(uint64_t address, uint64_t size) {
 	if (auto* inplace = g_inplace_heap; inplace != nullptr && size != 0) {
 		inplace->BeforeCpWrite(address, size);
 	}
+	BufferCache::LiveCpWriteHook(address, size); // KYTY_BDA_LIVE_PAGES (I-C1)
 	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {
 		(void)dma->DrainHostCopies(address, size, true);
@@ -6893,7 +6928,14 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto uploaded_before = m_bda_pass_upload_bytes;
 	m_bda_count_uploads        = same_submission;
 	const auto pass_start      = BufferLookupStats::Now();
+	// KYTY_BDA_LIVE_PAGES: no new redirect while BDA-write settles are pending (I-W2).
+	const auto live_mode = BdaLivePagesMode(); // 1 / 2 (verify) redirect; 3 (check) only verifies
+	m_bda_live_pass      = (live_mode == 1 || live_mode == 2) && m_bda_pending.empty();
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	m_bda_live_pass = false;
+	if (m_bda_live != nullptr) {
+		LivePagesAfterPass(mapped_ranges, fault_epoch);
+	}
 	if (pass_start != 0) {
 		BufferLookupStats::AddPart(static_cast<BufferLookupStats::Part>(m_bda_pass_kind),
 		                           BufferLookupStats::Now() - pass_start);
@@ -7258,6 +7300,11 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSy
 				++stats->scanned_buffers;
 				stats->buffer_id = it->second;
 			}
+			if (m_bda_live_pass) {
+				// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): the full pass redirects qualifying pages.
+				LiveSyncBufferRange(it->second, start, finish - start, stats);
+				continue;
+			}
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false, stats);
 		}
 	}
@@ -7380,6 +7427,7 @@ void BufferCache::NoteBdaFault(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::PrepareBdaWrites() {
 	EXIT_IF(!BdaWritesEnabled());
+	LivePagesBeforeBdaWrites(); // KYTY_BDA_LIVE_PAGES (I-W1)
 	if (BdaHeapsEnabled()) {
 		std::vector<std::pair<uint64_t, uint64_t>> heaps;
 		{

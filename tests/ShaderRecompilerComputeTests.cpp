@@ -1951,6 +1951,10 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
+  // KYTY_BDA_LIVE_PAGES check: the shader reads through this page table (a BufferCache's, filled by
+  // it) instead of the harness's own; bda_mappings are then not written.
+  vk::Buffer external_bda_pagetable = nullptr;
+  uint64_t external_bda_pagetable_size = 0;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -9450,6 +9454,308 @@ public:
             "BDA-tags direct-memory allocation release failed");
     set_tags("KYTY_BDA_ACCESS_TAGS=\n");
     ShaderRecompiler::SetCodegenOptions(saved_options);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): the page-table state machine. A full pass redirects
+  // CPU-dirty pages to the imported guest backing (no upload, page stays CPU-dirty); a shader reads
+  // the guest bytes written after the pass through the cache's own page table; an upload, a written
+  // binding, a CP write, a BDA-writing program and the switch 0 each end redirects as designed; the
+  // verify counters stay 0.
+  void CheckBdaLivePages(
+      const std::function<void(uint64_t guest, u32 expected, vk::Buffer table, uint64_t size)> &shader_read) {
+    constexpr const char *name = "BdaLivePages";
+    constexpr uintptr_t base = 0x0000000207600000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t buffer_offset = 0x20000;
+    constexpr uint64_t buffer_size = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+
+    if (!m_external_memory_host) {
+      std::printf("[host]    %-32s skipped (no VK_EXT_external_memory_host)\n", name);
+      return;
+    }
+    // The state is built when the variable is set at start (the cache's constructor).
+#if defined(_WIN32)
+    _putenv_s("KYTY_BDA_LIVE_PAGES", "verify");
+#else
+    setenv("KYTY_BDA_LIVE_PAGES", "verify", 1);
+#endif
+    EnsureRuntimeContext();
+    const auto set_live = [](const char *text) {
+      Live::Testing::StageText(text);
+      Live::OnCpFlip();
+    };
+    // The bound rule (KYTY_BDA_LIVE_BOUND_PASSES, default 0) is on for steps 3-10.
+    set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BOUND_PASSES=64\n");
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "live-pages direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "live-pages fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 31 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      Require(name, "built", cache.BdaLivePagesBuilt() && cache.BdaLivePagesMode() == 2,
+              "the live-pages state was not built (no backing alias or no import), or the policy is not verify");
+      context.MapMemory(base, allocation_size);
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      const auto dirty = [&](uint64_t offset) {
+        return OnGpuThread(context, [&] { return cache.IsRegionCpuModified(base + offset, sizeof(uint32_t)); });
+      };
+      const auto live = [&](uint64_t offset) { return cache.IsBdaLivePage(base + offset); };
+      const auto pass = [&] {
+        OnGpuThread(context, [&] {
+          SyncEpoch::Advance();
+          context.PrepareBda();
+        });
+      };
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + buffer_offset, buffer_size, false, false); });
+      const uint64_t a = buffer_offset, b = buffer_offset + page, c = buffer_offset + 2 * page,
+                     d = buffer_offset + 3 * page;
+
+      // 1: the new buffer is uploaded by a pass with the switch 0; then guest writes fault on its
+      // pages, and a pass with the switch on redirects them and leaves them CPU-dirty (no upload, no
+      // protection).
+      set_live("KYTY_BDA_LIVE_PAGES=0\n");
+      pass();
+      Require(name, "plain pass", !live(a) && !dirty(a) && !dirty(d), "the pass with the switch 0 did not upload");
+      set_live("KYTY_BDA_LIVE_PAGES=verify\n");
+      for (const auto offset : {a, b, c, d}) {
+        cpu_write(offset + 0x40, 0x7a6a5a4au);
+      }
+      pass();
+      Require(name, "redirect", live(a) && live(b) && live(c) && live(d),
+              "the full pass did not redirect the CPU-dirty pages of a new buffer");
+      Require(name, "stays dirty", dirty(a) && dirty(d), "a redirected page was uploaded or cleaned");
+      const auto first = cache.GetBdaLiveTotals();
+      Require(name, "counts", first.redirects >= 4 && first.held == 4 && first.windows >= 1,
+              "redirect / held / window counters are wrong");
+
+      // 2: a shader reads, through the cache's page table, bytes the guest wrote after the pass.
+      constexpr u32 fresh = 0x5eed1234u;
+      std::memcpy(memory + a + 4, &fresh, sizeof(fresh)); // writable: no fault, no tracker change
+      OnGpuThread(context, [&] { scheduler.Finish(); });
+      auto *table = cache.GetBdaPageTableBuffer();
+      shader_read(base + a, fresh, table->Handle(), table->Size());
+
+      // 3: an upload (read binding over the page; a small one is copied into the stream ring and
+      // leaves the page CPU-dirty and redirected) ends its redirect. KYTY_BDA_LIVE_BATCH=1 (default):
+      // the upload only settles the pages (their redirect entries stay; the guest bytes equal the
+      // uploaded copy), and the next pre-pass restores them in one batch.
+      // A read of more than one caching page is uploaded into the cache buffer (pages b and c).
+      const auto copies_before = cache.GetBdaLiveTotals().entry_copies;
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + b, page + 0x40, false, false); });
+      Require(name, "upload settles", live(b) && live(c) && !dirty(b) && cache.IsBdaLivePageSettled(base + b) &&
+                                          cache.IsBdaLivePageSettled(base + c),
+              "a read upload over a redirected page did not settle it (batched restore)");
+      Require(name, "no mid-stream copy", cache.GetBdaLiveTotals().entry_copies == copies_before,
+              "a read upload wrote page-table entries at once with batching on");
+      // A settled page still reads, through its redirect, the guest bytes (= the uploaded copy).
+      {
+        u32 value_b = 0; // LivePageRead loads the dword at guest + 4
+        std::memcpy(&value_b, memory + b + 4, sizeof(value_b));
+        OnGpuThread(context, [&] { scheduler.Finish(); });
+        shader_read(base + b, value_b, table->Handle(), table->Size());
+      }
+      const auto restores_before = cache.GetBdaLiveTotals().restore_upload;
+      pass();
+      Require(name, "after upload", !live(b) && !dirty(b) && !live(c) && !cache.IsBdaLivePageSettled(base + b),
+              "the pre-pass did not restore the settled pages, or redirected an uploaded page again");
+      Require(name, "batched restore", cache.GetBdaLiveTotals().restore_upload == restores_before + 2,
+              "the pre-pass restored a different number of settled pages");
+      // A page a cache binding uploaded is not redirected again for 64 full passes (performance
+      // rule, KYTY_BDA_LIVE_BOUND_PASSES): the pass uploads it meanwhile.
+      cpu_write(c + 0x40, 0x5a5a5a5au);
+      pass();
+      Require(name, "bound", !live(c) && !dirty(c) && cache.GetBdaLiveTotals().rejects_bound >= 1,
+              "a page a binding uploaded was redirected again at once, or not uploaded");
+      for (int k = 0; k < 64; k++) {
+        pass();
+      }
+      cpu_write(c + 0x80, 0x5b5b5b5bu);
+      pass();
+      Require(name, "redirect c", live(c), "the pass did not redirect page c again after the bound passes");
+
+      // 4: a written binding over page c ends its redirect; the pass never redirects a GPU-dirty page.
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + c, 0x100, true, false); });
+      Require(name, "written restore", !live(c), "a written binding over a redirected page kept the redirect");
+      pass();
+      Require(name, "gpu-dirty", !live(c), "a GPU-dirty page was redirected");
+      Require(name, "forced upload", !dirty(c + 0x2000),
+              "the forced set did not upload the CPU-dirty rest of a restored page");
+
+      // 5: switch 0: every redirect back, its bytes uploaded.
+      set_live("KYTY_BDA_LIVE_PAGES=0\n");
+      pass();
+      Require(name, "off", !live(a) && !live(d) && !dirty(a) && !dirty(d),
+              "switch 0 did not restore and upload the redirected pages");
+      const auto off = cache.GetBdaLiveTotals();
+      Require(name, "off count", off.held == 0 && off.restore_off >= 2, "restore counters after switch 0 are wrong");
+
+      // 6: on again: a guest write fault dirties page a, the pass redirects it.
+      set_live("KYTY_BDA_LIVE_PAGES=verify\n");
+      cpu_write(a + 0x80, 0x01020304u);
+      pass();
+      Require(name, "redirect again", live(a) && dirty(a), "the pass did not redirect a page dirtied by a write fault");
+      Require(name, "faults counted", cache.GetBdaLiveTotals().faults >= 1, "the write fault was not counted");
+
+      // 7: a CP write over it: counted, the page is restored at the next pass and never redirected again.
+      OnGpuThread(context, [&] { cache.LivePagesBeforeCpWrite(base + a + 0x100, 4); });
+      Require(name, "cp hit", cache.GetBdaLiveTotals().cp_hits >= 1, "the CP write over a redirected page was not seen");
+      pass();
+      Require(name, "cp restore", !live(a) && !dirty(a), "the CP-written page was not restored and uploaded");
+      cpu_write(a + 0x200, 0x0a0b0c0du);
+      pass();
+      Require(name, "cp blacklist", !live(a), "a CP-written page was redirected again");
+
+      // 8: a BDA-writing program: every redirect is restored and uploaded before it.
+      cpu_write(d + 0x80, 0x11223344u);
+      pass();
+      Require(name, "redirect d", live(d), "the pass did not redirect page d");
+      OnGpuThread(context, [&] { cache.PrepareBdaWrites(); });
+      Require(name, "bda writes", !live(d) && !dirty(d), "a BDA-writing program found a redirect alive");
+
+      const auto totals = cache.GetBdaLiveTotals();
+      std::printf("BdaLivePages: redirects %llu, restores upload %llu written %llu off %llu cp %llu writers %llu, "
+                  "forced %llu, cp hits %llu waits %llu, V1 %llu (checks %llu, skipped %llu) V2 %llu V3 %llu\n",
+                  static_cast<unsigned long long>(totals.redirects), static_cast<unsigned long long>(totals.restore_upload),
+                  static_cast<unsigned long long>(totals.restore_written), static_cast<unsigned long long>(totals.restore_off),
+                  static_cast<unsigned long long>(totals.restore_cp), static_cast<unsigned long long>(totals.restore_writes),
+                  static_cast<unsigned long long>(totals.forced_syncs), static_cast<unsigned long long>(totals.cp_hits),
+                  static_cast<unsigned long long>(totals.cp_waits), static_cast<unsigned long long>(totals.v1),
+                  static_cast<unsigned long long>(totals.v1_checks), static_cast<unsigned long long>(totals.v1_skipped),
+                  static_cast<unsigned long long>(totals.v2), static_cast<unsigned long long>(totals.v3));
+      Require(name, "verify",
+              totals.v1 == 0 && totals.v2 == 0 && totals.v3 == 0 && totals.v4 == 0 && totals.v5 == 0 &&
+                  totals.v1_checks >= 1 && totals.v4_checks >= 1 && totals.v5_checks >= 1,
+              "a verify counter is not 0, or V1 / V4 / V5 never ran");
+
+      // 9: KYTY_BDA_LIVE_BATCH=0: a read upload restores at once (one entry copy per run).
+      set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BATCH=0\n");
+      cpu_write(d + 0x100, 0x21222324u);
+      pass();
+      Require(name, "redirect d again", live(d), "the pass did not redirect page d again");
+      {
+        const auto before = cache.GetBdaLiveTotals();
+        (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + c, page + 0x40, false, false); });
+        const auto after = cache.GetBdaLiveTotals();
+        Require(name, "unbatched restore",
+                !live(d) && !cache.IsBdaLivePageSettled(base + d) && after.restore_upload == before.restore_upload + 1 &&
+                    after.entry_copies == before.entry_copies + 1,
+                "with KYTY_BDA_LIVE_BATCH=0 a read upload did not restore its redirect at once");
+      }
+
+      // 10: V5 catches a settled page that turned GPU-dirty without a written binding (injected).
+      set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BATCH=1\n");
+      for (int k = 0; k < 64; k++) {
+        pass(); // past the bound passes of page d
+      }
+      cpu_write(d + 0x180, 0x31323334u);
+      pass();
+      Require(name, "redirect d for V5", live(d), "the pass did not redirect page d for the V5 check");
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + c, page + 0x40, false, false); });
+      Require(name, "settled d", cache.IsBdaLivePageSettled(base + d), "the read upload did not settle page d");
+      // The injected bit is taken back after the check: nothing else in the cache knows of it (a
+      // synchronization of a GPU-dirty page without its written-binding records is not a real state).
+      uint64_t injected = 0;
+      OnGpuThread(context, [&] {
+        cache.TestingMarkGpuDirty(base + d, page);
+        injected = cache.CheckSettledLivePages();
+        cache.TestingMarkGpuDirty(base + d, page, false);
+      });
+      Require(name, "V5", injected == 1 && cache.GetBdaLiveTotals().v5 == 1,
+              "V5 did not count the settled page made GPU-dirty");
+      pass();
+      Require(name, "settled restored", !live(d) && !cache.IsBdaLivePageSettled(base + d),
+              "the pre-pass did not restore the settled page d");
+
+      // 11: KYTY_BDA_LIVE_BOUND_PASSES=0 (default): a page a binding uploaded is redirected again by
+      // the next pass that finds it CPU-dirty.
+      set_live("KYTY_BDA_LIVE_PAGES=verify\nKYTY_BDA_LIVE_BOUND_PASSES=0\n");
+      for (int k = 0; k < 64; k++) {
+        pass(); // past any bound passes set earlier for page b
+      }
+      cpu_write(b + 0x200, 0x41424344u);
+      pass();
+      Require(name, "redirect b", live(b), "the pass did not redirect page b");
+      (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + b, page + 0x40, false, false); });
+      pass(); // restores the settled page b
+      Require(name, "b restored", !live(b) && !dirty(b), "the pre-pass did not restore and upload page b");
+      cpu_write(b + 0x240, 0x45464748u);
+      const auto rejects = cache.GetBdaLiveTotals().rejects_bound;
+      pass();
+      Require(name, "no bound rule", live(b) && cache.GetBdaLiveTotals().rejects_bound == rejects,
+              "with KYTY_BDA_LIVE_BOUND_PASSES=0 an uploaded page was not redirected again");
+
+      // 12 (I-S1): a written binding over a redirected CPU-dirty page uploads the guest bytes, also when
+      // the upload is staged in a reservation of the staging ring (KYTY_RENDERER_BATCH=1, the test
+      // bda_live_pages_batch): the restore's page-table entries must not land in that reservation. The
+      // guest writes the page without a fault (it is writable), the binding takes GPU ownership, and a
+      // guest read of the page then publishes the GPU's bytes: they must be the guest's (Astro Bot's
+      // pirate level lost the device when they were page-table entries).
+      {
+        constexpr u32 head = 0x61626364u, tail = 0x65666768u;
+        std::memcpy(memory + b, &head, sizeof(head));             // first bytes of the staged page
+        std::memcpy(memory + b + 0x2c0, &tail, sizeof(tail));     // inside the written range
+        const auto v6_before = cache.GetBdaLiveTotals().v6;
+        (void)OnGpuThread(context, [&] { return cache.ObtainBuffer(base + b, 0x300, true, false); });
+        Require(name, "written restore b", !live(b), "a written binding over redirected page b kept the redirect");
+        OnGpuThread(context, [&] { scheduler.Finish(); });
+        Require(name, "written readback", context.HandleFault(PageFaultAccess::Read, base + b),
+                "a guest read of the GPU-owned page did not publish its GPU bytes");
+        u32 head_after = 0, tail_after = 0;
+        std::memcpy(&head_after, memory + b, sizeof(head_after));
+        std::memcpy(&tail_after, memory + b + 0x2c0, sizeof(tail_after));
+        std::printf("BdaLivePages step 12: renderer batch %d, GPU bytes after the written binding 0x%08x 0x%08x "
+                    "(guest wrote 0x%08x 0x%08x), V6 %llu\n",
+                    Common::RendererBatchEnabled() ? 1 : 0, head_after, tail_after, head, tail,
+                    static_cast<unsigned long long>(cache.GetBdaLiveTotals().v6));
+        Require(name, "written upload bytes", head_after == head && tail_after == tail,
+                "the written binding's upload did not carry the guest bytes of a redirected page");
+        Require(name, "V6", cache.GetBdaLiveTotals().v6 == v6_before,
+                "page-table entries were written while a staging reservation was open");
+      }
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+      Require(name, "unmap", cache.GetBdaLiveTotals().held == 0, "unmap left redirects");
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "live-pages direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "live-pages direct-memory allocation release failed");
+    set_live("KYTY_BDA_LIVE_PAGES=\nKYTY_BDA_LIVE_BOUND_PASSES=\nKYTY_BDA_LIVE_BATCH=\n");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -29509,6 +29815,9 @@ public:
       EnsureBdaBuffers(test.name);
       bda_pagetable_info = {m_bda_pagetable_buffer.buffer, 0,
                             m_bda_pagetable_buffer.size};
+      if (test.external_bda_pagetable != nullptr) {
+        bda_pagetable_info = {test.external_bda_pagetable, 0, test.external_bda_pagetable_size};
+      }
       fault_buffer_info = {m_fault_buffer.buffer, 0, m_fault_buffer.size};
       const std::array special_buffers{
           std::pair{Kind::BdaPagetable, &bda_pagetable_info},
@@ -29743,7 +30052,22 @@ public:
     }
 
     vk::CommandBuffer cmd = BeginCommands(test.name, "dispatch");
-    if (uses_bda) {
+    if (uses_bda && test.external_bda_pagetable != nullptr) {
+      // The page table is the caller's (already filled and complete): only the fault buffer clears.
+      cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = m_fault_buffer.buffer;
+      barrier.offset = 0;
+      barrier.size = m_fault_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1, &barrier, 0,
+                          nullptr);
+    } else if (uses_bda) {
       Require(test.name, "dispatch", buffer.device_address != 0,
               "BDA test backing has no device address");
       Require(test.name, "dispatch", !test.bda_mappings.empty(),
@@ -33738,6 +34062,8 @@ private:
     m_runtime_context.pipeline_library_enabled = m_pipeline_library;
     m_runtime_context.pipeline_creation_cache_control_enabled = m_pipeline_library;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
+    // KYTY_BDA_LIVE_PAGES / KYTY_INPLACE: imports of guest memory, as on the emulator's device.
+    m_runtime_context.external_memory_host_enabled = m_external_memory_host;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -34239,6 +34565,15 @@ private:
         device_extensions.push_back(calibration);
         GpuTiming::NoteCalibrationExtensionEnabled(calibration);
       }
+      // KYTY_BDA_LIVE_PAGES / KYTY_INPLACE import guest memory (VK_EXT_external_memory_host).
+      if (std::any_of(available_extensions.begin(), available_extensions.end(),
+                      [](const vk::ExtensionProperties &extension) {
+                        return std::strcmp(extension.extensionName.data(),
+                                           VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
+                      })) {
+        device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        m_external_memory_host = true;
+      }
     }
     device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -34618,6 +34953,7 @@ private:
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
   bool m_pipeline_library = false;
+  bool m_external_memory_host = false;
   bool m_storage_image_read_without_format = false;
   bool m_sampler_filter_minmax = false;
   // Enabled on the device when supported; the runtime context reports them only inside
@@ -48371,6 +48707,32 @@ TestCase GlobalLoadRecordsUnaccessedPage() {
   auto test = GlobalSignedImmediateRebasesBeforeSaddr();
   test.name = "GlobalLoadRecordsUnaccessedPage";
   test.bda_mappings.front().accessed = false;
+  return test;
+}
+
+// KYTY_BDA_LIVE_PAGES: the load of GlobalSignedImmediateRebasesBeforeSaddr (the dword at guest + 4)
+// through a BufferCache's page table, whose entry for that page is a redirect into the imported
+// guest backing: the shader must see the guest's bytes written after the entry was recorded.
+TestCase LivePageRead(uint64_t guest, u32 expected, vk::Buffer table, uint64_t table_size) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 0, static_cast<u32>(guest));
+  AppendSMovLiteral(&code, 1, static_cast<u32>(guest >> 32u));
+  AppendVMovU32(&code, 20, 8);
+  code.push_back(EncodeFlat0(0x0c, 2, 0xffcu));
+  code.push_back(EncodeFlat1(0, 0, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LivePageRead";
+  test.code = std::move(code);
+  test.initial = {0xfeedfaceu};
+  test.expected = {expected};
+  test.external_bda_pagetable = table;
+  test.external_bda_pagetable_size = table_size;
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -63427,6 +63789,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-access-tags-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaAccessTags();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-live-pages-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaLivePages([&](uint64_t guest, u32 expected, vk::Buffer table, uint64_t size) {
+      RunCase(&vulkan, LivePageRead(guest, expected, table, size));
+    });
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-per-submission-only") == 0) {

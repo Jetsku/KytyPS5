@@ -1026,6 +1026,12 @@ add_executable(inplace_candidates_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/inplaceCandidates.cpp"
 )
 target_include_directories(inplace_candidates_tests PRIVATE ${inc_headers})
+# KYTY_BDA_LIVE_PAGES: bookkeeping of the imported guest-backing windows.
+add_executable(bda_live_windows_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BdaLiveWindowsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/bdaLiveWindows.cpp"
+)
+target_include_directories(bda_live_windows_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
@@ -1566,6 +1572,7 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-keep-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME inplace_candidates COMMAND $<TARGET_FILE:inplace_candidates_tests>)
+	add_test(NAME bda_live_windows COMMAND $<TARGET_FILE:bda_live_windows_tests>)
 	add_test(NAME bda_reach COMMAND $<TARGET_FILE:bda_reach_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	if(KYTY_X86_64_V3)
@@ -1942,6 +1949,21 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
 	add_test(NAME bda_access_tags_shader
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-access-tags-shader-only)
+	# KYTY_BDA_LIVE_PAGES (the check sets the variable for the device and switches the policy itself):
+	# page-table state machine with a shader read through a redirected entry, plain and incremental
+	# passes.
+	add_test(NAME bda_live_pages
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-live-pages-only)
+	add_test(NAME bda_live_pages_incremental
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-live-pages-only)
+	set_tests_properties(bda_live_pages_incremental PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	# Written uploads staged in a reservation of the staging ring (KYTY_RENDERER_BATCH=1): the restore
+	# of a redirected page must not write its page-table entries into that reservation (step 12).
+	add_test(NAME bda_live_pages_batch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-live-pages-only)
+	set_tests_properties(bda_live_pages_batch PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_RENDERER_BATCH=1")
 	# KYTY_BDA_DIRTY_LOG (with incremental BDA synchronization): verify mode and off.
 	add_test(NAME bda_sync_dirty_log_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)

@@ -108,11 +108,25 @@ void BufferCache::ApplyBdaTags(uint64_t first_page, std::span<vk::DeviceAddress>
 }
 
 vk::DeviceAddress BufferCache::TaggedBdaEntry(uint64_t page, vk::DeviceAddress entry) const {
+	// KYTY_BDA_LIVE_PAGES: a redirected page keeps its redirect (with its own tag).
+	if (entry != 0 && m_bda_live_count.load(std::memory_order_relaxed) != 0) {
+		if (const auto live = LiveEntry(page); live != 0) {
+			return live;
+		}
+	}
 	if (m_bda_tags == nullptr || entry == 0) {
 		return entry;
 	}
 	std::scoped_lock lock(m_bda_tags->mutex);
 	return m_bda_tags->accessed.Contains(page << CACHING_PAGEBITS, CACHING_PAGESIZE) ? (entry | BDA_ACCESSED) : entry;
+}
+
+bool BufferCache::BdaTagAccessed(uint64_t page) const {
+	if (m_bda_tags == nullptr) {
+		return false;
+	}
+	std::scoped_lock lock(m_bda_tags->mutex);
+	return m_bda_tags->accessed.Contains(page << CACHING_PAGEBITS, CACHING_PAGESIZE);
 }
 
 void BufferCache::NoteBdaTagFault(uint64_t start, uint64_t size) {
@@ -145,6 +159,9 @@ void BufferCache::NoteBdaTagFault(uint64_t start, uint64_t size) {
 			pages.push_back(page);
 		}
 	}
+	for (const auto page: pages) {
+		LiveNoteTagRead(page); // KYTY_BDA_LIVE_PAGES (I5)
+	}
 	// The tagged entries of the backed pages (sorted: the loop runs upwards).
 	std::vector<vk::DeviceAddress> entries;
 	for (size_t first = 0; first < pages.size();) {
@@ -159,6 +176,14 @@ void BufferCache::NoteBdaTagFault(uint64_t start, uint64_t size) {
 				entries[k - first] = (buffer.BufferDeviceAddress() +
 				                      ((pages[k] - (buffer.CpuAddress() >> CACHING_PAGEBITS)) << CACHING_PAGEBITS)) |
 				                     BDA_ACCESSED;
+				// KYTY_BDA_LIVE_PAGES: a page read through its redirect keeps the redirect, now tagged
+				// (LiveEntry adds the tag: the page is in the accessed set); the next full pass
+				// uploads it (LivePagesPrePass sees it accessed).
+				if (m_bda_live_count.load(std::memory_order_relaxed) != 0) {
+					if (const auto live = LiveEntry(pages[k]); live != 0) {
+						entries[k - first] = live;
+					}
+				}
 				any = true;
 			}
 		}

@@ -673,6 +673,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 				Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrains);
 			}
 		}
+		m_buffer_cache.DropLivePages(vaddr, size); // KYTY_BDA_LIVE_PAGES (I-L2)
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_bindless_table.UnwatchRange(vaddr, size);
@@ -693,6 +694,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): promoted redirects back, the forced set uploaded.
+	m_buffer_cache.LivePagesPrePass();
 	// KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp): 1 = only the pages DMA shaders accessed and new
 	// buffers; verify = the full pass plus the record of what 1 would have skipped.
 	const auto tags = m_buffer_cache.BdaAccessTagsMode();
@@ -748,6 +751,8 @@ void RenderContext::PrepareHostBackingWrite(uint64_t vaddr, uint64_t size,
                                             HostWriter writer) noexcept {
 	// Only the GPU thread: it alone marks pages GPU-dirty, so the ownership checked below cannot
 	// change before the invalidation (which would then download from a completion runner).
+	// KYTY_BDA_LIVE_PAGES (I-C1): recorded work that reads these pages live completes first.
+	m_buffer_cache.LivePagesBeforeCpWrite(vaddr, size);
 	if (!HostWriteTrackingEnabled() || !GuestGpu::IsGpuThread() || !IsMapped(vaddr, size)) {
 		NoteHostBackingWrite(vaddr, size, writer);
 		return;
