@@ -205,6 +205,9 @@ public:
 		static constexpr uint32_t MaxTimed = 4;
 		uint32_t                  timed_count = 0;
 		std::array<ImageId, MaxTimed> timed {};
+		// The first reason the loop was impure (KYTY_IMG_OVERLAP counters).
+		enum Why : uint8_t { WhyNone, WhyTimedTaken, WhyTimedMany, WhyDepth, WhyExpand, WhyMerge, WhyContains };
+		uint8_t impure_why = WhyNone;
 		ImageInfo requested;             // the description's info as FindImage got it
 		uint32_t candidates     = 0;
 		uint64_t region_address = 0;
@@ -215,6 +218,8 @@ public:
 	// ResolveOverlap's safe_to_delete for a candidate image, as it would be decided now (GPU
 	// thread; caller holds m_lock).
 	[[nodiscard]] bool OverlapSafeToDelete(const Image& cached) const;
+	// Marks the current lookup's overlap loop impure, keeping the first reason.
+	void NoteOverlapImpure(uint8_t why);
 	// Diagnostics (KYTY_CP_COMMIT=texdcc verify): DCC decisions of MaterializeDccClear that did
 	// something (a slice clear, or a native GPU inspection); a memo hit's full resolution adds none.
 	[[nodiscard]] uint64_t      DccDecisionEffects() const noexcept { return m_dcc_decision_effects; }

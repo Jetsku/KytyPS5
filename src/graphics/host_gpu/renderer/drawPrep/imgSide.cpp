@@ -121,6 +121,9 @@ const char* const g_switch_names[static_cast<size_t>(S::Count)] = {
     "memo2 evict",    "memo2 hit",     "memo2 miss",       "memo2 verify",   "memo2 mismatch",
     "memo copies",    "inplace hit",   "inplace verify",   "inplace mismatch", "partner hit", "partner sync", "inplace run hit",
     "partner verify", "partner mismatch", "overlap rec", "overlap hit", "overlap verify", "overlap mismatch", "acqseed rec", "acqseed hit", "acqseed verify", "acqseed mismatch",
+    "ovlrej timed-taken", "ovlrej timed-many", "ovlrej depth", "ovlrej expand", "ovlrej merge", "ovlrej contains",
+    "ovlrej inserted", "ovlrej pages", "ovlrej other", "seedref attachment", "seedref program", "seedref writes",
+    "seedref other",
     "frames"};
 static_assert(sizeof(g_switch_names) / sizeof(g_switch_names[0]) == static_cast<size_t>(S::Count));
 

@@ -4818,6 +4818,13 @@ uint8_t RenderExecutor::DrawRunSeedAcquire(const CommandBuffer& buffer, const Dr
 			}
 		}
 	}
+	// Buffer writes (V# writes and atomics) of the draw: none over an attachment's memory (the
+	// written ranges as the descriptors state them; KYTY_DRAW_RUN_WRITES's check).
+	for (const auto* stage: stages) {
+		if (stage->runtime != nullptr && DrawRunWritesOverRun(*stage->runtime, seed.marks) > 1) {
+			return 7;
+		}
+	}
 	seed.activity         = DrawRun::ActivityEpoch();
 	seed.command          = buffer.Identity();
 	seed.tick             = m_context.GetCommandScheduler().CurrentTick();
@@ -8109,14 +8116,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
 				clears = clears || rendering.color_attachments[i].is_clear;
 			}
+			// What the acquisition needs of the seeding draw (6.4 of the imgside design): its writes cannot
+			// reach the attachments unseen. Buffer writes are checked against the attachments' ranges
+			// (DrawRunSeedAcquire), storage images by the texture-over-attachment check; address writes
+			// (unbounded) and GDS refuse; the fault buffer (OR-ed bits read after the submission) does not.
 			bool program_ok  = true;
 			bool textures_ok = true;
 			for (const auto* stage: stages) {
-				program_ok = program_ok && stage->gds.buffer == nullptr &&
-				             DrawRunProgramEligible(*stage->runtime->program, false, g_draw_run_fault_buffer.On());
+				program_ok = program_ok && stage->gds.buffer == nullptr && !stage->runtime->program->has_address_writes;
+				for (const auto& binding: stage->runtime->program->bindings.descriptors) {
+					program_ok = program_ok && binding.kind != ShaderRecompiler::IR::DescriptorBindingKind::Gds;
+				}
 				for (const auto& binding: stage->images) {
-					textures_ok = textures_ok && !is_attachment(binding.image_id) &&
-					              binding.desc.type != TextureCache::BindingType::Storage;
+					textures_ok = textures_ok && !is_attachment(binding.image_id);
 				}
 			}
 			m_seed_why = ImgSide::AcqSeedMode() == ImgSide::Mode::Off ? 3
@@ -8125,13 +8137,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			             : buffer.ActiveRenderingSerial() == 0 || !RenderStateFastEnabled(RenderStatePart::Reset) ||
 			                       graphics_debug_dump_enabled()
 			                 ? 6
-			             : shader_write_stages ? 7
-			             : clears              ? 8
-			             : !program_ok         ? 9
-			             : !textures_ok        ? 10
-			                                   : 0;
+			             : clears       ? 8
+			             : !program_ok  ? 9
+			             : !textures_ok ? 10
+			                            : 0;
 			if (m_seed_why == 0) {
 				m_seed_why = DrawRunSeedAcquire(buffer, state, rendering, stages, bounded ? &written : nullptr);
+			}
+			if (m_seed_why != 13 && m_seed_why != 3) {
+				ImgSide::Bump(m_seed_why == 10  ? ImgSide::S::SeedRefAttachment
+				              : m_seed_why == 9 ? ImgSide::S::SeedRefProgram
+				              : m_seed_why == 7 ? ImgSide::S::SeedRefWrites
+				                                : ImgSide::S::SeedRefOther);
 			}
 		}
 		if (kernel_verify) {

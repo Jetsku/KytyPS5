@@ -980,6 +980,20 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 				    !TextureCache::ImagePageTable::TryGetPageRange(lookup.region_address,
 				                                                   lookup.region_size, region) ||
 				    region.last_exclusive - region.first > MaxExtraPages) {
+					if (overlap_ok) {
+						using L = TextureCache::OverlapLookup;
+						const bool same = lookup.overlap && lookup.result == found;
+						ImgSide::Bump(!same                                    ? ImgSide::S::OvlRejOther
+						              : lookup.inserted                        ? ImgSide::S::OvlRejInserted
+						              : lookup.impure_why == L::WhyTimedTaken  ? ImgSide::S::OvlRejTimedTaken
+						              : lookup.impure_why == L::WhyTimedMany   ? ImgSide::S::OvlRejTimedMany
+						              : lookup.impure_why == L::WhyDepth       ? ImgSide::S::OvlRejDepth
+						              : lookup.impure_why == L::WhyExpand      ? ImgSide::S::OvlRejExpand
+						              : lookup.impure_why == L::WhyMerge       ? ImgSide::S::OvlRejMerge
+						              : lookup.impure_why == L::WhyContains    ? ImgSide::S::OvlRejContains
+						              : !lookup.pure                           ? ImgSide::S::OvlRejOther
+						                                                       : ImgSide::S::OvlRejPages);
+					}
 					reject(view_rebased ? ImgSide::C::RejRebased : ImgSide::C::RejBacking);
 					CountOverlap(cache, found);
 					if (!view_rebased && ImgSide::StatsEnabled()) {

@@ -4869,7 +4869,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto note_timed = [&] {
 		auto& lookup = m_last_overlap;
 		if (safe_to_delete || lookup.timed_count >= OverlapLookup::MaxTimed) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(safe_to_delete ? OverlapLookup::WhyTimedTaken : OverlapLookup::WhyTimedMany);
 		} else {
 			lookup.timed[lookup.timed_count++] = cached_id;
 		}
@@ -4879,7 +4879,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	// cached depth image as it is and never sees a taller one.
 	if (binding == BindingType::DepthTarget && IsDepthGrowth(requested, cached.info) &&
 	    cached.registered && !cached.depth_id && cached.backing.samples == 1) {
-		m_overlap_impure = true;
+		NoteOverlapImpure(OverlapLookup::WhyDepth);
 		if (m_depth_grow_recreate) {
 			if (merged_id) {
 				// A larger image was already chosen for this binding: an older, smaller one at the
@@ -4901,7 +4901,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyDepth);
 			return {depth_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
@@ -4916,11 +4916,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyExpand);
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyExpand);
 			return {ExpandImage(requested, cached_id)};
 		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
@@ -4931,7 +4931,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent.width == cached.info.extent.width &&
 		      requested.extent.height == cached.info.extent.height &&
 		      requested.extent.depth > cached.info.extent.depth))) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyExpand);
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
@@ -4944,7 +4944,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		         : requested.extent.width > cached.info.extent.width &&
 		               requested.extent.height >= cached.info.extent.height &&
 		               requested.extent.depth >= cached.info.extent.depth)) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyExpand);
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
@@ -4955,7 +4955,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent == cached.info.extent &&
 		      cached.info.resources.levels > 1 &&
 		      requested.resources.layers == cached.info.resources.layers))) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyExpand);
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.type != cached.info.type) {
@@ -4989,10 +4989,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 	const int32_t mip = cached.info.MipOf(requested);
 	if (mip >= 0) {
-		m_overlap_impure = true; // an expansion or a merge
+		NoteOverlapImpure(OverlapLookup::WhyMerge); // an expansion or a merge
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (!merged_id) {
-			m_overlap_impure = true;
+			NoteOverlapImpure(OverlapLookup::WhyExpand);
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
@@ -5013,6 +5013,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 	}
 	return {merged_id};
+}
+
+void TextureCache::NoteOverlapImpure(uint8_t why) {
+	if (!m_overlap_impure) {
+		m_last_overlap.impure_why = why;
+	}
+	m_overlap_impure = true;
 }
 
 bool TextureCache::OverlapSafeToDelete(const Image& cached) const {
@@ -7647,7 +7654,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 				result = {};
 			} else if (ImageContainsEnabled() ? !resolved.info.resources.Contains(desc.info.resources)
 			                                  : resolved.info.resources < desc.info.resources) {
-				m_overlap_impure = true;
+				NoteOverlapImpure(OverlapLookup::WhyContains);
 				FreeImage(result, HangTrace::ImageFreeReason::SmallerResources);
 				result = {};
 			}

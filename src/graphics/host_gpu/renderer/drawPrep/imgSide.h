@@ -205,6 +205,21 @@ enum class S : uint8_t {
 	AcqSeedHit,     // ... reused by the next draw
 	AcqSeedChecks,  // verify: reusable acquisitions compared with the acquisition
 	AcqSeedMismatch,
+	// KYTY_IMG_OVERLAP not off: why an overlap-loop answer was not recorded (Record).
+	OvlRejTimedTaken, // a time-dependent branch decided to free (or the keep window)
+	OvlRejTimedMany,  // more than OverlapLookup::MaxTimed time-dependent candidates
+	OvlRejDepth,      // a depth grow / depth overlap branch
+	OvlRejExpand,     // an expansion
+	OvlRejMerge,      // a mip merge / expansion into the request
+	OvlRejContains,   // the Contains free
+	OvlRejInserted,   // the lookup inserted the image
+	OvlRejPages,      // the region spans more than 4 pages
+	OvlRejOther,      // DCC description, result changed, no overlap record
+	// KYTY_IMG_ACQSEED not off: why a run-ineligible draw seeded nothing.
+	SeedRefAttachment, // a texture is an attachment
+	SeedRefProgram,    // address writes or GDS
+	SeedRefWrites,     // a buffer write over an attachment's memory
+	SeedRefOther,      // feedback, clears, no rendering instance, depth promotion, a texture over an attachment
 	Frames,        // frame boundaries (per-frame figures of the line)
 	Count
 };
