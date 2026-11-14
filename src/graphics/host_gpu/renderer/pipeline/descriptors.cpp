@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
@@ -1649,9 +1650,26 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 				binding = std::move(full);
 			}
 		}
+		if (m_texture_memo.LastHitInplaceVerify()) {
+			// KYTY_IMG_INPLACE=verify: the full resolution (without the memo) for an in-place
+			// second-level answer; it replaces the answer when they differ.
+			TextureBinding full;
+			ResolveTextureFull(resource, descriptor, memo_key, hash, false, full);
+			if (m_texture_memo.InplaceDiffers(binding, full)) {
+				binding = std::move(full);
+			}
+		}
 		return;
 	}
+	if (!memo) {
+		ImgSide::Count(ImgSide::C::MissNoMemo);
+	}
 	ResolveTextureFull(resource, descriptor, memo_key, hash, memo, binding);
+	// KYTY_IMG_MEMO2=verify / KYTY_IMG_PARTNER=verify: the claim for this key against the full
+	// resolution.
+	if (memo) {
+		m_texture_memo.VerifyClaim(texture_cache, binding);
+	}
 }
 
 void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResource& resource,
@@ -1662,6 +1680,12 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	const bool storage           = resource.written;
 	const bool description_cache =
 	    Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u;
+	if (ImgSide::StatsEnabled()) [[unlikely]] {
+		ImgSide::Count(ImgSide::C::TexFull);
+		ImgSide::NoteFullKey(hash != 0 ? hash
+		                               : TextureBindingMemo::Hash(TextureBindingMemo::MakeKey(
+		                                     resource, descriptor.fields)));
+	}
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -2334,6 +2358,7 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 }
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
+	ImgSide::Count(ImgSide::C::Bind);
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
 		return;
@@ -2349,6 +2374,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
+	ImgSide::Count(ImgSide::C::BindTarget);
 	auto& image             = m_context.GetTextureCache().GetImage(id);
 	if (!Common::RendererBatchEnabled() || (!image.binding.is_bound && !image.binding.is_target)) {
 		m_bound_images.push_back(id);
@@ -2357,6 +2383,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	ImgSide::Count(ImgSide::C::ResetImages, m_bound_images.size());
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
 			if (image->binding.is_target) {
@@ -2481,6 +2508,7 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 	}
 	totals.texture_repeats++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureRepeats);
+	ImgSide::Count(ImgSide::C::TexSetRepeat, prepared.images.size());
 	CommitStats::AddItems(CommitStats::Item::TexSetRepeated, 1);
 	const auto storage = [](const TextureBinding& binding) {
 		return binding.desc.type == TextureCache::BindingType::Storage;
@@ -4683,6 +4711,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// KYTY_DRAW_RUN continuation: the texture and sampler bindings are the previous draw's (the
 	// same program, T# and S# words; RenderExecutor::DrawRunCandidate).
 	CommitStats::SubScope texture_scope(CommitStats::Sub::Textures);
+	ImgSide::Count(keep_images ? ImgSide::C::StagesKept : ImgSide::C::StagesFull);
 	if (!keep_images && !RepeatStageTextures(program, snapshot, prepared)) {
 		// KYTY_DRAW_PREP_BINDINGS textures: the memo hashes the preparing worker computed.
 		const auto count  = static_cast<uint32_t>(program.info.images.size());
@@ -4725,6 +4754,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 						BindImage(binding.image_id, storage(binding));
 					}
 					if (run != 0) {
+						ImgSide::Count(ImgSide::C::TexRunHit, run);
 						OwnedCounters::Add(DrawPrep::GetBindingTotals().texture_run_hits, run);
 						Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingTextureRunHits,
 						                          run);
@@ -4854,6 +4884,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 void RenderExecutor::PrepareBindingsContinuation(const ShaderStageRuntime& runtime,
                                                  PreparedBindings& prepared, DrawPrep::StagePlan* plan) {
 	const auto& program      = *runtime.program;
+	ImgSide::Count(ImgSide::C::StagesKept);
 	prepared.runtime             = &runtime;
 	prepared.xframe_verify_views = false;
 	prepared.plan                = plan;
@@ -5742,6 +5773,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	    })) {
 		const bool verify = DrawSequenceVerifyMode() != 0 || prepared.xframe_verify_views;
 		if (m_texture_memo.TryRepeatViews(texture_cache, images, !verify)) {
+			ImgSide::Count(ImgSide::C::ViewRepeat, images.size());
 			m_draw_sequence_totals.view_repeats++;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceViewRepeats);
 			if (!verify) {
@@ -5780,6 +5812,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			old_image->binding = {};
 		}
 		SetNullCompareFuncs(ImageCompareFuncs(program, snapshot, i));
+		ImgSide::Count(ImgSide::C::TexFullRebind);
 		ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
 		BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
 	};
@@ -5805,6 +5838,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				}
 			}
 			binding.mip_views.reserve(resource.mip_count);
+			ImgSide::Count(ImgSide::C::ViewMips, resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
 				desc.view_info.base_level += std::min(mip, levels - 1u);
@@ -5815,6 +5849,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else if (!m_texture_memo.TryAcquireView(texture_cache, binding)) {
+			ImgSide::Count(ImgSide::C::ViewFind);
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 			m_texture_memo.RecordView(binding, binding.image_view);
 		}
@@ -5889,6 +5924,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				texture_cache.NoteExactRangeStaleUse(image, false);
 			}
 			if (run != 0) {
+				ImgSide::Count(ImgSide::C::ViewRunHit, run);
 				OwnedCounters::Add(DrawPrep::GetBindingTotals().view_run_hits, run);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingViewRunHits, run);
 			}
@@ -5977,6 +6013,7 @@ void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) 
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors, bool keep_images) {
+	ImgSide::Count(ImgSide::C::Draws);
 	bool uses_dma = false;
 	bool uses_bvh = false;
 	for (auto* stage: stages) {

@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/watchRange.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
@@ -2431,6 +2432,7 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 	if (first_slice && submission.reset_processor && submission.type != SubmissionType::Compute) {
 		CommitStats::OnFrameBoundary();
+		ImgSide::OnFrame();
 		NoteCubeFrame();
 		CpGaps::NoteFrame();
 		Common::PrepPhases::NoteFrame();
@@ -2570,6 +2572,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		// sceAgcSuspendPoint.
 		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
 			CommitStats::OnFrameBoundary();
+			ImgSide::OnFrame();
 			NoteCubeFrame();
 			CpGaps::NoteFrame();
 			Common::PrepPhases::NoteFrame();

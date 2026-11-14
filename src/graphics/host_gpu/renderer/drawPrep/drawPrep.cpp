@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "graphics/host_gpu/renderer/drawPrep/lean.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
@@ -2995,6 +2996,7 @@ void Engine::Commit(Slot& slot) {
 		DrawRun::PrintSummary();
 		TexelImageLookup::PrintSummary();
 		XFrameReuse::PrintSummary();
+		ImgSide::PrintSummary();
 	}
 	CommitStats::StepMark(CommitStats::Step::GapCommitTail);
 }

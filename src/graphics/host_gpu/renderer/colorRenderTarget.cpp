@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
@@ -203,6 +204,7 @@ bool SameRenderColorInfo(const RenderColorInfo& a, const RenderColorInfo& b) {
 ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exact_format,
                                         TextureCache::RepeatLookup* record) {
 	auto& cache = m_context.GetTextureCache();
+	ImgSide::Count(ImgSide::C::FindTarget);
 	if (record == nullptr || !DrawSequenceEnabled(DrawSequencePart::Targets)) {
 		return cache.FindImage(desc, exact_format);
 	}
@@ -230,6 +232,7 @@ ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exac
 	}
 	totals.target_repeats++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetRepeats);
+	ImgSide::Count(ImgSide::C::FindTargetRep);
 	CommitStats::AddItems(CommitStats::Item::TargetRepeat, 1);
 	if (!verify) {
 		return record->image;
