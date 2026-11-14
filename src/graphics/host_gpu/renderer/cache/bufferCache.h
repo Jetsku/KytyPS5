@@ -190,6 +190,8 @@ public:
 		uint64_t v1_skipped       = 0; // checks skipped: the fault epoch moved during the pass
 		uint64_t v2               = 0; // verify: redirected pages that are GPU-dirty / hot / image-written
 		uint64_t v3               = 0; // verify: redirects alive at a BDA-writing program
+		uint64_t v4               = 0; // verify: forced pages still CPU-dirty after their upload (I3, must be 0)
+		uint64_t v4_checks        = 0;
 		uint64_t windows          = 0;
 		uint64_t pinned_bytes     = 0;
 		uint64_t import_failures  = 0;

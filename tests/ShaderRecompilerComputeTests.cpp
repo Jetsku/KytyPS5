@@ -9635,8 +9635,10 @@ public:
                   static_cast<unsigned long long>(totals.cp_waits), static_cast<unsigned long long>(totals.v1),
                   static_cast<unsigned long long>(totals.v1_checks), static_cast<unsigned long long>(totals.v1_skipped),
                   static_cast<unsigned long long>(totals.v2), static_cast<unsigned long long>(totals.v3));
-      Require(name, "verify", totals.v1 == 0 && totals.v2 == 0 && totals.v3 == 0 && totals.v1_checks >= 1,
-              "a verify counter is not 0, or V1 never ran");
+      Require(name, "verify",
+              totals.v1 == 0 && totals.v2 == 0 && totals.v3 == 0 && totals.v4 == 0 && totals.v1_checks >= 1 &&
+                  totals.v4_checks >= 1,
+              "a verify counter is not 0, or V1 / V4 never ran");
       scheduler.Finish();
       context.UnmapMemory(base, allocation_size);
       Require(name, "unmap", cache.GetBdaLiveTotals().held == 0, "unmap left redirects");

@@ -229,42 +229,46 @@ void BufferCache::LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size
 	uint64_t run = start;
 	for (auto page = start >> CACHING_PAGEBITS; (page << CACHING_PAGEBITS) < end; ++page) {
 		const auto address = page << CACHING_PAGEBITS;
-		bool       is_live = false;
+		const bool in_buffer = address >= buffer.CpuAddress() && address + PAGE <= buffer.CpuAddress() + buffer.Size();
+		bool       is_live   = false;
+		bool       blocked   = !may_redirect || !in_buffer;
 		{
 			std::scoped_lock lock(live.mutex);
 			is_live = live.pages.contains(page);
-		}
-		vk::DeviceAddress entry = 0;
-		if (!is_live && may_redirect && address >= buffer.CpuAddress() &&
-		    address + PAGE <= buffer.CpuAddress() + buffer.Size()) {
-			bool blocked = false;
-			{
-				std::scoped_lock lock(live.mutex);
-				blocked = live.cp_written.contains(page);
-				// Performance only: a page a cache binding uploaded after its redirect is read by draws
-				// anyway; redirecting it again would only add two entry writes per frame.
-				if (!blocked) {
-					const auto h = live.bound_until.find(page);
-					if (h != live.bound_until.end()) {
-						if (live.passes < h->second) {
-							blocked = true;
-							live.totals.rejects_bound++;
-						} else {
-							live.bound_until.erase(h);
-						}
+			blocked = blocked || is_live || live.cp_written.contains(page);
+			// Performance only: a page a cache binding uploaded after its redirect is read by draws
+			// anyway; redirecting it again would only add two entry writes per frame.
+			if (!blocked) {
+				const auto h = live.bound_until.find(page);
+				if (h != live.bound_until.end()) {
+					if (live.passes < h->second) {
+						blocked = true;
+						live.totals.rejects_bound++;
+					} else {
+						live.bound_until.erase(h);
 					}
 				}
 			}
-			const auto state = blocked ? MemoryTracker::DirtyState {} : m_memory_tracker.QueryDirty(address, PAGE);
-			if (!blocked && state.cpu && !state.gpu && !BdaTagAccessed(page) &&
-			    !m_memory_tracker.IsRegionHot(address, PAGE) && !HasGpuDirtyBytes(address, PAGE) &&
-			    !HasPendingBackingPublication(address, PAGE) && !m_texture_cache.IsRegionGpuModified(address, PAGE)) {
+		}
+		vk::DeviceAddress entry = 0;
+		if (!blocked) {
+			// Cheapest checks first: the lock-free dirty mirrors (exact on the GPU thread), then the
+			// window (I-A2: the page and the 64 bytes after it lie in one imported window), then the
+			// locked queries.
+			MemoryTracker::DirtyState state;
+			if (!m_memory_tracker.QueryDirtyRelaxed(address, PAGE, state)) {
+				state = m_memory_tracker.QueryDirty(address, PAGE);
+			}
+			if (state.cpu && !state.gpu) {
 				const auto* host = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(address, PAGE));
-				// I-A2: the page and the 64 bytes after it lie in one imported window.
-				entry = host != nullptr ? live.windows->Translate(reinterpret_cast<uint64_t>(host), PAGE + 64) : 0;
-				if (entry == 0) {
+				const auto  dev  = host != nullptr ? live.windows->Translate(reinterpret_cast<uint64_t>(host), PAGE + 64) : 0;
+				if (dev == 0) {
 					std::scoped_lock lock(live.mutex);
 					live.totals.rejects_window++;
+				} else if (!BdaTagAccessed(page) && !m_memory_tracker.IsRegionHot(address, PAGE) &&
+				           !HasGpuDirtyBytes(address, PAGE) && !HasPendingBackingPublication(address, PAGE) &&
+				           !m_texture_cache.IsRegionGpuModified(address, PAGE)) {
+					entry = dev;
 				}
 			}
 		}
@@ -444,8 +448,36 @@ void BufferCache::LivePagesPrePass() {
 		return;
 	}
 	// Only mapped pages are here: unmap drops its pages from the set (DropLivePages).
-	const UploadBatch upload_batch(*this);
-	forced.ForEach([this](uint64_t begin, uint64_t end) { SynchronizeBuffersInRange(begin, end - begin, nullptr); });
+	const auto epoch = m_memory_tracker.FaultMutationEpoch();
+	{
+		const UploadBatch upload_batch(*this);
+		forced.ForEach([this](uint64_t begin, uint64_t end) { SynchronizeBuffersInRange(begin, end - begin, nullptr); });
+	}
+	if (BdaLivePagesMode() != 2 || m_memory_tracker.FaultMutationEpoch() != epoch) {
+		return;
+	}
+	// V4 (I3): a forced page that is still CPU-dirty (not hot) after its upload, with no fault in
+	// between, kept stale bytes under its cache entry.
+	uint64_t v4 = 0;
+	forced.ForEach([&](uint64_t begin, uint64_t end) {
+		for (auto page = begin >> CACHING_PAGEBITS; (page << CACHING_PAGEBITS) < end; ++page) {
+			const auto address = page << CACHING_PAGEBITS;
+			bool       cpu     = false;
+			const auto* owner   = m_page_table.Find(page);
+			if (owner != nullptr && *owner && m_memory_tracker.QueryCpuDirtyRelaxed(address, PAGE, cpu) &&
+			    cpu && !m_memory_tracker.IsRegionHot(address, PAGE) && !IsBdaLivePage(address)) {
+				v4++;
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::fprintf(stderr, "BdaLiveVerify V4: forced page 0x%" PRIx64 " still CPU-dirty after its upload\n",
+					             address);
+				}
+			}
+		}
+	});
+	std::scoped_lock lock(live.mutex);
+	live.totals.v4 += v4;
+	live.totals.v4_checks++;
 }
 
 void BufferCache::LivePagesBeforeBdaWrites() {
@@ -548,13 +580,17 @@ void BufferCache::LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fau
 	uint64_t v2 = 0;
 	for (const auto page: held) {
 		const auto address = page << CACHING_PAGEBITS;
-		const auto state   = m_memory_tracker.QueryDirty(address, PAGE);
-		if (state.gpu || m_memory_tracker.IsRegionHot(address, PAGE) || m_texture_cache.IsRegionGpuModified(address, PAGE)) {
+		const auto state = m_memory_tracker.QueryDirty(address, PAGE);
+		const bool hot   = m_memory_tracker.IsRegionHot(address, PAGE);
+		const bool image = m_texture_cache.IsRegionGpuModified(address, PAGE);
+		if (state.gpu || hot || image) {
 			v2++;
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-				std::fprintf(stderr, "BdaLiveVerify V2: redirected page 0x%" PRIx64 " is GPU-dirty, hot or image-written\n",
-				             address);
+				std::fprintf(stderr,
+				             "BdaLiveVerify V2: redirected page 0x%" PRIx64 " is%s%s%s (CPU-dirty %d)\n", address,
+				             state.gpu ? " GPU-dirty" : "", hot ? " hot" : "", image ? " image-written" : "",
+				             state.cpu ? 1 : 0);
 			}
 		}
 	}
@@ -661,8 +697,9 @@ void BufferCache::ReportBdaLive() {
 	            "restores upload %.1f written %.1f read %.1f cp %.1f unmap %.1f register %.1f off %.1f writers %.1f, "
 	            "forced syncs %.1f, faults %.1f | held %" PRIu64 " pages (%.1f MB) | cp hits %.2f/f waits %.2f/f "
 	            "unordered %.2f/f, window rejects %.1f/f, bound rejects %.1f/f, blocked passes %.2f/f | windows %" PRIu64 " (%" PRIu64
-	            " MiB pinned, %" PRIu64 " failed) | verify V1 %" PRIu64 " (checks %" PRIu64 ", skipped %" PRIu64
-	            "), V2 %" PRIu64 ", V3 %" PRIu64 " (totals)\n",
+	            " MiB pinned, %" PRIu64 " failed) | verify V1 (global, includes what the pass leaves without this "
+	            "switch) %" PRIu64 " (checks %" PRIu64 ", skipped %" PRIu64 "), V2 %" PRIu64 ", V3 %" PRIu64
+	            ", V4 %" PRIu64 " (checks %" PRIu64 ") (totals)\n",
 	            elapsed, mode == 3 ? "check" : (mode == 2 ? "verify" : (mode == 1 ? "on" : "off")), live.report_frames,
 	            per(t.redirects, r.redirects), per(t.redirects, r.redirects) * PAGE / 1e6,
 	            per(t.restore_upload, r.restore_upload), per(t.restore_written, r.restore_written),
@@ -674,7 +711,7 @@ void BufferCache::ReportBdaLive() {
 	            per(t.cp_unordered, r.cp_unordered), per(t.rejects_window, r.rejects_window),
 	            per(t.rejects_bound, r.rejects_bound),
 	            per(t.blocked_passes, r.blocked_passes), t.windows, t.pinned_bytes >> 20u, t.import_failures, t.v1,
-	            t.v1_checks, t.v1_skipped, t.v2, t.v3);
+	            t.v1_checks, t.v1_skipped, t.v2, t.v3, t.v4, t.v4_checks);
 	std::fflush(stdout);
 	live.report_time   = now;
 	live.reported      = t;
