@@ -816,6 +816,14 @@ struct CodegenOptions {
 	// that every path from the entry passes. Only programs whose trace failed change; not in the
 	// fingerprint (as KYTY_CALL_TRACE_WAVE32).
 	bool call_trace_reach = false;
+	// KYTY_VS_FULL_WAVE=1 (default 0): a vertex shader's merged wave info (s3) counts one full wave
+	// of vertices (wave_size), as the tessellation evaluation stage's does, instead of the subgroup's
+	// active invocations. Every host invocation is a vertex the guest wave would run, so the guest's
+	// EXEC (built from that count) is all ones in every lane that exists; the per-lane EXEC selects
+	// then fold away and the old values they kept live free their registers (NVIDIA: 216-235
+	// registers in Astro Bot's skinned vertex shaders). Guest reads of EXEC as a value (S_BCNT1) count
+	// the whole wave.
+	bool vs_full_wave = false;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the
