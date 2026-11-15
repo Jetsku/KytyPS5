@@ -8,8 +8,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "common/liveSwitch.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +50,13 @@ uint32_t FaultScanWords() {
 	}();
 	return words;
 }
+
+// KYTY_FAULT_SCAN_MAPPED=1 (live, default 0): fault_buffer_process.comp scans only the bitmap words of
+// pages inside guest GPU mappings (RenderContext's mapped ranges), one vkCmdDispatchBase per run of
+// 64-invocation groups (8192 pages, 128 MiB each) that holds mapped memory, instead of the whole
+// 1 TiB bitmap. Faults are taken only inside mappings (FindBuffer of the page); bits of unmapped
+// pages stay set and are scanned once the range is mapped. Only with KYTY_FAULT_SCAN_WORDS=4.
+Live::Switch g_fault_scan_mapped("KYTY_FAULT_SCAN_MAPPED", Live::ParseDefaultOff);
 
 } // namespace
 
@@ -97,12 +108,19 @@ FaultManager::~FaultManager() {
 	if (m_bda_pages_pipeline != nullptr) {
 		m_graphics.device.destroyPipeline(m_bda_pages_pipeline, nullptr);
 	}
+	if (m_fault_process_pipeline_base != nullptr) {
+		m_graphics.device.destroyPipeline(m_fault_process_pipeline_base, nullptr);
+	}
 	m_graphics.device.destroyPipeline(m_fault_process_pipeline, nullptr);
 	m_graphics.device.destroyPipelineLayout(m_fault_process_pipeline_layout, nullptr);
 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
 }
 
-void FaultManager::ProcessFaultBuffer() {
+bool FaultManager::ScanMappedActive() noexcept {
+	return g_fault_scan_mapped.Get() != 0;
+}
+
+void FaultManager::ProcessFaultBuffer(const std::vector<std::pair<uint64_t, uint64_t>>& mappings) {
 	KYTY_GPU_OP_SITE("fault.process");
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
@@ -147,13 +165,67 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
 	command.pipelineBarrier2(dependency);
-	m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32 / FaultScanWords(); // Four words per invocation by default (fd04c3fa9).
+	const auto num_workgroups = (num_threads + 63) / 64;
+	// KYTY_FAULT_SCAN_MAPPED: runs of groups over the mapped pages (one group: 64 x 128 pages).
+	std::vector<std::pair<uint32_t, uint32_t>> runs;
+	if (g_fault_scan_mapped.Get() != 0 && FaultScanWords() == 4 && !mappings.empty()) {
+		constexpr uint64_t GroupPages = 64u * 128u;
+		for (const auto& [begin, end]: mappings) {
+			if (end <= begin) continue;
+			const uint64_t first = (begin >> BufferCache::CACHING_PAGEBITS) / GroupPages;
+			const uint64_t last  = ((end - 1) >> BufferCache::CACHING_PAGEBITS) / GroupPages + 1;
+			const auto     g0    = static_cast<uint32_t>(std::min<uint64_t>(first, num_workgroups));
+			const auto     g1    = static_cast<uint32_t>(std::min<uint64_t>(last, num_workgroups));
+			if (g1 <= g0) continue;
+			if (!runs.empty() && g0 <= runs.back().second) {
+				runs.back().second = std::max(runs.back().second, g1);
+			} else {
+				runs.emplace_back(g0, g1);
+			}
+		}
+		std::sort(runs.begin(), runs.end());
+		if (m_fault_process_pipeline_base == nullptr && !runs.empty()) {
+			const uint32_t                   scan_words = FaultScanWords();
+			const vk::SpecializationMapEntry scan_entry {0, 0, sizeof(uint32_t)};
+			const vk::SpecializationInfo     scan_spec {1, &scan_entry, sizeof(uint32_t), &scan_words};
+			const auto                       shader = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_graphics.device);
+			vk::ComputePipelineCreateInfo    create {};
+			create.flags                     = vk::PipelineCreateFlagBits::eDispatchBase;
+			create.stage.stage               = vk::ShaderStageFlagBits::eCompute;
+			create.stage.module              = shader;
+			create.stage.pName               = "main";
+			create.stage.pSpecializationInfo = &scan_spec;
+			create.layout                    = m_fault_process_pipeline_layout;
+			const auto result = m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr,
+			                                                             &m_fault_process_pipeline_base);
+			m_graphics.device.destroyShaderModule(shader, nullptr);
+			RequireVulkanSuccess(result, "create fault-buffer pipeline (dispatch base)");
+		}
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			uint64_t groups = 0;
+			for (const auto& run: runs) groups += run.second - run.first;
+			std::printf("KYTY_FAULT_SCAN_MAPPED: %zu mapped ranges -> %zu runs, %" PRIu64 " of %" PRIu64
+			            " groups scanned\n",
+			            mappings.size(), runs.size(), groups, static_cast<uint64_t>(num_workgroups));
+		}
+	}
+	if (!runs.empty()) {
+		m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline_base);
+	} else {
+		m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	}
 	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32 / FaultScanWords(); // Four words per invocation by default (fd04c3fa9).
-	const auto num_workgroups = (num_threads + 63) / 64;
-	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	if (!runs.empty()) {
+		for (const auto& [g0, g1]: runs) {
+			command.dispatchBase(g0, 0, 0, g1 - g0, 1, 1);
+		}
+	} else {
+		command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	}
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 	// KYTY_BDA_TAGS_GPU_COUNT (diagnostic): a copy of the get_bda_pointer counters per area.

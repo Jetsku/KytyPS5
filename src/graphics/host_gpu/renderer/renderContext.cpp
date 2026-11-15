@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -813,7 +814,14 @@ void RenderContext::RunGarbageCollector() {
 	const CpGaps::Scope gap(CpGaps::Cat::Gc);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
-		m_buffer_cache.ProcessFaultBuffer();
+		// KYTY_FAULT_SCAN_MAPPED (faultManager.cpp): the scan is limited to the guest GPU mappings.
+		std::vector<std::pair<uint64_t, uint64_t>> mapped;
+		if (FaultManager::ScanMappedActive()) {
+			std::shared_lock lock(m_mapped_ranges_mutex);
+			mapped.reserve(m_mapped_ranges.Size());
+			m_mapped_ranges.ForEach([&](uint64_t begin, uint64_t end) { mapped.emplace_back(begin, end); });
+		}
+		m_buffer_cache.ProcessFaultBuffer(mapped);
 	}
 	m_texture_cache.ProcessDownloadImages();
 	m_buffer_cache.ProcessPendingBdaSettles(false);

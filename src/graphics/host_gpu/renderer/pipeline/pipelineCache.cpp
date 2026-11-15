@@ -2350,6 +2350,321 @@ std::vector<uint32_t> ApplySpirvTry(std::span<const uint32_t> code, const std::s
 	return out;
 }
 
+// KYTY_SPIRV_VARIANT=<flags>@<hash>[,<hash>...][+<flags>@<hashes>...] or <flags>@all (diagnostic,
+// default off): each '+' group gives its listed guest shaders an edited module under an id of its
+// own; draws use group n's copies while the live switch KYTY_SPIRV_VARIANT_LIVE is n (1-based,
+// renderDraw.cpp; 0 = the programs themselves), so one boot can alternate them (same-boot A/B of a
+// translation change without a program-cache change). Flags:
+// those of KYTY_SPIRV_TRY (z, c) and
+//   e  adds EarlyFragmentTests to a fragment shader that has neither it nor DepthReplacing;
+//   t  replaces the result of every image sample, fetch, gather and LOD query with zeros (texture
+//      cost probe: pictures are wrong);
+//   k  removes every OpKill / OpTerminateInvocation / OpDemoteToHelperInvocation (pictures may be wrong);
+//   o  reads every buffer byte offset (EmitMemoryOffsets' 8-bit shader_data fields) as 0: constant
+//      buffer indices (pictures are right only where every bound buffer's offset is 0);
+//   p  drops every NoContraction decoration ("precise": KYTY_MAD_MODE's unfused position math);
+//   x  removes the body of a module with one function (cost probe: outputs undefined);
+//   d  drops the f32 denormal-flush selects (results differ only for denormal inputs);
+//   F  limits the group to fragment shaders.
+struct SpirvVariantGroup {
+	std::string           flags;
+	std::vector<uint64_t> hashes;
+	bool                  all = false;
+};
+
+const std::vector<SpirvVariantGroup>& SpirvVariantSettings() {
+	static const std::vector<SpirvVariantGroup> groups = [] {
+		std::vector<SpirvVariantGroup> parsed;
+		const char*                    value = std::getenv("KYTY_SPIRV_VARIANT");
+		if (value == nullptr) return parsed;
+		std::string text(value);
+		size_t      at = 0;
+		while (at < text.size()) {
+			auto       next  = text.find('+', at);
+			auto       item  = text.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			const auto split = item.find('@');
+			if (split != std::string::npos) {
+				SpirvVariantGroup group;
+				group.flags      = item.substr(0, split);
+				std::string list = item.substr(split + 1);
+				if (list == "all") {
+					group.all = true;
+				} else {
+					size_t p = 0;
+					while (p < list.size()) {
+						const auto comma = list.find(',', p);
+						const auto h = list.substr(p, comma == std::string::npos ? std::string::npos : comma - p);
+						if (!h.empty()) group.hashes.push_back(std::strtoull(h.c_str(), nullptr, 16));
+						if (comma == std::string::npos) break;
+						p = comma + 1;
+					}
+				}
+				parsed.push_back(std::move(group));
+			}
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		if (!parsed.empty()) {
+			std::printf("Kyty SPIR-V variants: %zu group(s) (KYTY_SPIRV_VARIANT=%s), live switch KYTY_SPIRV_VARIANT_LIVE\n",
+			            parsed.size(), value);
+		}
+		return parsed;
+	}();
+	return groups;
+}
+
+// The flags of group `index` (0-based) for `hash`, empty when the group does not list it.
+std::string SpirvVariantFlags(uint64_t hash, size_t index) {
+	const auto& groups = SpirvVariantSettings();
+	if (index >= groups.size()) return {};
+	const auto& group = groups[index];
+	if (group.all || std::ranges::find(group.hashes, hash) != group.hashes.end() ||
+	    std::ranges::find(group.hashes, hash & 0xffffffffull) != group.hashes.end() ||
+	    std::ranges::find(group.hashes, hash >> 32u) != group.hashes.end()) {
+		return group.flags;
+	}
+	return {};
+}
+
+// KYTY_SPIRV_VARIANT's edits e, t, k (after ApplySpirvTry's z, c); empty when nothing changed.
+std::vector<uint32_t> ApplySpirvVariantEdits(std::span<const uint32_t> code, const std::string& flags,
+                                             uint64_t hash) {
+	const bool early   = flags.find('e') != std::string::npos;
+	const bool notex   = flags.find('t') != std::string::npos;
+	const bool nokill  = flags.find('k') != std::string::npos;
+	const bool nooffs  = flags.find('o') != std::string::npos;
+	const bool noprec  = flags.find('p') != std::string::npos;
+	const bool nobody  = flags.find('x') != std::string::npos;
+	const bool nodnz   = flags.find('d') != std::string::npos;
+	if ((!early && !notex && !nokill && !nooffs && !noprec && !nobody && !nodnz) || code.size() < 5) return {};
+	// d: Select(ULessThan(x & 0x7fffffff, 0x800000), x & 0x80000000, x) (the f32 denormal flush the
+	// translator emits before transcendental and compare inputs) becomes x.
+	std::unordered_map<uint32_t, uint32_t> dnz_source; // select result -> x
+	if (nodnz) {
+		std::unordered_map<uint32_t, uint32_t>                 constants;
+		std::unordered_map<uint32_t, std::array<uint32_t, 3>> defs; // id -> {opcode, a, b}
+		for (size_t i = 5; i < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			const uint32_t op    = code[i] & 0xffffu;
+			if (count == 0 || i + count > code.size()) return {};
+			if (op == 43 && count == 4) constants[code[i + 2]] = code[i + 3];
+			if ((op == 199 /* OpBitwiseAnd */ || op == 176 /* OpULessThan */) && count == 5) {
+				defs[code[i + 2]] = {op, code[i + 3], code[i + 4]};
+			}
+			if (op == 169 /* OpSelect */ && count == 6) {
+				const auto is_const = [&](uint32_t id, uint32_t value) {
+					const auto c = constants.find(id);
+					return c != constants.end() && c->second == value;
+				};
+				const auto masked = [&](uint32_t id, uint32_t mask, uint32_t& x) {
+					const auto d = defs.find(id);
+					if (d == defs.end() || d->second[0] != 199) return false;
+					if (is_const(d->second[2], mask)) { x = d->second[1]; return true; }
+					if (is_const(d->second[1], mask)) { x = d->second[2]; return true; }
+					return false;
+				};
+				const auto cond = defs.find(code[i + 3]);
+				uint32_t   x1 = 0, x2 = 0;
+				if (cond != defs.end() && cond->second[0] == 176 && is_const(cond->second[2], 0x00800000u) &&
+				    masked(cond->second[1], 0x7fffffffu, x1) && masked(code[i + 4], 0x80000000u, x2) &&
+				    x1 == x2 && code[i + 5] == x1) {
+					dnz_source[code[i + 2]] = x1;
+				}
+			}
+			i += count;
+		}
+	}
+	// x: a module with one function whose body becomes its first block's variables and OpReturn
+	// (the stage's cost probe: outputs are undefined).
+	if (nobody) {
+		uint32_t functions = 0;
+		for (size_t i = 5; i < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			if (count == 0 || i + count > code.size()) return {};
+			if ((code[i] & 0xffffu) == 54 /* OpFunction */) functions++;
+			i += count;
+		}
+		if (functions != 1) return {};
+		std::vector<uint32_t> out(code.begin(), code.begin() + 5);
+		bool in_function = false, first_label = false, done = false;
+		for (size_t i = 5; i < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			const uint32_t op    = code[i] & 0xffffu;
+			const auto     copy  = [&] {
+				out.insert(out.end(), code.begin() + static_cast<std::ptrdiff_t>(i),
+				           code.begin() + static_cast<std::ptrdiff_t>(i + count));
+			};
+			if (op == 54) in_function = true;
+			if (!in_function || op == 54 || op == 55 /* OpFunctionParameter */ || op == 56 /* OpFunctionEnd */) {
+				if (op == 56 && !done) {
+					out.push_back((1u << 16u) | 253u); // OpReturn
+					done = true;
+				}
+				copy();
+			} else if (op == 248 /* OpLabel */ && !first_label) {
+				first_label = true;
+				copy();
+			} else if (op == 59 /* OpVariable */ && first_label && !done) {
+				copy();
+			}
+			i += count;
+		}
+		std::printf("KYTY_SPIRV_VARIANT: shader 0x%016" PRIx64 " flags x: body removed\n", hash);
+		return out;
+	}
+	// o: the byte offsets EmitMemoryOffsets unpacks (8-bit fields of shader_data words) read as 0.
+	std::unordered_set<uint32_t> shader_data_vars, shader_data_ptrs, shader_data_words, offset_fields;
+	std::unordered_map<uint32_t, uint32_t> u32_constants; // id -> value
+	if (nooffs) {
+		for (size_t i = 5; i < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			const uint32_t op    = code[i] & 0xffffu;
+			if (count == 0 || i + count > code.size()) return {};
+			if (op == 5 /* OpName */ && count >= 3) {
+				const char* name = reinterpret_cast<const char*>(&code[i + 2]);
+				if (std::string_view(name, strnlen(name, (count - 2) * 4)) == "shader_data") {
+					shader_data_vars.insert(code[i + 1]);
+				}
+			}
+			if (op == 43 /* OpConstant */ && count == 4) u32_constants[code[i + 2]] = code[i + 3];
+			if ((op == 65 || op == 66) /* OpAccessChain, OpInBoundsAccessChain */ && count >= 4 &&
+			    (shader_data_vars.contains(code[i + 3]) || shader_data_ptrs.contains(code[i + 3]))) {
+				shader_data_ptrs.insert(code[i + 2]);
+			}
+			if (op == 61 /* OpLoad */ && count >= 4 && shader_data_ptrs.contains(code[i + 3])) {
+				shader_data_words.insert(code[i + 2]);
+			}
+			if (op == 202 /* OpBitFieldUExtract */ && count == 6 && shader_data_words.contains(code[i + 3])) {
+				const auto width = u32_constants.find(code[i + 5]);
+				if (width != u32_constants.end() && width->second == 8u) offset_fields.insert(code[i + 2]);
+			}
+			i += count;
+		}
+	}
+	uint32_t main_id = 0;
+	bool     fragment = false, has_early = false, depth_replacing = false;
+	size_t   first_function = 0;
+	std::vector<uint32_t> null_types; // result types of replaced image results, in first-seen order
+	for (size_t i = 5; i < code.size();) {
+		const uint32_t count = code[i] >> 16u;
+		const uint32_t op    = code[i] & 0xffffu;
+		if (count == 0 || i + count > code.size()) return {};
+		if (op == 15 /* OpEntryPoint */ && count >= 3) {
+			main_id  = code[i + 2];
+			fragment = code[i + 1] == 4; // Fragment
+		}
+		if (op == 16 /* OpExecutionMode */ && count >= 3) {
+			has_early |= code[i + 2] == 9;        // EarlyFragmentTests
+			depth_replacing |= code[i + 2] == 12; // DepthReplacing
+		}
+		if (op == 54 /* OpFunction */ && first_function == 0) first_function = i;
+		i += count;
+	}
+	const auto is_image_result = [](uint32_t op) {
+		return (op >= 87 && op <= 97) /* samples, fetch, gathers */ || op == 105 /* OpImageQueryLod */ ||
+		       (op >= 305 && op <= 315) /* sparse samples, fetch, gathers */;
+	};
+	std::unordered_map<uint32_t, uint32_t> null_of_type;
+	uint32_t                               bound = code[3];
+	const auto replaced = [&](uint32_t op, size_t i, uint32_t count) {
+		return count >= 3 && ((notex && is_image_result(op)) ||
+		                      (nooffs && op == 202 && offset_fields.contains(code[i + 2])));
+	};
+	if (notex || nooffs) {
+		for (size_t i = first_function; first_function != 0 && i < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			const uint32_t op    = code[i] & 0xffffu;
+			if (replaced(op, i, count) && !null_of_type.contains(code[i + 1])) {
+				null_of_type[code[i + 1]] = bound++;
+				null_types.push_back(code[i + 1]);
+			}
+			i += count;
+		}
+	}
+	std::vector<uint32_t> out(code.begin(), code.begin() + 5);
+	out.reserve(code.size() + 64);
+	uint32_t changed = 0;
+	for (size_t i = 5; i < code.size();) {
+		const uint32_t count = code[i] >> 16u;
+		const uint32_t op    = code[i] & 0xffffu;
+		if (i == first_function) {
+			for (const auto type: null_types) {
+				out.insert(out.end(), {(3u << 16u) | 46u /* OpConstantNull */, type, null_of_type[type]});
+			}
+		}
+		out.insert(out.end(), code.begin() + static_cast<std::ptrdiff_t>(i),
+		           code.begin() + static_cast<std::ptrdiff_t>(i + count));
+		if (early && fragment && !has_early && !depth_replacing && op == 16 && count >= 3 &&
+		    code[i + 1] == main_id && code[i + 2] == 7 /* OriginUpperLeft */) {
+			out.insert(out.end(), {(3u << 16u) | 16u, main_id, 9u});
+			changed++;
+		}
+		if (first_function != 0 && i > first_function && replaced(op, i, count)) {
+			out.resize(out.size() - count);
+			out.insert(out.end(), {(4u << 16u) | 83u /* OpCopyObject */, code[i + 1], code[i + 2],
+			                       null_of_type[code[i + 1]]});
+			changed++;
+		}
+		if (nokill && (op == 252 /* OpKill */ || op == 4416 /* OpTerminateInvocation */) && count == 1) {
+			// A block must end in a terminator: return instead (the shader's outputs stay as written).
+			out.back() = (1u << 16u) | 253u; // OpReturn
+			changed++;
+		}
+		if (nodnz && op == 169 && count == 6 && dnz_source.contains(code[i + 2])) {
+			out.resize(out.size() - count);
+			out.insert(out.end(), {(4u << 16u) | 83u /* OpCopyObject */, code[i + 1], code[i + 2],
+			                       dnz_source[code[i + 2]]});
+			changed++;
+		}
+		if (noprec && op == 71 /* OpDecorate */ && count == 3 && code[i + 2] == 42 /* NoContraction */) {
+			out.resize(out.size() - count);
+			changed++;
+		}
+		if (nokill && op == 5380 /* OpDemoteToHelperInvocation */ && count == 1) {
+			out.pop_back();
+			changed++;
+		}
+		i += count;
+	}
+	if (changed == 0) return {};
+	out[3] = bound;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+		std::printf("KYTY_SPIRV_VARIANT: shader 0x%016" PRIx64 " flags %s: %u edits\n", hash, flags.c_str(), changed);
+	}
+	return out;
+}
+
+} // namespace
+// KYTY_SPIRV_VARIANT: the registry of edited copies (defined with PipelineCache::SpirvVariantProgram).
+static void RegisterSpirvVariant(uint64_t id, size_t group, ShaderProgram variant);
+namespace {
+
+// The variant module's words of group `index` for `hash` (KYTY_SPIRV_VARIANT), or empty without a
+// change.
+std::vector<uint32_t> SpirvVariantWords(std::span<const uint32_t> code, uint64_t hash, size_t index) {
+	const auto flags = SpirvVariantFlags(hash, index);
+	if (flags.empty()) return {};
+	// F: fragment shaders only (a group "xF@all" removes every pixel shader body, no other stage's).
+	if (flags.find('F') != std::string::npos) {
+		bool fragment = false;
+		for (size_t i = 5; i + 1 < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			if (count == 0) break;
+			if ((code[i] & 0xffffu) == 15 /* OpEntryPoint */) {
+				fragment = code[i + 1] == 4;
+				break;
+			}
+			i += count;
+		}
+		if (!fragment) return {};
+	}
+	auto       first  = ApplySpirvTry(code, flags, hash);
+	const auto source = first.empty() ? code : std::span<const uint32_t>(first);
+	auto       second = ApplySpirvVariantEdits(source, flags, hash);
+	return !second.empty() ? second : first;
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -3210,6 +3525,13 @@ struct PipelineCache::ProgramCache {
 		g_shader_modules.Add(module, driver_spirv);
 		times.module_ns = CompileClockNs() - module_begin;
 		EXIT_IF(module == nullptr);
+		PipelineStats::RegisterModule(module, stage_name, options.shader_hash); // KYTY_PIPELINE_STATS
+		// KYTY_SPIRV_VARIANT: each group's edited words, taken before the emitted words move on.
+		const auto variant_groups = SpirvVariantSettings().size();
+		std::vector<std::vector<uint32_t>> variant_words(variant_groups);
+		for (size_t g = 0; g < variant_groups; g++) {
+			variant_words[g] = SpirvVariantWords(driver_spirv, options.shader_hash, g);
+		}
 		// KYTY_EQAA_MIXED on NV mixed samples: a pixel shader that shades per sample gets a
 		// per-pixel copy for EQAA draws (pixelRateVariant.h); registered under its id below.
 		bool             shades_per_sample = false;
@@ -3245,6 +3567,21 @@ struct PipelineCache::ProgramCache {
 		if (shades_per_sample) {
 			PixelRate::Register(id, true, pixel_rate_module);
 		}
+		// KYTY_SPIRV_VARIANT: the edited copy under an id of its own (draws pick it while live).
+		const auto make_variants = [&](uint64_t base_id, std::vector<std::vector<uint32_t>>& groups) {
+			for (size_t g = 0; g < groups.size(); g++) {
+				auto& edited = groups[g];
+				if (edited.empty()) continue;
+				const auto variant_module = CompileSPV(edited, device);
+				if (variant_module == nullptr) continue;
+				g_shader_modules.Add(variant_module, edited);
+				PipelineStats::RegisterModule(variant_module, "variant", options.shader_hash);
+				const auto variant_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+				GpuOpProfiler::RegisterShader(variant_id, stage_name, options.shader_hash);
+				RegisterSpirvVariant(base_id, g, {.id = variant_id, .module = variant_module});
+			}
+		};
+		make_variants(id, variant_words);
 		if (normalized_module != nullptr) {
 			const auto variant_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 			GpuOpProfiler::RegisterShader(variant_id, stage_name, options.shader_hash);
@@ -3265,7 +3602,13 @@ struct PipelineCache::ProgramCache {
 			const auto  plain_module = CompileSPV(plain_driver, device);
 			EXIT_IF(plain_module == nullptr);
 			g_shader_modules.Add(plain_module, plain_driver);
+			PipelineStats::RegisterModule(plain_module, "psplain", options.shader_hash); // KYTY_PIPELINE_STATS
+			std::vector<std::vector<uint32_t>> plain_variant_words(variant_groups);
+			for (size_t g = 0; g < variant_groups; g++) {
+				plain_variant_words[g] = SpirvVariantWords(plain_driver, options.shader_hash, g);
+			}
 			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+			make_variants(plain_id, plain_variant_words);
 			if (options.stage == ShaderType::Pixel) {
 				AaMaskCoverage::Register(plain_id, options.shader_hash, emitted.spirv_plain);
 			}
@@ -10139,6 +10482,44 @@ ShaderProgram PipelineCache::PlainPixelProgram(const StagePrep& prep) {
 	return prep.permutation != nullptr ? prep.permutation->plain : ShaderProgram {};
 }
 
+namespace {
+std::mutex g_spirv_variant_mutex;
+// (base program id, group index) -> edited copy
+std::unordered_map<uint64_t, ShaderProgram> g_spirv_variants;
+constexpr uint64_t SpirvVariantKey(uint64_t id, size_t group) {
+	return (id << 8u) | (group & 0xffu);
+}
+} // namespace
+
+static void RegisterSpirvVariant(uint64_t id, size_t group, ShaderProgram variant) {
+	std::scoped_lock lock(g_spirv_variant_mutex);
+	g_spirv_variants[SpirvVariantKey(id, group)] = variant;
+}
+
+ShaderProgram PipelineCache::SpirvVariantProgram(const ShaderProgram& program, uint32_t group) {
+	if (!program || group == 0) return {};
+	std::scoped_lock lock(g_spirv_variant_mutex);
+	const auto       it = g_spirv_variants.find(SpirvVariantKey(program.id, group - 1u));
+	if (it == g_spirv_variants.end()) return {};
+	auto variant                = it->second;
+	variant.normalized_samplers = program.normalized_samplers;
+	return variant;
+}
+
+bool PipelineCache::SpirvVariantsConfigured() {
+	return !SpirvVariantSettings().empty();
+}
+
+// KYTY_SPIRV_VARIANT_LIVE (diagnostic, live, default 0): n = draws (renderDraw.cpp) and dispatches
+// (TryGetComputePipeline) run group n's KYTY_SPIRV_VARIANT copies of their programs.
+static Live::Switch g_spirv_variant_live("KYTY_SPIRV_VARIANT_LIVE", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 0;
+});
+
+uint32_t PipelineCache::SpirvVariantLiveGroup() {
+	return static_cast<uint32_t>(g_spirv_variant_live.Get());
+}
+
 // KYTY_LAYER_CLAMP: the least layer count of the bound attachments (0 without any).
 static uint32_t BoundLayerCount(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
                                 bool with_depth) {
@@ -11271,8 +11652,15 @@ void PipelineCache::PrewarmComputePipeline(const ShaderComputeInputInfo& input_i
 }
 
 PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                                              const ShaderProgram& compute_program) {
-	EXIT_IF(!compute_program || !input_info.stage);
+                                                              const ShaderProgram& program_in) {
+	EXIT_IF(!program_in || !input_info.stage);
+	// KYTY_SPIRV_VARIANT_LIVE: the group's edited copy (same bindings and layout) when it has one.
+	ShaderProgram compute_program = program_in;
+	if (const auto group = SpirvVariantLiveGroup(); group != 0 && SpirvVariantsConfigured()) [[unlikely]] {
+		if (const auto variant = SpirvVariantProgram(program_in, group)) {
+			compute_program = variant;
+		}
+	}
 	// A call-split program (CallSplit.h) builds in the background too, and never waits.
 	const bool call_split =
 	    input_info.stage.program->bindings.call_state_dword != ShaderRecompiler::IR::PushData::NoStart;

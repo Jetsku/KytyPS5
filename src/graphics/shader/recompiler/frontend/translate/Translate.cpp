@@ -1624,8 +1624,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			// ESVertCount describes input vertices, independently of lane ordinals.
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
+			// KYTY_VS_FULL_WAVE: one full wave of vertices (the EXEC it builds is constant).
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      entry_ir.BitwiseOr(active_lane_count(), IR::U32(IR::Value(1u << 28u))));
+			                      GetCodegenOptions().vs_full_wave
+			                          ? IR::U32(IR::Value(options.wave_size | (1u << 28u)))
+			                          : entry_ir.BitwiseOr(active_lane_count(), IR::U32(IR::Value(1u << 28u))));
 			const auto* vertex_input = options.input_info.vertex;
 			if (vertex_input != nullptr && vertex_input->indirect_vertex_base) {
 				// KYTY_INDIRECT_VERTEX_BASE: as the GPU's, an indirect draw's index VGPR excludes the
