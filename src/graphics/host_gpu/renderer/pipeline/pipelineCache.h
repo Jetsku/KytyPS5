@@ -199,6 +199,8 @@ public:
 	// VariantsConfigured: any group is set.
 	[[nodiscard]] static ShaderProgram SpirvVariantProgram(const ShaderProgram& program, uint32_t group);
 	[[nodiscard]] static bool          SpirvVariantsConfigured();
+	// KYTY_SPIRV_VARIANT_LIVE (live, default 0): the group draws and dispatches run (0 = none).
+	[[nodiscard]] static uint32_t      SpirvVariantLiveGroup();
 
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,

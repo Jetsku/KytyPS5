@@ -3309,11 +3309,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 // once with only them, each pass keeping its slots' masks and blends. KYTY_MRT_SPLIT=0 binds them
 // together as before.
 static Live::Switch g_mrt_split("KYTY_MRT_SPLIT", Live::ParseDefaultOn); // live
-// KYTY_SPIRV_VARIANT_LIVE (diagnostic, live, default 0): n = draws run group n's KYTY_SPIRV_VARIANT
-// copies of their programs (pipelineCache.cpp) instead of the programs themselves.
-static Live::Switch          g_spirv_variant_live("KYTY_SPIRV_VARIANT_LIVE", [](const char* value) -> int64_t {
-    return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 0;
-});
+// KYTY_SPIRV_VARIANT_LIVE (PipelineCache::SpirvVariantLiveGroup): draws run that group's copies.
 static std::atomic<uint64_t> g_spirv_variant_draws {0};
 // KYTY_DRAW_SKIP_VS / KYTY_DRAW_SKIP_PS=<hex hash>[,<hex hash>...] (diagnostic, live, default off, up
 // to 64 hashes each): draws with one of these vertex / pixel programs emit no draw command.
@@ -7405,7 +7401,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// prepared plan's pipeline is then not used.
 	PipelineCache::GraphicsPrograms variant_programs;
 	bool                            variant_used = false;
-	if (const auto variant_group = static_cast<uint32_t>(g_spirv_variant_live.Get());
+	if (const auto variant_group = PipelineCache::SpirvVariantLiveGroup();
 	    variant_group != 0 && PipelineCache::SpirvVariantsConfigured()) [[unlikely]] {
 		variant_programs = *programs;
 		if (state.ps_active) {

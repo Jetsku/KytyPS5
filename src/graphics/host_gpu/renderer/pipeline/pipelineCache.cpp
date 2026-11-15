@@ -2364,6 +2364,7 @@ std::vector<uint32_t> ApplySpirvTry(std::span<const uint32_t> code, const std::s
 //      buffer indices (pictures are right only where every bound buffer's offset is 0);
 //   p  drops every NoContraction decoration ("precise": KYTY_MAD_MODE's unfused position math);
 //   x  removes the body of a module with one function (cost probe: outputs undefined);
+//   d  drops the f32 denormal-flush selects (results differ only for denormal inputs);
 //   F  limits the group to fragment shaders.
 struct SpirvVariantGroup {
 	std::string           flags;
@@ -2434,7 +2435,45 @@ std::vector<uint32_t> ApplySpirvVariantEdits(std::span<const uint32_t> code, con
 	const bool nooffs  = flags.find('o') != std::string::npos;
 	const bool noprec  = flags.find('p') != std::string::npos;
 	const bool nobody  = flags.find('x') != std::string::npos;
-	if ((!early && !notex && !nokill && !nooffs && !noprec && !nobody) || code.size() < 5) return {};
+	const bool nodnz   = flags.find('d') != std::string::npos;
+	if ((!early && !notex && !nokill && !nooffs && !noprec && !nobody && !nodnz) || code.size() < 5) return {};
+	// d: Select(ULessThan(x & 0x7fffffff, 0x800000), x & 0x80000000, x) (the f32 denormal flush the
+	// translator emits before transcendental and compare inputs) becomes x.
+	std::unordered_map<uint32_t, uint32_t> dnz_source; // select result -> x
+	if (nodnz) {
+		std::unordered_map<uint32_t, uint32_t>                 constants;
+		std::unordered_map<uint32_t, std::array<uint32_t, 3>> defs; // id -> {opcode, a, b}
+		for (size_t i = 5; i < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			const uint32_t op    = code[i] & 0xffffu;
+			if (count == 0 || i + count > code.size()) return {};
+			if (op == 43 && count == 4) constants[code[i + 2]] = code[i + 3];
+			if ((op == 199 /* OpBitwiseAnd */ || op == 176 /* OpULessThan */) && count == 5) {
+				defs[code[i + 2]] = {op, code[i + 3], code[i + 4]};
+			}
+			if (op == 169 /* OpSelect */ && count == 6) {
+				const auto is_const = [&](uint32_t id, uint32_t value) {
+					const auto c = constants.find(id);
+					return c != constants.end() && c->second == value;
+				};
+				const auto masked = [&](uint32_t id, uint32_t mask, uint32_t& x) {
+					const auto d = defs.find(id);
+					if (d == defs.end() || d->second[0] != 199) return false;
+					if (is_const(d->second[2], mask)) { x = d->second[1]; return true; }
+					if (is_const(d->second[1], mask)) { x = d->second[2]; return true; }
+					return false;
+				};
+				const auto cond = defs.find(code[i + 3]);
+				uint32_t   x1 = 0, x2 = 0;
+				if (cond != defs.end() && cond->second[0] == 176 && is_const(cond->second[2], 0x00800000u) &&
+				    masked(cond->second[1], 0x7fffffffu, x1) && masked(code[i + 4], 0x80000000u, x2) &&
+				    x1 == x2 && code[i + 5] == x1) {
+					dnz_source[code[i + 2]] = x1;
+				}
+			}
+			i += count;
+		}
+	}
 	// x: a module with one function whose body becomes its first block's variables and OpReturn
 	// (the stage's cost probe: outputs are undefined).
 	if (nobody) {
@@ -2569,6 +2608,12 @@ std::vector<uint32_t> ApplySpirvVariantEdits(std::span<const uint32_t> code, con
 		if (nokill && (op == 252 /* OpKill */ || op == 4416 /* OpTerminateInvocation */) && count == 1) {
 			// A block must end in a terminator: return instead (the shader's outputs stay as written).
 			out.back() = (1u << 16u) | 253u; // OpReturn
+			changed++;
+		}
+		if (nodnz && op == 169 && count == 6 && dnz_source.contains(code[i + 2])) {
+			out.resize(out.size() - count);
+			out.insert(out.end(), {(4u << 16u) | 83u /* OpCopyObject */, code[i + 1], code[i + 2],
+			                       dnz_source[code[i + 2]]});
 			changed++;
 		}
 		if (noprec && op == 71 /* OpDecorate */ && count == 3 && code[i + 2] == 42 /* NoContraction */) {
@@ -10465,6 +10510,16 @@ bool PipelineCache::SpirvVariantsConfigured() {
 	return !SpirvVariantSettings().empty();
 }
 
+// KYTY_SPIRV_VARIANT_LIVE (diagnostic, live, default 0): n = draws (renderDraw.cpp) and dispatches
+// (TryGetComputePipeline) run group n's KYTY_SPIRV_VARIANT copies of their programs.
+static Live::Switch g_spirv_variant_live("KYTY_SPIRV_VARIANT_LIVE", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 0;
+});
+
+uint32_t PipelineCache::SpirvVariantLiveGroup() {
+	return static_cast<uint32_t>(g_spirv_variant_live.Get());
+}
+
 // KYTY_LAYER_CLAMP: the least layer count of the bound attachments (0 without any).
 static uint32_t BoundLayerCount(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
                                 bool with_depth) {
@@ -11597,8 +11652,15 @@ void PipelineCache::PrewarmComputePipeline(const ShaderComputeInputInfo& input_i
 }
 
 PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                                              const ShaderProgram& compute_program) {
-	EXIT_IF(!compute_program || !input_info.stage);
+                                                              const ShaderProgram& program_in) {
+	EXIT_IF(!program_in || !input_info.stage);
+	// KYTY_SPIRV_VARIANT_LIVE: the group's edited copy (same bindings and layout) when it has one.
+	ShaderProgram compute_program = program_in;
+	if (const auto group = SpirvVariantLiveGroup(); group != 0 && SpirvVariantsConfigured()) [[unlikely]] {
+		if (const auto variant = SpirvVariantProgram(program_in, group)) {
+			compute_program = variant;
+		}
+	}
 	// A call-split program (CallSplit.h) builds in the background too, and never waits.
 	const bool call_split =
 	    input_info.stage.program->bindings.call_state_dword != ShaderRecompiler::IR::PushData::NoStart;
