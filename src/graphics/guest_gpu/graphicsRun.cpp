@@ -531,6 +531,25 @@ static uint64_t CpNowNs() {
 	                                 .count());
 }
 
+// KYTY_LIVE_TEST_CP_DRAW_SPIN_NS=<ns> (default 0, live): busy-waits that long on the command
+// processor's thread at every indexed draw it executes: a known commit cost spread over the frame
+// (KYTY_LIVE_TEST_CP_SPIN_US lands after the flip, where the thread may have slack).
+static Live::Switch g_test_cp_draw_spin_ns("KYTY_LIVE_TEST_CP_DRAW_SPIN_NS", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 1000000ul));
+});
+
+static void CpTestDrawSpin() {
+	const auto ns = g_test_cp_draw_spin_ns.Get();
+	if (ns <= 0) {
+		return;
+	}
+	const auto end = CpNowNs() + static_cast<uint64_t>(ns);
+	while (CpNowNs() < end) {
+		_mm_pause();
+	}
+}
+
 // cp.csv label rows (KYTY_HANG_TRACE_CP).
 static void TraceCpLabel(const char* kind, const void* dst, uint64_t value, uint64_t size) {
 	// KYTY_READ_FAULT_DIAG: label writes (not deferral notes) the guest may already see.
@@ -3233,6 +3252,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 }
 
 void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
+	CpTestDrawSpin();
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
