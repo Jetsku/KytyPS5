@@ -90,12 +90,17 @@ public:
 	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
+	                                                   vk::AccessFlagBits::eMemoryWrite,
+	              bool            batch              = false);
 	// Several non-overlapping regions from `source` in one copy command, with one barrier pair over
 	// the spans the regions cover (KYTY_BDA_LIVE_BATCH page-table entry writes).
 	void CopyRegionsFrom(CommandBuffer& command, const Buffer& source, std::span<const vk::BufferCopy> regions,
 	                     vk::AccessFlags source_before = vk::AccessFlagBits::eMemoryWrite);
-	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// batch: the caller records nothing through a native handle obtained before this call until the
+	// next barrier flush point, so KYTY_DMA_BARRIER_BATCH may leave the after barriers queued.
+	void Fill(uint64_t offset, uint64_t size, uint32_t value, bool batch = false);
+	// KYTY_DMA_BARRIER_BATCH (streamBuffer.cpp; live, default off).
+	[[nodiscard]] static bool DmaBarrierBatchEnabled();
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;

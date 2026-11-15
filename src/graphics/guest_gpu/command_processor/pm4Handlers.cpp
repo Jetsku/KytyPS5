@@ -2931,7 +2931,7 @@ void CommandProcessor::ExecReleaseMem(const CpSeq::ReleaseMemOp& op) {
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			EmitGlobalBarrier();
+			EmitGlobalBarrier(GuestBarrierKind::ReleaseMem);
 		}
 
 		// INT_SEL does not gate DATA_SEL on RDNA: write the data too (KYTY_EOP_DROPPED_LABELS).
@@ -2948,7 +2948,7 @@ void CommandProcessor::ExecReleaseMem(const CpSeq::ReleaseMemOp& op) {
 
 	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			EmitGlobalBarrier();
+			EmitGlobalBarrier(GuestBarrierKind::ReleaseMem);
 		}
 
 		trigger_interrupt();
@@ -2957,7 +2957,7 @@ void CommandProcessor::ExecReleaseMem(const CpSeq::ReleaseMemOp& op) {
 	}
 
 	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
-		EmitGlobalBarrier();
+		EmitGlobalBarrier(GuestBarrierKind::ReleaseMem);
 	}
 
 	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
