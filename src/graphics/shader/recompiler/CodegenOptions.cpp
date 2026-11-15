@@ -8,6 +8,7 @@
 #include <mutex>
 #include <tuple>
 #include <utility>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -23,6 +24,17 @@ bool EnvFlag(const char* name, bool default_value) {
 		return default_value;
 	}
 	return std::strcmp(value, "0") != 0;
+}
+
+// The value "nvidia" of a switch that ApplyHostVendor resolves.
+bool EnvNamesNvidia(const char* name) {
+	const auto* value = std::getenv(name);
+	return value != nullptr && std::strcmp(value, "nvidia") == 0;
+}
+
+// EnvFlag for those switches: "nvidia" stays off until ApplyHostVendor has seen the device.
+bool EnvFlagVendor(const char* name, bool default_value) {
+	return !EnvNamesNvidia(name) && EnvFlag(name, default_value);
 }
 
 CodegenOptions FromEnvironment() {
@@ -54,7 +66,7 @@ CodegenOptions FromEnvironment() {
 	options.lane_local          = EnvFlag("KYTY_LANE_LOCAL", options.lane_local);
 	options.readonly_buffers    = EnvFlag("KYTY_READONLY_BUFFERS", options.readonly_buffers);
 	options.native_f16     = EnvFlag("KYTY_NATIVE_F16", options.native_f16);
-	options.f32_flush_host = EnvFlag("KYTY_F32_FLUSH_HOST", options.f32_flush_host);
+	options.f32_flush_host = EnvFlagVendor("KYTY_F32_FLUSH_HOST", options.f32_flush_host);
 	if (const auto* glc = std::getenv("KYTY_COHERENT_GLC_ONLY"); glc != nullptr && glc[0] != '\0') {
 		options.coherent_glc_only = std::strcmp(glc, "2") == 0 ? 2u : std::strcmp(glc, "0") == 0 ? 0u : 1u;
 	}
@@ -231,7 +243,7 @@ CodegenOptions FromEnvironment() {
 	options.lane_reductions   = EnvFlag("KYTY_LANE_REDUCTIONS", options.lane_reductions);
 	options.ir_linear_uses    = EnvFlag("KYTY_IR_LINEAR_USES", options.ir_linear_uses);
 	options.fold_lane_masks   = EnvFlag("KYTY_FOLD_LANE_MASKS", options.fold_lane_masks);
-	options.vs_full_wave      = EnvFlag("KYTY_VS_FULL_WAVE", options.vs_full_wave);
+	options.vs_full_wave      = EnvFlagVendor("KYTY_VS_FULL_WAVE", options.vs_full_wave);
 	options.int_mrt_outputs   = EnvFlag("KYTY_INT_MRT_OUTPUTS", options.int_mrt_outputs);
 	options.ufloat_store_rtz = EnvFlag("KYTY_UFLOAT_STORE_RTZ", options.ufloat_store_rtz);
 	if (const auto* cap = std::getenv("KYTY_DISPATCHER_CAP"); cap != nullptr && cap[0] != '\0') {
@@ -295,7 +307,7 @@ CodegenOptions FromEnvironment() {
 	}
 	options.ps_per_vertex = EnvFlag("KYTY_PS_PER_VERTEX", options.ps_per_vertex);
 	options.clip_guard    = EnvFlag("KYTY_CLIP_GUARD", options.clip_guard);
-	options.lds_slots     = EnvFlag("KYTY_LDS_SLOTS", options.lds_slots);
+	options.lds_slots     = EnvFlagVendor("KYTY_LDS_SLOTS", options.lds_slots);
 	options.float_store_clamp = EnvFlag("KYTY_FLOAT_STORE_CLAMP", options.float_store_clamp);
 	options.vte_cntl          = EnvFlag("KYTY_VTE_CNTL", options.vte_cntl);
 	options.snapshot_written_guard =
@@ -405,6 +417,24 @@ bool MadExactProgram(uint32_t stage, uint64_t shader_hash) {
 
 void SetCodegenOptions(const CodegenOptions& options) {
 	Storage() = options;
+}
+
+void ApplyHostVendor(uint32_t vendor_id) {
+	constexpr uint32_t NvidiaVendorId = 0x10deu;
+	const bool         nvidia         = vendor_id == NvidiaVendorId;
+	auto&              options        = Storage();
+	const auto         apply          = [nvidia, vendor_id](const char* name, bool& option) {
+		if (!EnvNamesNvidia(name)) {
+			return;
+		}
+		option = nvidia;
+		// On the console, with the other "Kyty GPU capabilities:" lines of a player's log.
+		std::printf("Kyty GPU capabilities: %s=nvidia is %s (device vendor 0x%04x)\n", name,
+		            nvidia ? "on" : "off", vendor_id);
+	};
+	apply("KYTY_F32_FLUSH_HOST", options.f32_flush_host);
+	apply("KYTY_VS_FULL_WAVE", options.vs_full_wave);
+	apply("KYTY_LDS_SLOTS", options.lds_slots);
 }
 
 namespace {

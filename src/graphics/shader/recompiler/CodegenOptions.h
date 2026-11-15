@@ -1059,6 +1059,10 @@ void SetMadExactFilter(MadExactFilter filter);
 // The program uses MadMode::Exact because of the filter (false while it is inactive).
 [[nodiscard]] bool MadExactProgram(uint32_t stage, uint64_t shader_hash);
 void SetCodegenOptions(const CodegenOptions& options);
+// KYTY_F32_FLUSH_HOST, KYTY_VS_FULL_WAVE and KYTY_LDS_SLOTS take the value "nvidia": on only when
+// the selected device is an NVIDIA one (vendor 0x10de), off otherwise. Called by the device layer
+// once the device is chosen, before any program is translated or fingerprinted.
+void ApplyHostVendor(uint32_t vendor_id);
 
 // The BVH lowering mode in effect on this thread: rt_function, unless this thread overrides it
 // (KYTY_RT_DUMP_DIR also emits each RT module inline, mode 0, for size and build-time comparisons).

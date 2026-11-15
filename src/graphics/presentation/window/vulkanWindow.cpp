@@ -1137,6 +1137,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			     ShaderRecompiler::Spirv::CoherentLoadModeName(mode));
 		}
 	}
+	// Codegen switches with the value "nvidia" (CodegenOptions.h).
+	ShaderRecompiler::ApplyHostVendor(properties2.properties.vendorID);
 	// KYTY_MESH_LAYER=drop|amd (default keep; GT7 fork 67d59fe29): mesh shaders without their Layer
 	// output, on any GPU or on an AMD GPU only, whose Windows driver crashed making those pipelines.
 	{

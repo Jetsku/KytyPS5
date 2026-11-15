@@ -19,5 +19,8 @@
   "KYTY_IMG_DEPTHALIAS": "1",
   "KYTY_IMG_INPLACE": "1",
   "KYTY_IMG_PARTNER": "1",
-  "KYTY_SMALL_CPU_RULE": "1"
+  "KYTY_SMALL_CPU_RULE": "1",
+  "KYTY_F32_FLUSH_HOST": "nvidia",
+  "KYTY_LDS_SLOTS": "nvidia",
+  "KYTY_VS_FULL_WAVE": "nvidia"
 }
