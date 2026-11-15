@@ -194,6 +194,11 @@ public:
 	// KYTY_LOD_STATS_PLAIN_VARIANT: the prepared pixel program compiled without GET_LOD_STATS
 	// feedback (same bindings and pipeline layout), or an empty program when it has none.
 	[[nodiscard]] static ShaderProgram PlainPixelProgram(const StagePrep& prep);
+	// KYTY_SPIRV_VARIANT (diagnostic): group `group`'s (1-based) edited copy of `program` (same
+	// bindings and layout, an id of its own), or an empty program when it has none.
+	// VariantsConfigured: any group is set.
+	[[nodiscard]] static ShaderProgram SpirvVariantProgram(const ShaderProgram& program, uint32_t group);
+	[[nodiscard]] static bool          SpirvVariantsConfigured();
 
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,

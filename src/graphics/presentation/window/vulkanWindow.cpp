@@ -1609,6 +1609,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext        = const_cast<void*>(create_info.pNext);
 		create_info.pNext         = &maintenance8;
 	}
+	// KYTY_PIPELINE_STATS: pipelineExecutableInfo (the extension was added only when requested).
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_info {};
+	if (HasExtension(device_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+		executable_info.pipelineExecutableInfo = VK_TRUE;
+		executable_info.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                      = &executable_info;
+		PipelineStats::SetEnabled(true);
+	}
 	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT pipeline_library {};
 	if (graphics.pipeline_library_enabled) {
 		pipeline_library.graphicsPipelineLibrary = VK_TRUE;
@@ -2445,6 +2453,14 @@ void WindowContext::CreateVulkan() {
 			// KYTY_DEVICE_FAULT_EXT=1 (diagnostic): only VK_EXT_device_fault, no checkpoints or NV
 			// diagnostics config, so the game runs at full speed; a loss prints the fault info.
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		// KYTY_PIPELINE_STATS (pipelineFeedback.h, diagnostic): the driver's per-pipeline statistics.
+		if (PipelineStats::Requested()) {
+			if (HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			} else {
+				std::printf("KYTY_PIPELINE_STATS: the driver lacks VK_KHR_pipeline_executable_properties\n");
+			}
 		}
 		if (AddressBindingReportRequested() &&
 		    HasExtension(available_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {

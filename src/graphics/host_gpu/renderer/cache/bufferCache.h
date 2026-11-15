@@ -500,7 +500,7 @@ public:
 	};
 	[[nodiscard]] PageStates CountPageStates(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size);
-	void               ProcessFaultBuffer();
+	void               ProcessFaultBuffer(const std::vector<std::pair<uint64_t, uint64_t>>& mapped = {});
 	// Caller holds the mapped-range lock. Cache/tracker iteration remains on the GPU thread.
 	void               SynchronizeBdaBuffers(const RangeSet& mapped_ranges);
 	// Map/unmap callers may run outside the GPU thread, under the mapped-range lock.

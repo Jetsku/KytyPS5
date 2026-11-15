@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -7,6 +8,11 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::PipelineFeedback {
 
@@ -56,9 +62,21 @@ vk::Result CreateGraphics(vk::Device device, vk::PipelineCache cache, const vk::
                           vk::Pipeline* pipeline, Path path) {
 	// KYTY_EMPTY_FS: the driver's copy only (the caller keyed the original).
 	EmptyFragment::Storage storage;
-	const auto&            info = EmptyFragment::Apply(original, storage);
+	const auto&            plain_info = EmptyFragment::Apply(original, storage);
+	// KYTY_PIPELINE_STATS: the driver's copy asks for statistics.
+	vk::GraphicsPipelineCreateInfo stats_info;
+	const bool                     stats = PipelineStats::Enabled() && PipelineStats::Selected(plain_info);
+	if (stats) {
+		stats_info = plain_info;
+		stats_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
+	const auto& info = stats ? stats_info : plain_info;
 	if (!Enabled()) {
-		return device.createGraphicsPipelines(cache, 1, &info, nullptr, pipeline);
+		const auto made = device.createGraphicsPipelines(cache, 1, &info, nullptr, pipeline);
+		if (stats && made == vk::Result::eSuccess && *pipeline != nullptr) {
+			PipelineStats::Print(device, *pipeline, PipelineStats::Describe(info.pStages, info.stageCount), info.flags);
+		}
+		return made;
 	}
 	vk::PipelineCreationFeedback           whole {};
 	vk::PipelineCreationFeedbackCreateInfo feedback {};
@@ -85,6 +103,9 @@ vk::Result CreateGraphics(vk::Device device, vk::PipelineCache cache, const vk::
 		c.compiles.fetch_add(1, std::memory_order_relaxed);
 		c.compile_ns.fetch_add(ns, std::memory_order_relaxed);
 		Max(c.compile_max_ns, ns);
+	}
+	if (stats && result == vk::Result::eSuccess && *pipeline != nullptr) {
+		PipelineStats::Print(device, *pipeline, PipelineStats::Describe(info.pStages, info.stageCount), info.flags);
 	}
 	return result;
 }
@@ -116,6 +137,153 @@ std::string Report() {
 }
 
 } // namespace Libs::Graphics::PipelineFeedback
+
+namespace Libs::Graphics::PipelineStats {
+
+namespace {
+
+struct Selection {
+	bool                  all = false;
+	std::vector<uint64_t> hashes;
+};
+
+const Selection& Settings() {
+	static const Selection selection = [] {
+		Selection parsed;
+		const char* value = std::getenv("KYTY_PIPELINE_STATS");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return parsed;
+		const std::string text(value);
+		if (text == "all" || text == "1") {
+			parsed.all = true;
+			return parsed;
+		}
+		size_t at = 0;
+		while (at < text.size()) {
+			const auto next = text.find(',', at);
+			const auto item = text.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			if (!item.empty()) parsed.hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		return parsed;
+	}();
+	return selection;
+}
+
+struct ModuleName {
+	const char* stage = "";
+	uint64_t    hash  = 0;
+};
+
+std::mutex                                        g_mutex;
+std::unordered_map<VkShaderModule, ModuleName>    g_modules;
+std::unordered_set<VkPipeline>                    g_printed;
+std::atomic<bool>                                 g_enabled {false};
+
+bool HashSelected(uint64_t hash) {
+	const auto& s = Settings();
+	return s.all || std::ranges::find(s.hashes, hash) != s.hashes.end() ||
+	       std::ranges::find(s.hashes, hash & 0xffffffffull) != s.hashes.end() ||
+	       std::ranges::find(s.hashes, hash >> 32u) != s.hashes.end();
+}
+
+} // namespace
+
+bool Requested() {
+	const auto& s = Settings();
+	return s.all || !s.hashes.empty();
+}
+
+void SetEnabled(bool on) {
+	g_enabled.store(on && Requested(), std::memory_order_relaxed);
+	if (on && Requested()) {
+		std::printf("Kyty pipeline stats: on (KYTY_PIPELINE_STATS)\n");
+	}
+}
+
+bool Enabled() {
+	return g_enabled.load(std::memory_order_relaxed);
+}
+
+void RegisterModule(vk::ShaderModule module, const char* stage, uint64_t hash) {
+	if (!Enabled() || module == nullptr) return;
+	std::scoped_lock lock(g_mutex);
+	g_modules[static_cast<VkShaderModule>(module)] = {stage, hash};
+}
+
+bool Selected(vk::ShaderModule module) {
+	if (!Enabled() || module == nullptr) return false;
+	std::scoped_lock lock(g_mutex);
+	const auto it = g_modules.find(static_cast<VkShaderModule>(module));
+	return it != g_modules.end() && HashSelected(it->second.hash);
+}
+
+bool Selected(const vk::GraphicsPipelineCreateInfo& info) {
+	if (!Enabled() || info.pStages == nullptr) return false;
+	for (uint32_t i = 0; i < info.stageCount; i++) {
+		if (Selected(info.pStages[i].module)) return true;
+	}
+	return false;
+}
+
+std::string Describe(const vk::PipelineShaderStageCreateInfo* stages, uint32_t count) {
+	std::string out;
+	std::scoped_lock lock(g_mutex);
+	for (uint32_t i = 0; i < count && stages != nullptr; i++) {
+		const auto it = g_modules.find(static_cast<VkShaderModule>(stages[i].module));
+		if (it == g_modules.end()) continue;
+		out += fmt::format("{}{}:0x{:016x}", out.empty() ? "" : "|", it->second.stage, it->second.hash);
+	}
+	return out;
+}
+
+void Print(vk::Device device, vk::Pipeline pipeline, const std::string& what, vk::PipelineCreateFlags flags) {
+	{
+		std::scoped_lock lock(g_mutex);
+		if (!g_printed.insert(static_cast<VkPipeline>(pipeline)).second || g_printed.size() > 4096) return;
+	}
+	vk::PipelineInfoKHR pipeline_info {};
+	pipeline_info.pipeline = pipeline;
+	uint32_t count         = 0;
+	if (device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, nullptr) != vk::Result::eSuccess) return;
+	std::vector<vk::PipelineExecutablePropertiesKHR> executables(count);
+	if (device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, executables.data()) != vk::Result::eSuccess) {
+		return;
+	}
+	std::string line = fmt::format("Pipeline stats: {}{}:", what,
+	                               (flags & vk::PipelineCreateFlagBits::eDisableOptimization) ? " (unoptimized)" : "");
+	for (uint32_t e = 0; e < count; e++) {
+		vk::PipelineExecutableInfoKHR exec {};
+		exec.pipeline        = pipeline;
+		exec.executableIndex = e;
+		uint32_t n           = 0;
+		if (device.getPipelineExecutableStatisticsKHR(&exec, &n, nullptr) != vk::Result::eSuccess) continue;
+		std::vector<vk::PipelineExecutableStatisticKHR> stats(n);
+		if (device.getPipelineExecutableStatisticsKHR(&exec, &n, stats.data()) != vk::Result::eSuccess) continue;
+		line += fmt::format(" [{} sg{}", executables[e].name.data(), executables[e].subgroupSize);
+		for (uint32_t s = 0; s < n; s++) {
+			const auto& st = stats[s];
+			switch (st.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					line += fmt::format(" {}={}", st.name.data(), st.value.b32 ? 1 : 0);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					line += fmt::format(" {}={}", st.name.data(), st.value.i64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					line += fmt::format(" {}={}", st.name.data(), st.value.u64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+					line += fmt::format(" {}={:.3f}", st.name.data(), st.value.f64);
+					break;
+			}
+		}
+		line += "]";
+	}
+	std::printf("%s\n", line.c_str());
+}
+
+} // namespace Libs::Graphics::PipelineStats
 
 namespace Libs::Graphics::EmptyFragment {
 

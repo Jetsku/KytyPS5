@@ -3309,6 +3309,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 // once with only them, each pass keeping its slots' masks and blends. KYTY_MRT_SPLIT=0 binds them
 // together as before.
 static Live::Switch g_mrt_split("KYTY_MRT_SPLIT", Live::ParseDefaultOn); // live
+// KYTY_SPIRV_VARIANT_LIVE (diagnostic, live, default 0): n = draws run group n's KYTY_SPIRV_VARIANT
+// copies of their programs (pipelineCache.cpp) instead of the programs themselves.
+static Live::Switch          g_spirv_variant_live("KYTY_SPIRV_VARIANT_LIVE", [](const char* value) -> int64_t {
+    return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 0;
+});
+static std::atomic<uint64_t> g_spirv_variant_draws {0};
 // KYTY_DRAW_SKIP_VS / KYTY_DRAW_SKIP_PS=<hex hash>[,<hex hash>...] (diagnostic, live, default off, up
 // to 64 hashes each): draws with one of these vertex / pixel programs emit no draw command.
 struct DrawSkipSet {
@@ -7395,6 +7401,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 	}
+	// KYTY_SPIRV_VARIANT_LIVE: the edited copies of the programs (same bindings and layout); the
+	// prepared plan's pipeline is then not used.
+	PipelineCache::GraphicsPrograms variant_programs;
+	bool                            variant_used = false;
+	if (const auto variant_group = static_cast<uint32_t>(g_spirv_variant_live.Get());
+	    variant_group != 0 && PipelineCache::SpirvVariantsConfigured()) [[unlikely]] {
+		variant_programs = *programs;
+		if (state.ps_active) {
+			if (const auto v = PipelineCache::SpirvVariantProgram(variant_programs.pixel, variant_group)) {
+				variant_programs.pixel = v;
+				variant_used           = true;
+			}
+		}
+		for (auto& vertex: variant_programs.vertex) {
+			if (const auto v = PipelineCache::SpirvVariantProgram(vertex, variant_group)) {
+				vertex       = v;
+				variant_used = true;
+			}
+		}
+		if (variant_used) {
+			programs = &variant_programs;
+			const auto n = g_spirv_variant_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((n & (n - 1)) == 0 && n >= 1024) {
+				std::printf("KYTY_SPIRV_VARIANT_LIVE: %" PRIu64 " draws ran a variant so far\n", n);
+			}
+		}
+	}
 	// KYTY_DRAW_PREP_BINDINGS pipeline: the object the preparing thread found for this key, when
 	// the draw's targets, topology, restart flag and plain-pixel choice are the ones the key was
 	// built for and no pipeline was replaced since (DrawPrep::PlannedPipeline).
@@ -7418,7 +7451,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	const auto* planned_pipeline =
-	    plan_stages && plan->pipeline != nullptr
+	    plan_stages && plan->pipeline != nullptr && !variant_used
 	        ? DrawPrep::PlannedPipeline(pipeline_cache, *plan, colors_span, state.depth_info,
 	                                    topology, primitive_restart_enable, plain_pixel)
 	        : nullptr;

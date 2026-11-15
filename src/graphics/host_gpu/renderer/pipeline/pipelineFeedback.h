@@ -38,6 +38,27 @@ void NoteAdopted(Path path);
 
 } // namespace Libs::Graphics::PipelineFeedback
 
+namespace Libs::Graphics::PipelineStats {
+
+// KYTY_PIPELINE_STATS=<hex hash>[,<hex hash>...] or all (diagnostic, default off): pipelines whose
+// stages include one of these guest shaders (a 32-bit hash matches either half) are created with
+// VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR and the driver's statistics of each executable
+// (VK_KHR_pipeline_executable_properties: registers, instructions, local memory, ...) are printed
+// once per pipeline as "Pipeline stats: ...". Only the driver's copy of the create info changes.
+[[nodiscard]] bool Requested();
+void               SetEnabled(bool on);
+[[nodiscard]] bool Enabled();
+// Every guest shader module, with its stage name and guest hash (FinishPermutation).
+void RegisterModule(vk::ShaderModule module, const char* stage, uint64_t hash);
+// Whether any stage of `info` (or `module`) is a selected guest shader.
+[[nodiscard]] bool Selected(const vk::GraphicsPipelineCreateInfo& info);
+[[nodiscard]] bool Selected(vk::ShaderModule module);
+// The stages' "<stage> 0x<hash>" names.
+[[nodiscard]] std::string Describe(const vk::PipelineShaderStageCreateInfo* stages, uint32_t count);
+void Print(vk::Device device, vk::Pipeline pipeline, const std::string& what, vk::PipelineCreateFlags flags);
+
+} // namespace Libs::Graphics::PipelineStats
+
 namespace Libs::Graphics::EmptyFragment {
 
 // KYTY_EMPTY_FS (default 0 = off; idea from chenxiao07/KytyPS5 5a7fa9a1b): a graphics pipeline the

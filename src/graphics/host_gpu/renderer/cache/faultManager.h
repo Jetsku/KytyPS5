@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -22,7 +23,11 @@ public:
 	KYTY_CLASS_NO_COPY(FaultManager);
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
-	void                  ProcessFaultBuffer();
+	// mapped: the guest GPU mappings [begin, end) (KYTY_FAULT_SCAN_MAPPED scans only their bitmap
+	// words; empty = the whole bitmap).
+	void ProcessFaultBuffer(const std::vector<std::pair<uint64_t, uint64_t>>& mapped = {});
+	// KYTY_FAULT_SCAN_MAPPED is on (the caller then passes the mappings).
+	[[nodiscard]] static bool ScanMappedActive() noexcept;
 
 	// KYTY_BDA_WRITES. Before a dispatch that writes through BDA: clears the written-page bitmap and
 	// the dropped-write counter the first time (the fault buffer's second half, see BufferCache).
@@ -68,6 +73,8 @@ private:
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;
+	// KYTY_FAULT_SCAN_MAPPED: the same scan created with DISPATCH_BASE (created on first use).
+	vk::Pipeline                               m_fault_process_pipeline_base = nullptr;
 	// KYTY_BDA_WRITES only (created on first use).
 	vk::Pipeline                               m_bda_pages_pipeline = nullptr;
 	std::array<std::unique_ptr<Buffer>, BdaSlots> m_bda_downloads;

@@ -6852,8 +6852,8 @@ void BufferCache::ReportVram() {
 	                static_cast<unsigned long long>(m_idle_freed));
 }
 
-void BufferCache::ProcessFaultBuffer() {
-	m_fault_manager.ProcessFaultBuffer();
+void BufferCache::ProcessFaultBuffer(const std::vector<std::pair<uint64_t, uint64_t>>& mapped) {
+	m_fault_manager.ProcessFaultBuffer(mapped);
 }
 
 void BufferCache::NoteBdaRegistered(uint64_t vaddr, uint64_t size) {

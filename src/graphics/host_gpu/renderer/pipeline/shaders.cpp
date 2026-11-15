@@ -774,12 +774,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	// KYTY_PIPELINE_STATS (pipelineFeedback.h): the driver's statistics of selected shaders.
+	const bool stats = PipelineStats::Enabled() && PipelineStats::Selected(compute_module);
+	if (stats) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 
 	if (create_hook != nullptr) {
 		result = (*create_hook)(info, &pipeline.pipeline);
 	} else {
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 		                                                &pipeline.pipeline);
+	}
+	if (stats && result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+		PipelineStats::Print(graphics.device, pipeline.pipeline, PipelineStats::Describe(&info.stage, 1), info.flags);
 	}
 	if (result_out != nullptr) {
 		// The caller can live without this pipeline (an optional ray-tracing kernel): report the
