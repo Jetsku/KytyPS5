@@ -698,6 +698,9 @@ add_kyty_full_emulator_test(sparse_residency_stress_tests "${KYTY_TESTS_DIR}/Spa
 # Times the driver's compile of SPIR-V modules (KYTY_DUMP_SPIRV_MIN_WORDS dumps), offline; a tool, not a test.
 add_executable(pipeline_build_timer EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineBuildTimer.cpp")
 target_link_libraries(pipeline_build_timer Vulkan::Headers)
+# The driver's statistics (registers, binary size, spill) of SPIR-V modules, offline; a tool, not a test.
+add_executable(pipeline_stats_tool EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineStatsTool.cpp")
+target_link_libraries(pipeline_stats_tool Vulkan::Headers)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

@@ -2362,7 +2362,9 @@ std::vector<uint32_t> ApplySpirvTry(std::span<const uint32_t> code, const std::s
 //   k  removes every OpKill / OpTerminateInvocation / OpDemoteToHelperInvocation (pictures may be wrong);
 //   o  reads every buffer byte offset (EmitMemoryOffsets' 8-bit shader_data fields) as 0: constant
 //      buffer indices (pictures are right only where every bound buffer's offset is 0);
-//   p  drops every NoContraction decoration ("precise": KYTY_MAD_MODE's unfused position math).
+//   p  drops every NoContraction decoration ("precise": KYTY_MAD_MODE's unfused position math);
+//   x  removes the body of a module with one function (cost probe: outputs undefined);
+//   F  limits the group to fragment shaders.
 struct SpirvVariantGroup {
 	std::string           flags;
 	std::vector<uint64_t> hashes;
@@ -2598,6 +2600,20 @@ namespace {
 std::vector<uint32_t> SpirvVariantWords(std::span<const uint32_t> code, uint64_t hash, size_t index) {
 	const auto flags = SpirvVariantFlags(hash, index);
 	if (flags.empty()) return {};
+	// F: fragment shaders only (a group "xF@all" removes every pixel shader body, no other stage's).
+	if (flags.find('F') != std::string::npos) {
+		bool fragment = false;
+		for (size_t i = 5; i + 1 < code.size();) {
+			const uint32_t count = code[i] >> 16u;
+			if (count == 0) break;
+			if ((code[i] & 0xffffu) == 15 /* OpEntryPoint */) {
+				fragment = code[i + 1] == 4;
+				break;
+			}
+			i += count;
+		}
+		if (!fragment) return {};
+	}
 	auto       first  = ApplySpirvTry(code, flags, hash);
 	const auto source = first.empty() ? code : std::span<const uint32_t>(first);
 	auto       second = ApplySpirvVariantEdits(source, flags, hash);
