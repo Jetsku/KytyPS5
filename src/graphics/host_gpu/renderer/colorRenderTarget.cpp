@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
@@ -29,10 +30,12 @@ namespace Libs::Graphics {
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
 bool TargetDescMemoEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_TARGET_DESC_MEMO");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

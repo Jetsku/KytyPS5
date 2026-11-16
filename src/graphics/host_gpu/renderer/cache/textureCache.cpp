@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/alignment.h"
@@ -101,10 +102,12 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 // KYTY_IMAGE_ALIAS_AGE=ticks restores the previous rule that frees an overlapped alias after
 // NumFramesBeforeRemoval scheduler ticks, which is usually within the same guest frame.
 static bool AliasAgeByFrames() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_IMAGE_ALIAS_AGE");
 		return value == nullptr || std::strcmp(value, "ticks") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -427,10 +430,12 @@ bool CmaskAliasSupersededEnabled() {
 
 void ClearTrace(const char* site, const char* outcome, uint64_t metadata, uint64_t metadata_size,
                 uint64_t data, uint64_t data_size, uint32_t width, uint32_t height, uint32_t extra) {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CLEAR_TRACE");
 		return value != nullptr && value[0] != '\0' && value[0] != '0';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (!enabled) {
 		return;
 	}
@@ -480,10 +485,12 @@ thread_local uint32_t t_null_compare_funcs = 0;
 
 // KYTY_IMAGE_CONTAINS (see ImageSubresources::Contains).
 bool ImageContainsEnabled() {
-	static const bool on = [] {
+	static constexpr auto on_init = [] {
 		const char* value = std::getenv("KYTY_IMAGE_CONTAINS");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(on_init())>> on_once;
+	const bool& on = on_once.Get(on_init);
 	return on;
 }
 
@@ -504,10 +511,12 @@ bool NullTextureZeroEnabled() {
 }
 
 bool NullCompareDepthEnabled() {
-	static const bool on = [] {
+	static constexpr auto on_init = [] {
 		const char* value = std::getenv("KYTY_NULL_COMPARE_DEPTH");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(on_init())>> on_once;
+	const bool& on = on_once.Get(on_init);
 	return on;
 }
 
@@ -2991,10 +3000,12 @@ void TextureCache::UntrackImageTail(ImageId id) {
 // encoders got the stale bytes of guest memory (noise). usa-ratt/KytyPS5-GT7 reads back up to
 // 32768 KB (rounds 118 and 126); a race writes no GPU linear image above 64 KB.
 static uint64_t SmallLinearReadbackBytes() {
-	static const uint64_t bytes = [] {
+	static constexpr auto bytes_init = [] {
 		const char* value = std::getenv("KYTY_READBACK_SMALL_IMAGES_KB");
 		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(bytes_init())>> bytes_once;
+	const uint64_t& bytes = bytes_once.Get(bytes_init);
 	return bytes;
 }
 
@@ -3170,7 +3181,7 @@ ImageId TextureCache::SingleSampleStencil(ImageId depth_id) {
 }
 
 bool TextureCache::PreserveStencilEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_PRESERVE_STENCIL");
 		const bool  on    = value != nullptr && value[0] == '1';
 		if (on) {
@@ -3178,7 +3189,9 @@ bool TextureCache::PreserveStencilEnabled() {
 			     "(KYTY_PRESERVE_STENCIL=1)\n");
 		}
 		return on;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -3433,7 +3446,7 @@ bool TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 // every frame, 0 before the volume draws; ours restored the last frame's counts). 0 or 1: off (our
 // StencilPlaneReader already covers Erlou's level 1, shader reads of a plane).
 int TextureCache::StencilPlaneSyncLevel() {
-	static const int level = [] {
+	static constexpr auto level_init = [] {
 		const char* value = std::getenv("KYTY_STENCIL_PLANE_SYNC");
 		const int   on    = value == nullptr || value[0] == '\0' ? 2 : (value[0] >= '0' && value[0] <= '9' ? value[0] - '0' : 2);
 		if (on >= 2 && PreserveStencilEnabled()) {
@@ -3441,7 +3454,9 @@ int TextureCache::StencilPlaneSyncLevel() {
 			     on);
 		}
 		return on;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(level_init())>> level_once;
+	const int& level = level_once.Get(level_init);
 	return level;
 }
 
@@ -7015,10 +7030,12 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	// bytes become 0xFF. It needs no readback; the DCC helper when KYTY_DCC_GPU=1 created it,
 	// otherwise a CMASK-only instance.
 	// KYTY_CMASK_NATIVE=0 decides them by readback instead.
-	static const bool native_enabled = [] {
+	static constexpr auto native_enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CMASK_NATIVE");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(native_enabled_init())>> native_enabled_once;
+	const bool& native_enabled = native_enabled_once.Get(native_enabled_init);
 	static_assert(DccClearHelper::ClearCodes[0] == 0x00);
 	if (native_enabled && m_dcc_clear == nullptr && m_cmask_clear == nullptr) {
 		m_cmask_clear = std::make_unique<DccClearHelper>(m_graphics, m_scheduler);
@@ -7188,10 +7205,12 @@ bool TextureCache::ClearFromKnownFill(ImageId id) {
 // relit every frame from its last value keeps such texels for good, and the surfaces that reflect
 // it shade black or NaN, which the temporal and blur passes spread (GT7).
 static bool NanScrubEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_NAN_SCRUB");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -7326,10 +7345,12 @@ void TextureCache::RunNanScrub() {
 }
 
 bool TextureCache::LightGridGuestEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_LIGHT_GRID_GUEST");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -7526,7 +7547,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 // first face's layers or other data (light counts of 65535 a pixel). A binding with no place, or
 // one its view does not fit in, gets an image of its own (logged).
 bool TextureCache::ViewPlacementEnabled() {
-	static const bool on = [] {
+	static constexpr auto on_init = [] {
 		const char* value = std::getenv("KYTY_VIEW_PLACEMENT");
 		const bool  set   = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 		if (set) {
@@ -7534,7 +7555,9 @@ bool TextureCache::ViewPlacementEnabled() {
 			     "(KYTY_VIEW_PLACEMENT)\n");
 		}
 		return set;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(on_init())>> on_once;
+	const bool& on = on_once.Get(on_init);
 	return on;
 }
 
@@ -7959,13 +7982,15 @@ Mode GetMode() {
 }
 
 bool StatsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* stats  = std::getenv("KYTY_TEXEL_IMAGE_LOOKUP_STATS");
 		const auto* commit = std::getenv("KYTY_CP_COMMIT_STATS");
 		return (stats != nullptr && std::strcmp(stats, "1") == 0) ||
 		       (commit != nullptr && commit[0] != '\0' && std::strcmp(commit, "0") != 0) ||
 		       GetMode() == Mode::Verify || GetMode() == Mode::Exit;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled || GetMode() == Mode::Verify || GetMode() == Mode::Exit;
 }
 
@@ -8107,10 +8132,12 @@ ImageId TextureCache::FindImageFromRangeLocked(uint64_t address, uint64_t size, 
 // that many array layers, log its guest range and how many 64 KiB chunks of the guest memory behind
 // it are nonzero, to tell an image that missed guest writes from guest memory that never got them.
 static void ImageLayerDiag(const ImageInfo& info) {
-	static const uint32_t layers = [] {
+	static constexpr auto layers_init = [] {
 		const auto* value = std::getenv("KYTY_IMAGE_LAYER_DIAG");
 		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(layers_init())>> layers_once;
+	const uint32_t& layers = layers_once.Get(layers_init);
 	if (layers == 0 || info.resources.layers != layers || info.data.Empty()) {
 		return;
 	}
@@ -8386,7 +8413,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 // such an image is queued on the block image and copied into its (level, layer) at its next
 // lookup.
 static bool BlockSubresourceWritesEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_BLOCK_SUBRESOURCE_WRITES");
 		const bool  on    = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 		if (on) {
@@ -8394,7 +8421,9 @@ static bool BlockSubresourceWritesEnabled() {
 			            "are copied into their block-compressed image\n");
 		}
 		return on;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -8775,10 +8804,12 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 // KYTY_STENCIL_PLANE_FILL_CLEAR=1 (default off; GT7 preset): ClearImageFromBuffer also takes a fill
 // that covers exactly a depth target's stencil plane as a stencil clear of that target.
 bool StencilPlaneFillClearEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_STENCIL_PLANE_FILL_CLEAR");
 		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -9707,10 +9738,12 @@ struct TexelImageSyncStats {
 TexelImageSyncStats g_texel_image_sync;
 
 bool TexelImageSyncStatsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_TEXEL_IMAGE_SYNC_STATS");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -9840,10 +9873,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 }
 
 bool BufferCache::RawReadImageSyncEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_RAW_READ_IMAGE_SYNC");
 		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -9910,10 +9945,12 @@ bool BufferCache::SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, ui
 }
 
 void BufferCache::PrepareReadRange(uint64_t vaddr, uint64_t size) {
-	static const bool obtains = [] {
+	static constexpr auto obtains_init = [] {
 		const auto* value = std::getenv("KYTY_RAW_READ_IMAGE_SYNC_OBTAINS");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(obtains_init())>> obtains_once;
+	const bool& obtains = obtains_once.Get(obtains_init);
 	if (!obtains || size == 0 || !RawReadImageSyncEnabled() || !m_texture_cache.MayOverlapImages(vaddr, size)) {
 		return;
 	}
@@ -10123,10 +10160,12 @@ uint64_t BufferCache::RecordImageDownload(Buffer& buffer, ImageId id, bool skip_
 // range GPU-dirty until a readback, and images created there later start from those bytes; the
 // Sky Garden water sampled such stale data (a never-written quarter-res input) and rendered white.
 bool BufferCache::ImageWritebackOnGpuWriteEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE");
 		return value != nullptr && std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -11034,10 +11073,12 @@ bool TextureCache::ClearMeta(uint64_t address) {
 }
 
 bool TextureCache::HtileSliceClearEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_HTILE_SLICE_CLEAR");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

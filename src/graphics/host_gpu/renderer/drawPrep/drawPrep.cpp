@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 
@@ -189,23 +190,27 @@ Mode GetMode() {
 }
 
 int VerifyMode() {
-	static const int mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_VERIFY");
 		if (value == nullptr || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const int& mode = mode_once.Get(mode_init);
 	return mode;
 }
 
 CertMode GetCertMode() {
-	static const CertMode mode = [] {
+	static constexpr auto mode_init = [] {
 		// Log by default (Run A audit, CP-ARCHITECTURE-20260927.md: DrawPrepLogMissed 0 in every
 		// scene); KYTY_DRAW_PREP_CERT=value restores the byte and digest comparisons.
 		const auto* value = EnvValue("KYTY_DRAW_PREP_CERT");
 		return value != nullptr && std::strcmp(value, "value") == 0 ? CertMode::Value : CertMode::Log;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const CertMode& mode = mode_once.Get(mode_init);
 	return mode;
 }
 
@@ -236,13 +241,15 @@ bool CertRangesOnWorker() {
 }
 
 int CertRangesVerifyMode() {
-	static const int mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_CERT_RANGES_VERIFY");
 		if (value == nullptr || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const int& mode = mode_once.Get(mode_init);
 	return mode;
 }
 

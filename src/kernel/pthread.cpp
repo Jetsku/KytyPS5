@@ -1,4 +1,5 @@
 #include "common/hleWaitStats.h"
+#include "common/staticOnce.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -284,7 +285,7 @@ struct KernelGuestTscClock {
 };
 
 static const KernelGuestTscClock& KernelGetGuestTscClock() {
-	static const KernelGuestTscClock clock = [] {
+	static constexpr auto clock_init = [] {
 		KernelGuestTscClock c;
 		auto                measured = KernelGetTscFrequencyNative();
 		if (const char* sim = std::getenv("KYTY_HOST_TSC_SIMULATE"); sim != nullptr && *sim != '\0') {
@@ -304,7 +305,9 @@ static const KernelGuestTscClock& KernelGetGuestTscClock() {
 			            measured, c.frequency);
 		}
 		return c;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(clock_init())>> clock_once;
+	const KernelGuestTscClock& clock = clock_once.Get(clock_init);
 	return clock;
 }
 

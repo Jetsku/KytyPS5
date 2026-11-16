@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "common/staticOnce.h"
 
 #include "common/alignment.h"
 #include "common/liveSwitch.h"
@@ -177,10 +178,12 @@ Live::Switch g_defer_cowatch("KYTY_DEFER_PROTECTS_COWATCH", Live::ParseDefaultOn
 // write the co-watcher, e.g. an image, never learns about). Expensive: a 4 KiB hash per page at
 // each point. =N hashes only every Nth page that becomes pending (co-watched pages always).
 uint64_t WindowAuditSample() {
-	static const uint64_t sample = [] {
+	static constexpr auto sample_init = [] {
 		const auto* value = std::getenv("KYTY_DEFER_PROTECTS_WINDOW_AUDIT");
 		return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(sample_init())>> sample_once;
+	const uint64_t& sample = sample_once.Get(sample_init);
 	return sample;
 }
 bool WindowAuditEnabled() {

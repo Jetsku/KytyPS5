@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
@@ -41,7 +42,7 @@ struct TransitSkipConfig {
 	int  verify  = 0; // 1: count and log mismatches, 2: exit on one
 };
 const TransitSkipConfig& TransitSkip() {
-	static const TransitSkipConfig config = [] {
+	static constexpr auto config_init = [] {
 		TransitSkipConfig result;
 		const auto* value = std::getenv("KYTY_IMAGE_TRANSIT_SKIP");
 		result.enabled    = value == nullptr || std::strcmp(value, "0") != 0;
@@ -50,16 +51,20 @@ const TransitSkipConfig& TransitSkip() {
 			result.verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
 		return result;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(config_init())>> config_once;
+	const TransitSkipConfig& config = config_once.Get(config_init);
 	return config;
 }
 
 // KYTY_GUEST_STORAGE_REPEAT (Image::GuestTransitScope): default off.
 bool GuestStorageRepeatEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_GUEST_STORAGE_REPEAT");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 thread_local bool g_guest_transit = false;

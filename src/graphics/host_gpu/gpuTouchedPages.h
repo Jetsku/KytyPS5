@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_GPUTOUCHEDPAGES_H_
 
 #include <algorithm>
+#include "common/staticOnce.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -167,10 +168,12 @@ inline Pages g_pages;
 // would have called it untouched. Nothing is allocated unless it is on.
 enum class DiagSource : uint32_t { BufferDirtyAdd, TrackerGpuMark, ImageGpuModified, PublicationBegin, Count };
 [[nodiscard]] inline bool DiagEnabled() noexcept {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CLEAN_UNTOUCHED_DIAG");
 		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 inline std::array<Pages, static_cast<size_t>(DiagSource::Count)> g_diag_pages;
@@ -188,10 +191,12 @@ inline PagesT<10> g_fine_pages;
 // Maintained from the first transition on when the sequencer thread is configured
 // (KYTY_CP_SEQ=1, read once here so that no mark before the sequencer starts is missed).
 [[nodiscard]] inline bool Enabled() noexcept {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CP_SEQ");
 		return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "thread") == 0);
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/lodStats.h"
+#include "common/staticOnce.h"
 
 #include "common/assert.h"
 #include "common/hangTrace.h"
@@ -60,7 +61,7 @@ bool LodStatsCounter::CountClamped() {
 }
 
 LodStatsCounter::Plain LodStatsCounter::PlainVariant() {
-	static const Plain mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = std::getenv("KYTY_LOD_STATS_PLAIN_VARIANT");
 		Plain result = Plain::On;
 		if (value != nullptr && value[0] != 0) {
@@ -74,7 +75,9 @@ LodStatsCounter::Plain LodStatsCounter::PlainVariant() {
 			                                                                        : "verify");
 		}
 		return result;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const Plain& mode = mode_once.Get(mode_init);
 	return mode;
 }
 

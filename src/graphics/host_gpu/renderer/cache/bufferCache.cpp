@@ -1,4 +1,5 @@
 #include "loader/systemContent.h"
+#include "common/staticOnce.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/watchRange.h"
 
@@ -260,10 +261,12 @@ int BdaDirtyLogVerifyMode() {
 // KYTY_UPLOAD_BATCH_SCOPED_FLUSH=0 restores recording every pending barrier at the end of each
 // outermost UploadBatch scope, even when the scope queued no upload.
 bool UploadBatchScopedFlushEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_UPLOAD_BATCH_SCOPED_FLUSH");
 		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -904,13 +907,15 @@ int BdaEpochVerifyMode() {
 // the transitions other threads can make in between (a page turning CPU-dirty, a GPU-dirty page
 // published) may separate them, and only while the range's mutation serials moved.
 int RelaxedVerifyMode() {
-	static const int mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = std::getenv("KYTY_TRACKER_RELAXED_VERIFY");
 		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const int& mode = mode_once.Get(mode_init);
 	return mode;
 }
 
@@ -5741,10 +5746,12 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// cached buffers and images of the whole range at once (what each page's write fault does)
 		// when any page of it is watched, then write without faulting. GTA V clears DCC metadata
 		// with uniform fills every frame: one fault per tracked page before.
-		static const bool invalidate_first = [] {
+		static constexpr auto invalidate_first_init = [] {
 			const auto* value = std::getenv("KYTY_FILL_INVALIDATE_FIRST");
 			return value != nullptr && std::strcmp(value, "1") == 0;
-		}();
+		};
+		static constinit Common::StaticOnce<std::remove_cvref_t<decltype(invalidate_first_init())>> invalidate_first_once;
+		const bool& invalidate_first = invalidate_first_once.Get(invalidate_first_init);
 		if (invalidate_first) {
 			(void)Libs::LibKernel::Memory::PrepareHostOverwrite(vaddr, size);
 		}

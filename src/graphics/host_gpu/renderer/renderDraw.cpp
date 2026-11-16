@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 #include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
@@ -2522,10 +2523,12 @@ static bool HoldsIndex(const uint8_t* bytes, uint64_t count, uint32_t element_si
 static uint32_t RewriteListReset(const CommandBuffer& buffer, BufferCache& cache,
                                  const DrawIndexBufferSource& source, uint32_t index_count,
                                  std::vector<uint8_t>& rewritten) {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_LIST_RESET");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (!enabled) {
 		return UINT32_MAX;
 	}
@@ -3108,10 +3111,12 @@ static Live::Switch g_occlusion_no_output_draws("KYTY_OCCLUSION_NO_OUTPUT_DRAWS"
 // not: it continues only a committed draw with the same structure key, which hashes every context
 // register, the screen scissor included, and a skipped draw never records a run.
 static bool EmptyScissorSkipEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_EMPTY_SCISSOR_SKIP");
 		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -3390,7 +3395,7 @@ static void NoteMrtSplit(uint32_t slots) {
 // shaders, one stdout line per distinct register state (at most 64): CB_SHADER_MASK,
 // CB_TARGET_MASK, the export formats, the program's colour outputs and the bound targets.
 static void NoteMrtDiag(const CommandBuffer& buffer, const DrawRenderState& state, uint32_t mrt_mask) {
-	static const std::vector<uint64_t> hashes = [] {
+	static constexpr auto hashes_init = [] {
 		std::vector<uint64_t> list;
 		const char*           value = std::getenv("KYTY_MRT_DIAG");
 		for (const char* p = value; p != nullptr && *p != '\0';) {
@@ -3400,7 +3405,9 @@ static void NoteMrtDiag(const CommandBuffer& buffer, const DrawRenderState& stat
 			p = (*end == ',') ? end + 1 : end;
 		}
 		return list;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(hashes_init())>> hashes_once;
+	const std::vector<uint64_t>& hashes = hashes_once.Get(hashes_init);
 	if (hashes.empty() || !state.ps_active || state.ps_input_info.stage.program == nullptr) {
 		return;
 	}
@@ -3524,12 +3531,14 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 	// idea from Erlou93/KytyPS5-Yotei's DRS_EXTENT): one stdout line "DRS_EXTENT frame=<n> depth=<w>x<h>"
 	// whenever the extent of the depth target at that address changes (the game's internal resolution).
 	{
-		static const uint64_t drs_address = [] {
+		static constexpr auto drs_address_init = [] {
 			const char* value = std::getenv("KYTY_TRACE_DRS_EXTENT");
 			if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return uint64_t {0};
 			if (std::strcmp(value, "1") == 0) return uint64_t {0x5002870000ull};
 			return static_cast<uint64_t>(std::strtoull(value, nullptr, 16));
-		}();
+		};
+		static constinit Common::StaticOnce<std::remove_cvref_t<decltype(drs_address_init())>> drs_address_once;
+		const uint64_t& drs_address = drs_address_once.Get(drs_address_init);
 		if (drs_address != 0 && state.depth_info.image_id && state.depth_info.desc.info.data.address == drs_address) {
 			static uint32_t last = 0;
 			const auto&     e    = state.depth_info.desc.info.extent;
@@ -3653,10 +3662,12 @@ static bool SkipFaultBufferEnabled() {
 // stayed black after a shader-cache invalidation). Only draws whose every target was already a
 // render target in at least two earlier presented frames may be skipped; the others wait.
 static bool SkipRecurrentTargetsOnly() {
-	static const bool on = [] {
+	static constexpr auto on_init = [] {
 		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_RECURRENT");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(on_init())>> on_once;
+	const bool& on = on_once.Get(on_init);
 	return on;
 }
 
@@ -5703,10 +5714,12 @@ static bool DrawIsBarrierSafe(std::span<PreparedBindings* const> stages,
 // (FrameEvent.DrawBindingRepeat*: same programs; also the same images and samplers; also the same
 // buffers; also the same user data and flattened SRT words).
 static bool BindingRepeatStatsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_DRAW_BINDING_REPEAT_STATS");
 		return Profiler::AggregateEnabled() && value != nullptr && std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -6053,7 +6066,7 @@ static bool SkipCubeDraw(const CommandBuffer& buffer) {
 // steady-clock ns at recording and at completion, to match screenshots). Ends the rendering
 // instance after each such draw. videoOut.cpp logs a "DrawPeekFlip" marker per guest flip with it.
 static const std::array<uint64_t, 2>& DrawPeekRequest() {
-	static const std::array<uint64_t, 2> request = [] {
+	static constexpr auto request_init = [] {
 		std::array<uint64_t, 2> parsed {0, 200000};
 		if (const auto* value = std::getenv("KYTY_DRAW_PEEK"); value != nullptr) {
 			char* end = nullptr;
@@ -6061,7 +6074,9 @@ static const std::array<uint64_t, 2>& DrawPeekRequest() {
 			if (end != nullptr && *end == ':') parsed[1] = std::strtoull(end + 1, &end, 10);
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(request_init())>> request_once;
+	const std::array<uint64_t, 2>& request = request_once.Get(request_init);
 	return request;
 }
 
@@ -6290,10 +6305,12 @@ struct State {
 	bool        failed  = false;
 };
 static const char* Path() {
-	static const char* path = [] {
+	static constexpr auto path_init = [] {
 		const auto* value = std::getenv("KYTY_DRAW_STATS");
 		return value != nullptr && value[0] != '\0' ? value : static_cast<const char*>(nullptr);
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(path_init())>> path_once;
+	const char* const& path = path_once.Get(path_init);
 	return path;
 }
 static State& Get() {
@@ -6396,7 +6413,7 @@ struct VerifyVsbRequest {
 	std::vector<uint32_t> buffers;
 };
 static const VerifyVsbRequest& VerifyVsb() {
-	static const VerifyVsbRequest request = [] {
+	static constexpr auto request_init = [] {
 		VerifyVsbRequest parsed;
 		if (const auto* value = std::getenv("KYTY_DRAW_VERIFY_VSB"); value != nullptr) {
 			char* end   = nullptr;
@@ -6407,7 +6424,9 @@ static const VerifyVsbRequest& VerifyVsb() {
 			if (parsed.buffers.empty()) parsed.buffers.push_back(0);
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(request_init())>> request_once;
+	const VerifyVsbRequest& request = request_once.Get(request_init);
 	return request;
 }
 
@@ -6632,10 +6651,12 @@ static bool DepthStencilCopyApplies(const HW::Context& hw) {
 }
 
 static bool ListResetEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_LIST_RESET");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -6656,10 +6677,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// KYTY_DRAW_SHADER_MAP=1 (diagnostic): logs once per guest VS/PS address pair the program hashes
 	// (device-loss checkpoints name the guest addresses only).
-	static const bool shader_map = [] {
+	static constexpr auto shader_map_init = [] {
 		const auto* value = std::getenv("KYTY_DRAW_SHADER_MAP");
 		return value != nullptr && value[0] != '\0' && value[0] != '0';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(shader_map_init())>> shader_map_once;
+	const bool& shader_map = shader_map_once.Get(shader_map_init);
 	if (shader_map) {
 		static std::mutex                                 map_mutex;
 		static std::set<std::pair<uint64_t, uint64_t>>    seen;
@@ -6675,7 +6698,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// KYTY_DRAW_TRACE_TARGET=<hex address>[:<count>] (diagnostic): logs the executed draws whose colour
 	// target 0 starts at that guest address (default 200): frame, programs, counts, depth state.
-	static const auto trace_target = [] {
+	static constexpr auto trace_target_init = [] {
 		std::pair<uint64_t, uint32_t> parsed {0, 200};
 		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_TARGET"); value != nullptr) {
 			char* end    = nullptr;
@@ -6683,7 +6706,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (end != nullptr && *end == ':') parsed.second = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(trace_target_init())>> trace_target_once;
+	const auto& trace_target = trace_target_once.Get(trace_target_init);
 	if (trace_target.first != 0 && state.color_count > 0 &&
 	    state.color_info[0].desc.info.data.address == trace_target.first) {
 		static std::atomic<uint32_t> traced {0};
@@ -6723,7 +6748,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// KYTY_DRAW_TRACE_DEPTH=<hex address>[:<count>] (diagnostic): the same for the draws whose depth
 	// target starts at that address, with their colour target 0 and the PS's depth/kill outputs.
-	static const auto trace_depth = [] {
+	static constexpr auto trace_depth_init = [] {
 		std::pair<uint64_t, uint32_t> parsed {0, 200};
 		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_DEPTH"); value != nullptr) {
 			char* end    = nullptr;
@@ -6731,7 +6756,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (end != nullptr && *end == ':') parsed.second = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(trace_depth_init())>> trace_depth_once;
+	const auto& trace_depth = trace_depth_once.Get(trace_depth_init);
 	if (trace_depth.first != 0 && state.depth_info.desc.info.data.address == trace_depth.first) {
 		static std::atomic<uint32_t> traced {0};
 		if (traced.fetch_add(1, std::memory_order_relaxed) < trace_depth.second) {
@@ -6761,7 +6788,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// pixel program: counts and user SGPRs; with <sgpr>:<offset> also the V# at that byte offset of
 	// the pointer in user SGPRs <sgpr>/<sgpr>+1 and the first 64 dwords of its buffer, from guest
 	// memory (with whether a GPU write of them is pending).
-	static const auto trace_ps = [] {
+	static constexpr auto trace_ps_init = [] {
 		std::array<uint64_t, 3> parsed {0, UINT64_MAX, 0};
 		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_PS"); value != nullptr) {
 			char* end = nullptr;
@@ -6772,7 +6799,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(trace_ps_init())>> trace_ps_once;
+	const auto& trace_ps = trace_ps_once.Get(trace_ps_init);
 	if (trace_ps[0] != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
 	    state.ps_input_info.stage.program->shader_hash == trace_ps[0]) {
 		static std::atomic<uint32_t> traced {0};
@@ -6820,7 +6849,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// 10 frames): for the draws with this vertex program, the first 64 dwords of each PS and VS buffer
 	// from guest memory (with whether a GPU write of them is pending), to compare per-draw constants
 	// (fade/dissolve values) between boots.
-	static const auto trace_cb = [] {
+	static constexpr auto trace_cb_init = [] {
 		std::array<uint64_t, 3> parsed {0, 300, 10};
 		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_CB"); value != nullptr) {
 			char* end = nullptr;
@@ -6831,7 +6860,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(trace_cb_init())>> trace_cb_once;
+	const auto& trace_cb = trace_cb_once.Get(trace_cb_init);
 	if (trace_cb[0] != 0 && state.vertex_info[0].stage.program != nullptr &&
 	    state.vertex_info[0].stage.program->shader_hash == trace_cb[0]) {
 		static std::atomic<uint32_t> traced {0};
@@ -8226,10 +8257,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	CommitStats::StepMark(CommitStats::Step::DrawCmd);
-	static const bool occlusion_draw_rows = [] {
+	static constexpr auto occlusion_draw_rows_init = [] {
 		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(occlusion_draw_rows_init())>> occlusion_draw_rows_once;
+	const bool& occlusion_draw_rows = occlusion_draw_rows_once.Get(occlusion_draw_rows_init);
 	const bool occlusion_debug_log = m_context.GetOcclusionCounter().DebugLogActive();
 	if ((occlusion_draw_rows && HangTrace::Enabled() && m_context.GetOcclusionCounter().Active()) ||
 	    occlusion_debug_log) {

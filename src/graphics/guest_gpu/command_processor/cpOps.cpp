@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "common/staticOnce.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +46,8 @@ int VerifyMode() {
 }
 
 bool PacketHashing() {
-	static const bool enabled = ConfiguredMode() != Mode::Off && VerifyMode() != 0;
+	static constinit Common::StaticOnce<bool> enabled_once;
+	const bool& enabled = enabled_once.Get([&] { return ConfiguredMode() != Mode::Off && VerifyMode() != 0; });
 	return enabled;
 }
 

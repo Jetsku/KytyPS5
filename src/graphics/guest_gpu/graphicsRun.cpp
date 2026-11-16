@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/staticOnce.h"
 #include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/inplaceStats.h"
@@ -226,10 +227,12 @@ constexpr int64_t ModeFront    = 2;
 constexpr int64_t ModeVerify   = 0x100;
 
 static bool StatsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CP_DECISION_STATS");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -1193,11 +1196,13 @@ void CommandProcessor::BufferInit() {
 // command buffers cost the command processor fewer ends, begins and state re-emissions; the GPU
 // gets the same work in larger pieces. BryanKAdams' fork batches label submits the same way (2 ms).
 static uint64_t SubmitMinIntervalNs() {
-	static const uint64_t ns = [] {
+	static constexpr auto ns_init = [] {
 		const char* value  = std::getenv("KYTY_SUBMIT_MIN_INTERVAL_US");
 		const auto  parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
 		return std::min<uint64_t>(parsed, 1'000'000ull) * 1000u;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(ns_init())>> ns_once;
+	const uint64_t& ns = ns_once.Get(ns_init);
 	return ns;
 }
 // GPU thread (every command processor runs there): the last submit, with the interval on.
@@ -1680,10 +1685,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 // WAIT_REG_MEM addresses (passed through a split-mode label, or suspended).
 static void LogCpAddress(const char* kind, uint64_t address, uint64_t value, uint64_t size,
                          uint32_t queue) {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* v = std::getenv("KYTY_CP_WRITE_LOG");
 		return v != nullptr && std::strcmp(v, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (!enabled) {
 		return;
 	}
@@ -4370,10 +4377,12 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	// the label's bytes at record time, compared when the deferred write lands. A difference means
 	// the guest wrote the word meanwhile (a reset for its next use, or reused memory such as a
 	// command buffer: Demon's Souls' "unknown op cmd_id 1" theory).
-	static const bool reuse_trace = [] {
+	static constexpr auto reuse_trace_init = [] {
 		const auto* value = std::getenv("KYTY_LABEL_REUSE_TRACE");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(reuse_trace_init())>> reuse_trace_once;
+	const bool& reuse_trace = reuse_trace_once.Get(reuse_trace_init);
 	uint64_t prior = 0;
 	if (reuse_trace && (size == 4 || size == 8)) {
 		std::memcpy(&prior, dst, size);
@@ -4403,13 +4412,13 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	// the GPU thread may take the resulting fault/readback. The interrupt follows the write.
 	scheduler.DeferPriorityOperation(
 	    [renderer, &gpu, address, value, size, tick, interrupt, event_id, interrupt_context_id,
-	     trace_queue, timestamps, timestamp_slot, prior] {
+	     trace_queue, timestamps, timestamp_slot, prior, reuse_trace] {
 		    // The tick has completed, so a timestamp query's result is final.
 		    const uint64_t written =
 		        timestamps != nullptr ? timestamps->TakeDeferred(timestamp_slot, value) : value;
 		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, written, size, tick,
 		                                          interrupt, event_id, interrupt_context_id,
-		                                          trace_queue, prior] {
+		                                          trace_queue, prior, reuse_trace] {
 			    {
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
 				    HangWatchdog::Scope write("deferred-label-write", address, written, tick, size);
@@ -5598,10 +5607,12 @@ struct CpOpStats {
 	uint64_t              last_print_ns = 0;
 };
 bool CpOpStatsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CP_OP_STATS");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 uint64_t CpOpStatsNowNs() {

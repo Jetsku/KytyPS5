@@ -2,6 +2,7 @@
 #define KYTY_COMMON_CRUZ_STATS_H_
 
 #include <atomic>
+#include "common/staticOnce.h"
 #include <chrono>
 #include <cinttypes>
 #include <cstdint>
@@ -34,10 +35,12 @@ inline std::atomic<int64_t>  g_next_report_ns {0};
 } // namespace Detail
 
 [[nodiscard]] inline bool Enabled() noexcept {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CRUZ_STATS");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/staticOnce.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -359,10 +360,12 @@ namespace {
 // KYTY_STORE_IN_PLACE=1: stores to pages protected because the GPU wrote them; KYTY_STORE_CLEAN=1:
 // stores to CPU-clean pages watched for CPU writes (both default off).
 bool StoreInPlaceGpuWritten() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_STORE_IN_PLACE");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

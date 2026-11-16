@@ -421,6 +421,15 @@ Switch g_test_cp_spin_us("KYTY_LIVE_TEST_CP_SPIN_US", [](const char* value) -> i
 
 } // namespace
 
+} // namespace Live
+
+// KYTY_STATIC_ONCE_FAST (common/staticOnce.h; live, default 0).
+namespace Common::StaticOnceDetail {
+Live::Switch g_fast("KYTY_STATIC_ONCE_FAST", Live::ParseDefaultOff);
+} // namespace Common::StaticOnceDetail
+
+namespace Live {
+
 int64_t ParseDefaultOn(const char* value) {
 	return value == nullptr || std::strcmp(value, "0") != 0 ? 1 : 0;
 }

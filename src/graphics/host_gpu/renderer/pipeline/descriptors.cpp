@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "common/staticOnce.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorEncode.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
@@ -347,10 +348,12 @@ static uint64_t StorageRangeCap(const GraphicContext& graphics) {
 // 68-69 read as zero, the 68-69 distance constraint divided 0 by 0, and the NaN guard reset the
 // upper banner to its skinned pose every frame (stiff, sideways katana banner).
 static bool ReadBufferTail() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_READ_BUFFER_TAIL");
 		return value != nullptr && value[0] != '\0' && value[0] != '0';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -4966,7 +4969,7 @@ struct BufferPeekConfig {
 	uint64_t hash = 0, begin = 0, end = 0;
 };
 static const BufferPeekConfig& GetBufferPeekConfig() {
-	static const BufferPeekConfig config = [] {
+	static constexpr auto config_init = [] {
 		BufferPeekConfig c;
 		const char* v = std::getenv("KYTY_BUFFER_PEEK");
 		if (v == nullptr) {
@@ -4981,7 +4984,9 @@ static const BufferPeekConfig& GetBufferPeekConfig() {
 			}
 		}
 		return c;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(config_init())>> config_once;
+	const BufferPeekConfig& config = config_once.Get(config_init);
 	return config;
 }
 
@@ -5694,10 +5699,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 // reset to the depth that passes the comparison: 1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL. None
 // for other functions, bindless samplers, or samplers of one image that disagree.
 static void ResetSparseDepthHoles(TextureCache& texture_cache, const PreparedBindings& prepared) {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_SPARSE_HOLES");
 		return value != nullptr && value[0] == '1';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (!enabled || prepared.runtime == nullptr || !*prepared.runtime) {
 		return;
 	}
@@ -5959,10 +5966,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 // resolved buffers lost one to a join (BufferCache::UnregisterEpoch moved) resolves them again
 // before it is recorded. The first 16 occurrences are logged.
 bool RebindAfterJoinEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_REBIND_AFTER_JOIN");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

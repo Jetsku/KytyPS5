@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/memoryTracker.h"
+#include "common/staticOnce.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -251,10 +252,12 @@ namespace {
 std::atomic<MemoryTracker::OwnerThreadFn> g_lockfree_owner {nullptr};
 
 bool LockFreeDirtyHere() noexcept {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_TRACKER_LOCKFREE_DIRTY");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (!enabled) {
 		return false;
 	}

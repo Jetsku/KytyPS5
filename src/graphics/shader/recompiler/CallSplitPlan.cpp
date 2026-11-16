@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/CallSplitPlan.h"
+#include "common/staticOnce.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -380,10 +381,12 @@ bool Planner::Enabled() {
 	if (const auto value = g_enabled_override.load(std::memory_order_relaxed); value >= 0) {
 		return value != 0;
 	}
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_SHADER_CALLS_SPLIT");
 		return value != nullptr && std::strcmp(value, "0") != 0 && *value != '\0';
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

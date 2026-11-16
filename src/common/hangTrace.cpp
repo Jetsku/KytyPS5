@@ -1,4 +1,5 @@
 #include "common/hangTrace.h"
+#include "common/staticOnce.h"
 
 #include "common/compileWatch.h"
 #include "common/cpuPlacement.h"
@@ -1052,7 +1053,8 @@ bool ImportsEnabled() {
 }
 
 bool CpTraceEnabled() {
-	static const bool enabled = Enabled() && EnvFlag("KYTY_HANG_TRACE_CP", false);
+	static constinit Common::StaticOnce<bool> enabled_once;
+	const bool& enabled = enabled_once.Get([&] { return Enabled() && EnvFlag("KYTY_HANG_TRACE_CP", false); });
 	return enabled;
 }
 
