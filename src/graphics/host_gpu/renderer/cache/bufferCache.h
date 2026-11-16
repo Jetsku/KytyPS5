@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/streamCopyMemo.h"
 #include "graphics/host_gpu/writeTickMap.h"
 
 #include <array>
@@ -295,6 +296,10 @@ public:
 	// becomes resident now and before every later BDA-writing dispatch (its other pages are the
 	// destinations of that and the next dispatches, which would drop their stores and atomics).
 	void NoteBdaFault(uint64_t vaddr, uint64_t size);
+	// KYTY_STREAM_COPY_REUSE (streamCopyMemo.h; command-processor thread): a packet that may write or
+	// wait on guest memory, or a new submission slice, was processed: no small stream copy made
+	// before it is reused after it.
+	void NewStreamEpoch() noexcept { m_stream_copy_memo.NewEpoch(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -1437,6 +1442,8 @@ private:
 	// guest memory holds its current bytes.
 	[[nodiscard]] bool TryInplaceBinding(uint64_t vaddr, uint64_t size, std::pair<Buffer*, uint64_t>& result);
 	StreamBuffer                                      m_stream_buffer;
+	// KYTY_STREAM_COPY_REUSE (streamCopyMemo.h): the small stream copies of the current tick and epoch.
+	StreamCopyMemo                                    m_stream_copy_memo;
 	// KYTY_STREAM_COPY_DEFER: copies encoded for the recorder that it may not have executed yet
 	// (ring position after each), in encoding order from m_deferred_head; [lo, hi) bounds them.
 	struct DeferredCopy {

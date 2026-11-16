@@ -2708,6 +2708,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_yield         = false;
 	execution.m_yielded       = false;
 	m_slice_draws             = 0;
+	// KYTY_STREAM_COPY_REUSE: the guest may have written memory since the last slice.
+	m_renderer.GetBufferCache().NewStreamEpoch();
 	// The draw-prep packet hook, decided once per slice instead of per packet: with draw prep on
 	// it is on for the process (PacketHookEnabled); only the Tracy-gated fence histogram of draw
 	// prep off can change, and it now follows a connection at the next slice.
@@ -5742,6 +5744,14 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 	// checks) may order the dispatches around it: draws, synchronization, labels, waits, flips.
 	if (kind != OpKind::DispatchDirect && kind != OpKind::ReadCheck && GetScheduler().Active()) {
 		GetScheduler().Current().BreakDispatchOverlap();
+	}
+	// KYTY_STREAM_COPY_REUSE (streamCopyMemo.h; based on Senaxx/KytyPS5 8bdb5b43f): any op but a
+	// draw or dispatch (labels, writes, DMA, waits, flips, predication, ...) may write or wait on
+	// guest memory: small stream copies made before it are not reused after it.
+	if (kind != OpKind::DrawIndex && kind != OpKind::DrawAuto && kind != OpKind::DrawIndirect &&
+	    kind != OpKind::DrawIndirectMulti && kind != OpKind::DispatchDirect &&
+	    kind != OpKind::DispatchIndirect && kind != OpKind::ReadCheck) {
+		m_renderer.GetBufferCache().NewStreamEpoch();
 	}
 	CommitStats::StepMark(CommitStats::Step::GapOpHead);
 	switch (kind) {

@@ -846,6 +846,19 @@ if(LINUX)
 	target_link_libraries(core_budget_tests Threads::Threads)
 endif()
 
+# KYTY_STREAM_COPY_REUSE (streamCopyMemo.h): reuse only within one tick and epoch.
+add_executable(stream_copy_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StreamCopyMemoTests.cpp"
+)
+target_include_directories(stream_copy_memo_tests PRIVATE ${inc_headers})
+
+# KYTY_PCACHE_SAVE_MAPPED (pipelineCacheMappedFile.h): the mapped temporary file of a driver cache save.
+add_executable(pipeline_cache_mapped_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineCacheMappedFileTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheMappedFile.cpp"
+)
+target_include_directories(pipeline_cache_mapped_file_tests PRIVATE ${inc_headers})
+
 # Live switches (common/liveSwitch.h, KYTY_LIVE_FILE): parsing, application at the flip, the
 # synthetic CP spin and the live-control thread.
 add_executable(live_switch_tests EXCLUDE_FROM_ALL
@@ -1613,6 +1626,8 @@ if(BUILD_TESTING)
 	add_test(NAME cpu_placement_vcache_pending
 	         COMMAND $<TARGET_FILE:cpu_placement_tests> --vcache pending)
 	add_test(NAME live_switch COMMAND $<TARGET_FILE:live_switch_tests>)
+	add_test(NAME stream_copy_memo COMMAND $<TARGET_FILE:stream_copy_memo_tests>)
+	add_test(NAME pipeline_cache_mapped_file COMMAND $<TARGET_FILE:pipeline_cache_mapped_file_tests>)
 	add_test(NAME guest_probe_retire COMMAND $<TARGET_FILE:guest_probe_tests>)
 	add_test(NAME guest_probe_shared COMMAND $<TARGET_FILE:guest_probe_tests> --shared)
 	add_test(NAME guest_probe_equals COMMAND $<TARGET_FILE:guest_probe_tests> --equals)

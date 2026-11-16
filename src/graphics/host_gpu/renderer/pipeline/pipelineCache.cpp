@@ -42,6 +42,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineListGameFile.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineListInt21.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheMappedFile.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/rtSession.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
@@ -9074,6 +9075,9 @@ void PipelineCache::NotePipelineCreated(uint64_t create_ns) {
 	}
 }
 
+// KYTY_PCACHE_SAVE_MAPPED (WriteDriverCache): read at each save.
+static Live::Switch g_pcache_save_mapped("KYTY_PCACHE_SAVE_MAPPED", Live::ParseDefaultOff);
+
 uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 	HangWatchdog::Scope snapshot(
 	    "pipeline-cache-snapshot",
@@ -9088,7 +9092,23 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 	// (pcache_save_overlaps). vkDestroyPipelineCache, the only externally synchronized use, runs
 	// in Save() after the saver has stopped. The handle itself is written only before the saver
 	// starts and after it stops.
+	// KYTY_PCACHE_SAVE_MAPPED=1 (live, default off; based on Senaxx/KytyPS5 2708521dc): the driver
+	// writes its data straight into a mapping of the temporary file, whose pages belong to the file
+	// and are not charged to commit as the same bytes on the heap are (the payload, ~130 MB for Astro
+	// Bot's cache and up to the KYTY_DRIVER_CACHE_MAX_MB cap, at every periodic save and at exit).
+	// The file's layout is the same.
+	const bool use_mapped = g_pcache_save_mapped.On();
+	auto       temp_path  = m_driver_cache_path;
+	temp_path += ".tmp";
+	const auto signature   = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	const auto prefix_size = signature.size() + sizeof(uint64_t);
+	if (use_mapped && !Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		return 0;
+	}
 	std::vector<uint8_t> payload;
+	PipelineCacheMappedFile mapped;
+	uint8_t*             data   = nullptr;
 	size_t               size   = 0;
 	vk::Result           result = vk::Result::eIncomplete;
 	if (m_saver != nullptr) m_saver->serializing.store(true, std::memory_order_relaxed);
@@ -9103,56 +9123,76 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 		}
 		// Pipelines created between the two calls grow the data; leave room for them. Whatever
 		// is returned is valid initial data, but only complete data replaces the file.
-		payload.resize(size + size / 8u + 1024u * 1024u);
-		size   = payload.size();
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+		const size_t capacity = size + size / 8u + 1024u * 1024u;
+		if (use_mapped) {
+			if (!mapped.Create(temp_path, prefix_size + capacity)) {
+				result = vk::Result::eErrorOutOfHostMemory;
+				break;
+			}
+			data = mapped.Data() + prefix_size;
+		} else {
+			payload.resize(capacity);
+			data = payload.data();
+		}
+		size   = capacity;
+		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, data);
 	}
 	if (m_saver != nullptr) m_saver->serializing.store(false, std::memory_order_relaxed);
 	const auto serialized = CompileClockNs();
 	const char* kind      = periodic ? "periodic" : "exit";
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
+		(void)mapped.Close(0);
 		PipelineCacheLog("Vulkan pipeline cache: {} save failed ({}, {} bytes)", kind,
 		                 vk::to_string(result), size);
 		return 0;
 	}
-	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	if (!use_mapped) {
+		payload.resize(size);
+	}
+	auto       prefix       = signature;
+	const auto payload_hash = XXH3_64bits(data, size);
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (periodic && prefix.size() + payload.size() > DriverCacheFileCap()) {
+	if (periodic && prefix.size() + size > DriverCacheFileCap()) {
 		// The loader rejects such a file and starts over; keep the last file that it accepts.
 		// The exit save still writes it, which is what resets an overgrown cache.
+		(void)mapped.Close(0);
 		PipelineCacheLog("Vulkan pipeline cache: {} bytes exceed the {} byte cap; periodic saves "
 		                 "stop, the exit save still writes it",
-		                 payload.size(), DriverCacheFileCap());
+		                 size, DriverCacheFileCap());
 		return DriverCacheSaver::WriteOversized;
 	}
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+	if (!use_mapped && !Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return 0;
 	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
-	Common::File file;
-	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+	uint32_t prefix_written  = 0;
+	uint32_t payload_written = 0;
+	bool     flushed         = false;
+	if (use_mapped) {
+		// The prefix goes in front of the payload the driver wrote; the file is cut to what was used.
+		std::memcpy(mapped.Data(), prefix.data(), prefix.size());
+		flushed         = mapped.Close(prefix.size() + size);
+		prefix_written  = flushed ? static_cast<uint32_t>(prefix.size()) : 0u;
+		payload_written = flushed ? static_cast<uint32_t>(size) : 0u;
+	} else {
+		Common::File file;
+		if (file.Create(temp_path)) {
+			file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
+			file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+		}
+		flushed = !file.IsInvalid() && file.Flush();
+		file.Close();
 	}
-	const bool flushed = !file.IsInvalid() && file.Flush();
-	file.Close();
 	// std::filesystem::rename replaces the destination in one step (MoveFileExW with
 	// MOVEFILE_REPLACE_EXISTING on Windows, rename(2) elsewhere): a kill at any point leaves
 	// either the previous or the new complete file. Common::File::RenameFile deleted the old
 	// file first, so a kill between the delete and the move lost the cache.
 	std::error_code error;
-	if (prefix_written == prefix.size() && payload_written == payload.size() && flushed) {
+	if (prefix_written == prefix.size() && payload_written == size && flushed) {
 		std::filesystem::rename(temp_path, m_driver_cache_path, error);
 	}
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    error) {
+	if (prefix_written != prefix.size() || payload_written != size || !flushed || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}{}",
 		                 Common::PathToString(m_driver_cache_path),
 		                 error ? " (" + error.message() + ")" : std::string());
@@ -9160,13 +9200,14 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 	}
 	if (m_known != nullptr) m_known->Flush();
 	const auto written = CompileClockNs();
-	HangTrace::RecordPipelineCacheSave(payload.size(), serialized - begin, written - serialized);
+	HangTrace::RecordPipelineCacheSave(size, serialized - begin, written - serialized);
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {} ({}, serialize {:.1f} ms, write "
-	                 "{:.1f} ms)",
-	                 payload.size(), Common::PathToString(m_driver_cache_path), kind,
+	                 "{:.1f} ms{})",
+	                 size, Common::PathToString(m_driver_cache_path), kind,
 	                 static_cast<double>(serialized - begin) / 1.0e6,
-	                 static_cast<double>(written - serialized) / 1.0e6);
-	return payload.size();
+	                 static_cast<double>(written - serialized) / 1.0e6,
+	                 use_mapped ? ", mapped" : "");
+	return size;
 }
 
 void PipelineCache::Save() {
