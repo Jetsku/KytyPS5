@@ -1899,6 +1899,8 @@ private:
 	bool          m_run_prev_valid     = false; // m_run.valid when the committed draw began
 	bool          m_run_active         = false; // the draw takes the delta path
 	uint64_t      m_rebind_epoch       = 0;     // KYTY_REBIND_AFTER_JOIN: UnregisterEpoch at resolution
+	bool          m_lazy_find          = false; // KYTY_LAZY_FIND_BUFFER: FindBuffers leaves read V#s' ids unset
+	bool          m_lazy_find_draw     = false; // and the draw being committed did (rebind check on)
 	bool          m_run_verify         = false; // verify mode: the draw would have continued
 	uint64_t      m_run_key            = 0;     // the committed draw's structure key (the engine)
 	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)

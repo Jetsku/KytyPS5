@@ -3672,9 +3672,36 @@ static bool SkipRecurrentTargetsOnly() {
 }
 
 // Notes the draw's render targets for the rule above (once per image and frame).
+// KYTY_SKIP_TARGETS_MEMO (live, default 0): a draw whose targets are the ones the previous noted draw
+// had, in the same frame, notes nothing (each image is noted once per frame anyway); ~10,000 draws a
+// flip at the Astro's Playroom GPU Jungle mostly repeat their targets.
+static Live::Switch g_skip_targets_memo("KYTY_SKIP_TARGETS_MEMO", Live::ParseDefaultOff);
+
 static void NoteSkipTargets(RenderContext& context, const DrawRenderState& state) {
 	auto&      cache = context.GetTextureCache();
 	const auto frame = cache.Frame() + 1u; // 0 = never
+	if (g_skip_targets_memo.On()) {
+		// Commit thread only (ExecutePreparedDraw).
+		static struct {
+			uint64_t frame = 0;
+			uint32_t count = UINT32_MAX;
+			ImageId  depth {};
+			std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+		} last;
+		bool same = last.frame == frame && last.count == state.color_count && last.depth == state.depth_info.image_id;
+		for (uint32_t i = 0; same && i < state.color_count; i++) {
+			same = last.colors[i] == state.color_info[i].image_id;
+		}
+		if (same) {
+			return;
+		}
+		last.frame = frame;
+		last.count = state.color_count;
+		last.depth = state.depth_info.image_id;
+		for (uint32_t i = 0; i < state.color_count && i < last.colors.size(); i++) {
+			last.colors[i] = state.color_info[i].image_id;
+		}
+	}
 	const auto note  = [&](ImageId id) {
 		if (!id) {
 			return;
@@ -7353,7 +7380,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// buffer): the recorded draw would read and write a buffer nothing uses again, its writes lost
 	// while the range stays GPU-owned. Resolve the buffers and the per-draw ranges again while the
 	// count moves (at most 4 times).
-	if (RebindAfterJoinEnabled()) {
+	if (RebindAfterJoinEnabled() || std::exchange(m_lazy_find_draw, false)) {
 		auto& cache = m_context.GetBufferCache();
 		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
 			NoteRebindAfterJoin("draw", draw.Name());

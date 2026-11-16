@@ -5191,6 +5191,12 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		if (const auto& resource = program.info.buffers[i]; !resource.written && !resource.formatted) {
 			// KYTY_CP_BINDING_BATCH_PREFETCH=find (BufferCache::PrefetchReadBinding).
 			cache.PrefetchReadBinding(address, size, true);
+			// KYTY_LAZY_FIND_BUFFER (PrepareGraphicsBindings): the buffer is found by the lookup that
+			// needs one (a binding-memo miss); a hit never reads the id.
+			if (m_lazy_find) {
+				prepared.buffer_sources.push_back({address, size, BufferId {}});
+				continue;
+			}
 		}
 		BufferLookupStats::PartScope find_scope(BufferLookupStats::Part::FindCall);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
@@ -6020,6 +6026,8 @@ void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) 
 	}
 }
 
+static Live::Switch g_lazy_find_buffer("KYTY_LAZY_FIND_BUFFER", Live::ParseDefaultOff);
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors, bool keep_images) {
 	ImgSide::Count(ImgSide::C::Draws);
@@ -6028,13 +6036,22 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
 			PrefaultDmaPointers(m_context.GetBufferCache(), *stage->runtime);
+			uses_dma = true;
 		}
 	}
+	// KYTY_LAZY_FIND_BUFFER (live, default 0; based on TheCruZ/KytyPS5-GTA FindBuffers, which finds
+	// buffers up front only for operations with device-address reads): the read-only, unformatted
+	// V#s of a draw without device-address reads leave their buffer to the binding lookup, which
+	// finds it only on a memo miss. A buffer that lookup creates may join one an earlier binding of
+	// the draw resolved: the draw then resolves its buffers again (the KYTY_REBIND_AFTER_JOIN check,
+	// on for such draws).
+	m_lazy_find = !uses_dma && g_lazy_find_buffer.On();
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
-		uses_dma |= stage->runtime->program->info.uses_dma;
 		uses_bvh |= stage->runtime->program->info.uses_bvh;
 	}
+	m_lazy_find_draw = m_lazy_find;
+	m_lazy_find      = false;
 	CommitStats::StepMark(CommitStats::Step::FindBuffers);
 	if (uses_dma) {
 		const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::PrepareBda);

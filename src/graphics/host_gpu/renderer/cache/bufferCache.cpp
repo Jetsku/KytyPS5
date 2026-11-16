@@ -5032,6 +5032,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingMemo(uint64_t vaddr, 
 			return hit;
 		}
 	}
+	// KYTY_LAZY_FIND_BUFFER (RenderExecutor::PrepareGraphicsBindings): the miss finds the buffer.
+	if (IsBufferInvalid(id) && g_binding_lean_miss.On()) {
+		id = FindBuffer(vaddr, size);
+	}
 	if (std::pair<Buffer*, uint64_t> lean {};
 	    g_binding_lean_miss.On() && TryLeanReadMiss(vaddr, size, epoch, before, id, lean)) {
 		return lean;
