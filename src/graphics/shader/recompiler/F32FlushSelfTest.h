@@ -143,6 +143,67 @@ void ForceMismatch(std::span<uint32_t> buffer);
 // shader-side flush emitted): such a module would test something else.
 [[nodiscard]] std::vector<uint32_t> EmitModule(std::string* error);
 
+// ---- Stage B: the same job without DenormPreserve 16, plus an f16 block ----------------------
+// DenormPreserve 16 (and 64) is declared since 6a25c0430 (FLOAT_MODE 0xC0 keeps f16 denormals) in
+// every module where the device takes it. On an RTX 3090 that mode made rcp and compares keep f32
+// denormal inputs (stage A fails them). Stage B runs the f32 job with the modes minus
+// DenormPreserve 16 and an f16 block in that mode; when both pass, modules leave DenormPreserve 16
+// out and every op class keeps the host flush (CodegenOptions bit F32FlushClassNoPreserve16).
+//
+// The f16 block covers the f16 forms a program can get without KYTY_NATIVE_F16 (stage B refuses
+// while native f16 arithmetic is active): GLSL UnpackHalf2x16 (EmitF16BitsToF32: V_CVT_F32_F16,
+// f16 operands, interpolation and memory reads of f16 data) on both halves of a word, and GLSL
+// PackHalf2x16 (EmitGlslPackHalf2x16: V_CVT_F16_F32 without KYTY_F16_EXACT_ROUND, f16 memory and
+// image stores) of both components. The integer f16 paths (KYTY_FAST_PKRTZ, KYTY_F16_EXACT_ROUND)
+// do not depend on float modes. Inputs: every f16 denormal of both signs in both halves; f32
+// values that are exact f16 denormals and the ties between them (round to nearest even, as
+// V_CVT_F16_F32 under FLOAT_MODE 0xC0), both signs, and f32 denormals (-> signed zero).
+// Expected = CPU model, bit-exact.
+inline constexpr uint32_t F16Words        = 2048; // unpack inputs, one per invocation
+inline constexpr uint32_t F16PackValues   = 2u * F16Words;
+inline constexpr uint32_t F16UnpackBase   = 0;
+inline constexpr uint32_t F16PackBase     = F16UnpackBase + F16Words;
+inline constexpr uint32_t F16UnpackOutBase = F16PackBase + F16PackValues; // 2 f32 per input word
+inline constexpr uint32_t F16PackOutBase  = F16UnpackOutBase + 2u * F16Words; // 1 word per pair
+inline constexpr uint32_t F16BufferWords  = F16PackOutBase + F16Words;
+static_assert(F16Words % WorkgroupSize == 0);
+
+// f16 bits -> f32 bits (exact; denormals kept).
+[[nodiscard]] uint32_t F16ToF32Bits(uint32_t half);
+// f32 bits -> f16 bits, round to nearest even, f16 denormals kept, f32 denormals -> signed zero.
+[[nodiscard]] uint32_t F32ToF16BitsRne(uint32_t bits);
+[[nodiscard]] std::vector<uint32_t> F16InitialBuffer();
+// Results against the model; by_op[0] counts unpack mismatches, by_op[1] pack mismatches.
+[[nodiscard]] Verdict ClassifyF16(std::span<const uint32_t> buffer);
+// The f16 module (local size WorkgroupSize, set 0 binding 0 of F16BufferWords words, dispatch
+// F16Words / WorkgroupSize groups) with the current host float controls.
+[[nodiscard]] std::vector<uint32_t> EmitF16Module();
+
+// The decision. KYTY_F32_FLUSH_SELFTEST: "" (decide), "off" (skip: all classes, modes kept),
+// "fail" (one forced mismatch in stage A), "stageA" (per-class stage A result, no stage B),
+// "stageB" (stage B outcome whatever its tests give; they still run and are reported).
+enum class Force : uint8_t { None, Fail, StageA, StageB };
+enum class Outcome : uint8_t {
+	AllDeclared, // stage A passed every class: all on, modes as declared
+	PerClass,    // stage A's passing classes, modes as declared
+	NoPreserve16 // stage B: all classes, DenormPreserve 16 left out
+};
+struct DecisionInput {
+	uint8_t stage_a_classes = 0;     // PassingClasses of stage A (0 if it did not run)
+	bool    preserve16_declared = false; // the device's controls declare DenormPreserve 16
+	bool    native_f16_active   = false; // stage B refuses
+	bool    stage_b_ran         = false;
+	uint8_t stage_b_classes     = 0;
+	bool    f16_passed          = false;
+	Force   force               = Force::None;
+};
+// Whether stage B should run at all (stage A not all-pass, B possible and not forced to A).
+[[nodiscard]] bool    StageBWanted(const DecisionInput& in);
+[[nodiscard]] Outcome Decide(const DecisionInput& in);
+// The CodegenOptions::f32_flush_host_classes value of an outcome.
+inline constexpr uint8_t ClassNoPreserve16 = 64u;
+[[nodiscard]] uint8_t OutcomeClasses(Outcome outcome, uint8_t stage_a_classes);
+
 } // namespace Libs::Graphics::ShaderRecompiler::FlushSelfTest
 
 #endif // EMULATOR_SRC_GRAPHICS_SHADER_RECOMPILER_F32FLUSHSELFTEST_H_

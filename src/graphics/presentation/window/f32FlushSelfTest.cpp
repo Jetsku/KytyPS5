@@ -2,12 +2,14 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string_view>
 
 namespace Libs::Graphics {
@@ -70,23 +72,20 @@ bool Check(vk::Result result, const char* what, std::string* error) {
 	return false;
 }
 
-bool Dispatch(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memory_properties, vk::Queue queue,
-              uint32_t queue_family, bool force_mismatch, F32FlushSelfTestRun* run) {
-	auto*      error = &run->error;
+// One compute job: `code` (one storage buffer at set 0 binding 0, *buffer's words) dispatched as
+// `groups` workgroups once on `queue`; *buffer holds the read-back afterwards.
+bool RunJob(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memory_properties, vk::Queue queue,
+            uint32_t queue_family, std::span<const uint32_t> code, std::vector<uint32_t>* buffer, uint32_t groups,
+            double* pipeline_ms, double* gpu_ms, std::string* error) {
 	auto       mark  = std::chrono::steady_clock::now();
 	const auto phase = [&mark](double* out) {
 		const auto now = std::chrono::steady_clock::now();
 		*out           = std::chrono::duration<double, std::milli>(now - mark).count();
 		mark           = now;
 	};
-	const auto code = FlushSelfTest::EmitModule(error);
-	phase(&run->emit_ms);
-	if (code.empty()) {
-		return false;
-	}
 	Job job;
 	job.device       = device;
-	const auto bytes = static_cast<vk::DeviceSize>(FlushSelfTest::BufferWords) * 4u;
+	const auto bytes = static_cast<vk::DeviceSize>(buffer->size()) * 4u;
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = bytes;
@@ -116,8 +115,7 @@ bool Dispatch(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memor
 	}
 	auto* words = static_cast<uint32_t*>(mapped);
 	{
-		const auto initial = FlushSelfTest::InitialBuffer();
-		std::memcpy(words, initial.data(), initial.size() * sizeof(uint32_t));
+		std::memcpy(words, buffer->data(), buffer->size() * sizeof(uint32_t));
 	}
 	vk::MappedMemoryRange range {};
 	range.memory = job.memory;
@@ -214,7 +212,7 @@ bool Dispatch(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memor
 	}
 	commands.bindPipeline(vk::PipelineBindPoint::eCompute, job.pipeline);
 	commands.bindDescriptorSets(vk::PipelineBindPoint::eCompute, job.pipeline_layout, 0, 1, &set, 0, nullptr);
-	commands.dispatch(FlushSelfTest::InputCount / FlushSelfTest::WorkgroupSize, 1, 1);
+	commands.dispatch(groups, 1, 1);
 	vk::MemoryBarrier to_host {};
 	to_host.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
@@ -223,7 +221,7 @@ bool Dispatch(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memor
 	if (!Check(commands.end(), "vkEndCommandBuffer", error)) {
 		return false;
 	}
-	phase(&run->pipeline_ms);
+	phase(pipeline_ms);
 	vk::FenceCreateInfo fence_info {};
 	if (!Check(device.createFence(&fence_info, nullptr, &job.fence), "vkCreateFence", error)) {
 		return false;
@@ -239,20 +237,17 @@ bool Dispatch(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memor
 		return false;
 	}
 	job.in_flight = false;
-	phase(&run->gpu_ms);
+	phase(gpu_ms);
 	if (!coherent && !Check(device.invalidateMappedMemoryRanges(1, &range), "vkInvalidateMappedMemoryRanges", error)) {
 		return false;
 	}
-	std::vector<uint32_t> result(words, words + FlushSelfTest::BufferWords);
+	std::memcpy(buffer->data(), words, buffer->size() * sizeof(uint32_t));
 	device.unmapMemory(job.memory);
-	if (force_mismatch) {
-		FlushSelfTest::ForceMismatch(result);
-	}
-	run->ran       = true;
-	run->verdict   = FlushSelfTest::Classify(result);
-	run->reference = FlushSelfTest::ClassifyReference(result);
-	phase(&run->check_ms);
 	return true;
+}
+
+double MillisecondsSince(std::chrono::steady_clock::time_point start) {
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 } // namespace
@@ -261,13 +256,46 @@ F32FlushSelfTestRun RunF32FlushSelfTest(vk::Device device, const vk::PhysicalDev
                                         vk::Queue queue, uint32_t queue_family, bool force_mismatch) {
 	F32FlushSelfTestRun run;
 	const auto          start = std::chrono::steady_clock::now();
-	(void)Dispatch(device, memory, queue, queue_family, force_mismatch, &run);
-	run.milliseconds =
-	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	const auto          code  = FlushSelfTest::EmitModule(&run.error);
+	run.emit_ms               = MillisecondsSince(start);
+	auto                buffer = FlushSelfTest::InitialBuffer();
+	if (!code.empty() &&
+	    RunJob(device, memory, queue, queue_family, code, &buffer,
+	           FlushSelfTest::InputCount / FlushSelfTest::WorkgroupSize, &run.pipeline_ms, &run.gpu_ms, &run.error)) {
+		const auto check = std::chrono::steady_clock::now();
+		if (force_mismatch) {
+			FlushSelfTest::ForceMismatch(buffer);
+		}
+		run.ran       = true;
+		run.verdict   = FlushSelfTest::Classify(buffer);
+		run.reference = FlushSelfTest::ClassifyReference(buffer);
+		run.check_ms  = MillisecondsSince(check);
+	}
+	run.milliseconds = MillisecondsSince(start);
+	return run;
+}
+
+F32FlushSelfTestRun RunF16SelfTest(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memory,
+                                   vk::Queue queue, uint32_t queue_family) {
+	F32FlushSelfTestRun run;
+	const auto          start = std::chrono::steady_clock::now();
+	const auto          code  = FlushSelfTest::EmitF16Module();
+	run.emit_ms               = MillisecondsSince(start);
+	auto                buffer = FlushSelfTest::F16InitialBuffer();
+	if (RunJob(device, memory, queue, queue_family, code, &buffer,
+	           FlushSelfTest::F16Words / FlushSelfTest::WorkgroupSize, &run.pipeline_ms, &run.gpu_ms, &run.error)) {
+		const auto check = std::chrono::steady_clock::now();
+		run.ran          = true;
+		run.verdict      = FlushSelfTest::ClassifyF16(buffer);
+		run.reference.checked = 1; // no shader reference: the model is the reference
+		run.check_ms     = MillisecondsSince(check);
+	}
+	run.milliseconds = MillisecondsSince(start);
 	return run;
 }
 
 void SettleF32FlushHostSelfTest(GraphicContext& graphics) {
+	namespace Spirv = ShaderRecompiler::Spirv;
 	if (!ShaderRecompiler::F32FlushHostAwaitsSelfTest()) {
 		return;
 	}
@@ -282,40 +310,103 @@ void SettleF32FlushHostSelfTest(GraphicContext& graphics) {
 		std::fflush(stdout);
 		return;
 	}
-	const bool force   = setting == "fail";
-	const auto run     = RunF32FlushSelfTest(graphics.device, graphics.physical_device_memory_properties,
-	                                         graphics.queue, graphics.queue_family, force);
-	// Per op class: the classes whose every result matched keep the host flush.
-	const auto classes = run.ran ? FlushSelfTest::PassingClasses(run.verdict) : uint8_t {0};
-	ShaderRecompiler::SettleF32FlushHost(classes);
-	char phases[128];
-	std::snprintf(phases, sizeof(phases), "%.1f ms: emit %.1f, pipeline %.1f, GPU %.1f, check %.1f",
-	              run.milliseconds, run.emit_ms, run.pipeline_ms, run.gpu_ms, run.check_ms);
-	const auto reference =
-	    run.reference.mismatches == 0
-	        ? std::string("reference = IEEE model")
-	        : "reference differs from the IEEE model in " + std::to_string(run.reference.mismatches) +
-	              " results, first " + run.reference.first;
-	if (!run.ran) {
-		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is off: the self-test could not run "
-		            "(device vendor 0x%04x; %s; %s)\n",
-		            vendor, run.error.c_str(), phases);
-	} else if (run.verdict.mismatches == 0) {
-		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is on for all op classes (device vendor "
-		            "0x%04x; self-test passed: %" PRIu64 " results of rcp/rsq/sqrt/exp/log and 12 compares on %u "
-		            "denormals equal the flushed inputs' results, %s; %s)\n",
-		            vendor, run.verdict.checked, FlushSelfTest::InputCount, reference.c_str(), phases);
-	} else {
-		const auto off   = static_cast<uint8_t>(FlushSelfTest::ClassAll & ~classes);
-		const auto state = classes != 0u ? "on for " + FlushSelfTest::ClassesText(classes) + ", off for " +
-		                                       FlushSelfTest::ClassesText(off)
-		                                 : std::string("off: the self-test failed");
-		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is %s (device vendor "
-		            "0x%04x; self-test: %" PRIu64 " of %" PRIu64 " results differ (%s), first %s; %s; %s)%s\n",
-		            state.c_str(), vendor, run.verdict.mismatches, run.verdict.checked,
-		            run.verdict.ByOpText().c_str(), run.verdict.first.c_str(), reference.c_str(), phases,
-		            force ? " (forced by KYTY_F32_FLUSH_SELFTEST=fail)" : "");
+	FlushSelfTest::DecisionInput in;
+	in.force = setting == "fail"     ? FlushSelfTest::Force::Fail
+	           : setting == "stageA" ? FlushSelfTest::Force::StageA
+	           : setting == "stageB" ? FlushSelfTest::Force::StageB
+	                                 : FlushSelfTest::Force::None;
+	const bool force_mismatch = in.force == FlushSelfTest::Force::Fail;
+	const auto declared       = Spirv::GetHostFloatControls();
+	in.preserve16_declared    = declared.denorm_preserve_f16;
+	in.native_f16_active      = ShaderRecompiler::NativeHalfActive();
+	const auto run = [&](bool mismatch) {
+		return RunF32FlushSelfTest(graphics.device, graphics.physical_device_memory_properties, graphics.queue,
+		                           graphics.queue_family, mismatch);
+	};
+	// Stage A: the modes as declared.
+	const auto a      = run(force_mismatch);
+	in.stage_a_classes = a.ran ? FlushSelfTest::PassingClasses(a.verdict) : uint8_t {0};
+	// Stage B: the same job and the f16 block without DenormPreserve 16.
+	F32FlushSelfTestRun b;
+	F32FlushSelfTestRun f16;
+	bool                b_ran = false;
+	if (a.ran && FlushSelfTest::StageBWanted(in)) {
+		auto without                = declared;
+		without.denorm_preserve_f16 = false;
+		Spirv::SetHostFloatControls(without);
+		b                  = run(force_mismatch);
+		f16                = RunF16SelfTest(graphics.device, graphics.physical_device_memory_properties,
+		                                    graphics.queue, graphics.queue_family);
+		b_ran              = true;
+		in.stage_b_ran     = b.ran && f16.ran;
+		in.stage_b_classes = b.ran ? FlushSelfTest::PassingClasses(b.verdict) : uint8_t {0};
+		in.f16_passed      = f16.ran && f16.verdict.Passed();
 	}
+	const auto outcome = a.ran || in.force == FlushSelfTest::Force::StageB ? FlushSelfTest::Decide(in)
+	                                                                        : FlushSelfTest::Outcome::PerClass;
+	Spirv::SetHostFloatControls(outcome == FlushSelfTest::Outcome::NoPreserve16
+	                                ? Spirv::HostFloatControls {declared.denorm_flush_f32, false,
+	                                                            declared.denorm_preserve_f64}
+	                                : declared);
+	const auto classes = FlushSelfTest::OutcomeClasses(outcome, in.stage_a_classes);
+	ShaderRecompiler::SettleF32FlushHost(classes);
+
+	const auto phases = [](const F32FlushSelfTestRun& r) {
+		char text[128];
+		std::snprintf(text, sizeof(text), "%.1f ms: emit %.1f, pipeline %.1f, GPU %.1f, check %.1f", r.milliseconds,
+		              r.emit_ms, r.pipeline_ms, r.gpu_ms, r.check_ms);
+		return std::string(text);
+	};
+	const auto verdict = [&](const F32FlushSelfTestRun& r) {
+		if (!r.ran) {
+			return "could not run: " + r.error;
+		}
+		std::string text = std::to_string(r.verdict.mismatches) + " of " + std::to_string(r.verdict.checked) +
+		                   " results differ";
+		if (r.verdict.mismatches != 0) {
+			text += " (" + r.verdict.ByOpText() + "), first " + r.verdict.first;
+		}
+		return text;
+	};
+	const auto off_classes = static_cast<uint8_t>(FlushSelfTest::ClassAll & ~classes);
+	std::string chosen;
+	switch (outcome) {
+		case FlushSelfTest::Outcome::AllDeclared: chosen = "on for all op classes, float modes as declared"; break;
+		case FlushSelfTest::Outcome::PerClass:
+			chosen = (classes & FlushSelfTest::ClassAll) == 0u
+			             ? std::string("off")
+			             : "on for " + FlushSelfTest::ClassesText(classes) + ", off for " +
+			                   FlushSelfTest::ClassesText(off_classes) + ", float modes as declared";
+			break;
+		case FlushSelfTest::Outcome::NoPreserve16:
+			chosen = "on for all op classes, DenormPreserve 16 no longer declared (stage B)";
+			break;
+	}
+	std::string text = "Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is " + chosen;
+	char        head[64];
+	std::snprintf(head, sizeof(head), " (device vendor 0x%04x", vendor);
+	text += head;
+	text += "; stage A, declared modes (DenormPreserve 16 " + std::string(declared.denorm_preserve_f16 ? "on" : "off") +
+	        "): " + verdict(a) + "; " + phases(a);
+	if (a.ran && a.reference.mismatches != 0) {
+		text += "; reference differs from the IEEE model in " + std::to_string(a.reference.mismatches) +
+		        " results, first " + a.reference.first;
+	}
+	if (b_ran) {
+		text += "; stage B, without DenormPreserve 16: " + verdict(b) + "; " + phases(b) + "; f16 block: " +
+		        verdict(f16) + "; " + phases(f16);
+	} else if ((in.stage_a_classes & FlushSelfTest::ClassAll) != FlushSelfTest::ClassAll) {
+		text += in.force == FlushSelfTest::Force::StageA ? "; stage B not run: KYTY_F32_FLUSH_SELFTEST=stageA"
+		        : !declared.denorm_preserve_f16         ? "; stage B not run: DenormPreserve 16 is not declared"
+		        : in.native_f16_active ? "; stage B refused: KYTY_NATIVE_F16 emits f16 arithmetic the f16 block does "
+		                                 "not cover"
+		                               : "; stage B not run";
+	}
+	text += ")";
+	if (in.force != FlushSelfTest::Force::None) {
+		text += " (forced by KYTY_F32_FLUSH_SELFTEST=" + std::string(setting) + ")";
+	}
+	std::printf("%s\n", text.c_str());
 	std::fflush(stdout);
 }
 

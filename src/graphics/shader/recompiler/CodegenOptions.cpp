@@ -451,7 +451,8 @@ bool F32FlushHostAwaitsSelfTest() {
 
 void SettleF32FlushHost(uint8_t classes) {
 	Storage().f32_flush_host         = (classes & F32FlushClassAll) != 0u;
-	Storage().f32_flush_host_classes = static_cast<uint8_t>(classes & F32FlushClassAll);
+	Storage().f32_flush_host_classes =
+	    static_cast<uint8_t>(classes & (F32FlushClassAll | F32FlushClassNoPreserve16));
 	g_f32_flush_host_self_test       = false;
 }
 

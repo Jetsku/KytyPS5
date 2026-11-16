@@ -30,10 +30,16 @@ struct F32FlushSelfTestRun {
                                                       vk::Queue queue, uint32_t queue_family,
                                                       bool force_mismatch);
 
+// The f16 block of stage B (F16BufferWords, EmitF16Module) with the current host float controls.
+[[nodiscard]] F32FlushSelfTestRun RunF16SelfTest(vk::Device device, const vk::PhysicalDeviceMemoryProperties& memory,
+                                                 vk::Queue queue, uint32_t queue_family);
+
 // The device layer, once the device and its queue exist and before anything is translated: with
 // KYTY_F32_FLUSH_HOST=nvidia on an NVIDIA device (ShaderRecompiler::F32FlushHostAwaitsSelfTest)
 // runs the job and keeps the switch only when it passes, printing one "Kyty GPU capabilities:"
-// line. KYTY_F32_FLUSH_SELFTEST=off keeps the switch without the test, =fail forces a mismatch.
+// line. Stage A runs with the declared float modes; if a class fails there, stage B runs the job and
+// the f16 block without DenormPreserve 16 (FlushSelfTest::Decide). KYTY_F32_FLUSH_SELFTEST=off keeps
+// every class without the test, =fail forces a mismatch, =stageA / =stageB force that outcome.
 void SettleF32FlushHostSelfTest(GraphicContext& graphics);
 
 } // namespace Libs::Graphics

@@ -188,12 +188,113 @@ void TestClassification() {
 	Check(T::Classify(std::vector<uint32_t>(10, 0u)).mismatches == 1u, "a short read-back fails");
 }
 
+void TestF16Block() {
+	// Model.
+	Check(T::F16ToF32Bits(0x0001u) == 0x33800000u, "f16 smallest denormal = 2^-24");
+	Check(T::F16ToF32Bits(0x83ffu) == 0xb87fc000u, "f16 largest negative denormal");
+	Check(T::F16ToF32Bits(0x0400u) == 0x38800000u && T::F16ToF32Bits(0x3c00u) == 0x3f800000u, "f16 normals");
+	Check(T::F16ToF32Bits(0x8000u) == 0x80000000u && T::F16ToF32Bits(0x7c00u) == 0x7f800000u, "f16 -0 and inf");
+	for (uint32_t h = 0; h < 0x7c00u; h++) {
+		Check(T::F32ToF16BitsRne(T::F16ToF32Bits(h)) == h, "f16 -> f32 -> f16 round trip");
+		Check(T::F32ToF16BitsRne(T::F16ToF32Bits(h | 0x8000u)) == (h | 0x8000u), "negative round trip");
+	}
+	Check(T::F32ToF16BitsRne(0x33000000u) == 0u, "2^-25 ties to even (0)");
+	Check(T::F32ToF16BitsRne(0x33c00000u) == 2u, "1.5 * 2^-24 ties to even (2)");
+	Check(T::F32ToF16BitsRne(0x34200000u) == 2u, "2.5 * 2^-24 ties to even (2)");
+	Check(T::F32ToF16BitsRne(0x80000001u) == 0x8000u && T::F32ToF16BitsRne(0x007fffffu) == 0u,
+	      "f32 denormals give signed zeros");
+	Check(T::F32ToF16BitsRne(0x387fe000u) == 0x0400u, "1023.75 * 2^-24 rounds to the smallest normal");
+	Check(T::F32ToF16BitsRne(0x3f801000u) == 0x3c00u && T::F32ToF16BitsRne(0x3f803000u) == 0x3c02u,
+	      "normal ties to even");
+	Check(T::F32ToF16BitsRne(0x47800000u) == 0x7c00u && T::F32ToF16BitsRne(0x7fc00000u) == 0x7e00u,
+	      "overflow and NaN");
+
+	// Inputs: every f16 denormal of both signs appears in both halves; pack inputs cover exact
+	// values, ties and f32 denormals.
+	const auto buffer = T::F16InitialBuffer();
+	Check(buffer.size() == T::F16BufferWords, "f16 buffer size");
+	std::set<uint32_t> low, high;
+	for (uint32_t k = 0; k < T::F16Words; k++) {
+		low.insert(buffer[T::F16UnpackBase + k] & 0xffffu);
+		high.insert(buffer[T::F16UnpackBase + k] >> 16u);
+	}
+	Check(low.size() == 2046u && high.size() == 2046u, "every f16 denormal in each half");
+	uint32_t ties = 0, f32_denormals = 0;
+	for (uint32_t i = 0; i < T::F16PackValues; i++) {
+		const auto v = buffer[T::F16PackBase + i];
+		ties += (v & 0x7fffffffu) >= 0x33800000u && T::F32ToF16BitsRne(v) != T::F32ToF16BitsRne(v - 1u) ? 1u : 0u;
+		f32_denormals += T::IsDenormalF32(v) ? 1u : 0u;
+	}
+	Check(ties > 1000u && f32_denormals == 2u, "pack inputs: ties and f32 denormals");
+
+	// Classification.
+	auto perfect = buffer;
+	for (uint32_t k = 0; k < T::F16Words; k++) {
+		const auto word = perfect[T::F16UnpackBase + k];
+		perfect[T::F16UnpackOutBase + 2u * k]      = T::F16ToF32Bits(word & 0xffffu);
+		perfect[T::F16UnpackOutBase + 2u * k + 1u] = T::F16ToF32Bits(word >> 16u);
+		perfect[T::F16PackOutBase + k] = T::F32ToF16BitsRne(perfect[T::F16PackBase + 2u * k]) |
+		                                 (T::F32ToF16BitsRne(perfect[T::F16PackBase + 2u * k + 1u]) << 16u);
+	}
+	const auto pass = T::ClassifyF16(perfect);
+	Check(pass.Passed() && pass.checked == 4u * T::F16Words, "a preserving host passes the f16 block");
+	auto flushed = perfect;
+	flushed[T::F16UnpackOutBase + 0] = 0u; // UnpackHalf2x16(0x0001) flushed to +0
+	const auto fail = T::ClassifyF16(flushed);
+	Check(fail.mismatches == 1u && fail.by_op[0] == 1u &&
+	          fail.first == "UnpackHalf2x16(0x00000001) = 0x00000000, expected 0x33800000",
+	      "a flushed f16 denormal is a mismatch");
+}
+
+void TestDecision() {
+	using F = T::Force;
+	using O = T::Outcome;
+	T::DecisionInput in;
+	in.preserve16_declared = true;
+	in.stage_a_classes     = T::ClassAll;
+	Check(!T::StageBWanted(in) && T::Decide(in) == O::AllDeclared, "stage A passes: modes as declared");
+	in.stage_a_classes = 30u; // rsq, sqrt, exp, log
+	Check(T::StageBWanted(in), "a failing class asks for stage B");
+	Check(T::Decide(in) == O::PerClass, "stage B not run: per class");
+	in.stage_b_ran     = true;
+	in.stage_b_classes = T::ClassAll;
+	in.f16_passed      = true;
+	Check(T::Decide(in) == O::NoPreserve16, "stage B and the f16 block pass: no DenormPreserve 16");
+	Check(T::OutcomeClasses(O::NoPreserve16, 30u) == (T::ClassAll | T::ClassNoPreserve16) &&
+	          T::OutcomeClasses(O::PerClass, 30u) == 30u && T::OutcomeClasses(O::AllDeclared, 30u) == T::ClassAll,
+	      "outcome classes");
+	in.f16_passed = false;
+	Check(T::Decide(in) == O::PerClass, "an f16 mismatch keeps stage A");
+	in.f16_passed      = true;
+	in.stage_b_classes = 31u;
+	Check(T::Decide(in) == O::PerClass, "a stage B mismatch keeps stage A");
+	in.stage_b_classes   = T::ClassAll;
+	in.native_f16_active = true;
+	Check(!T::StageBWanted(in) && T::Decide(in) == O::PerClass, "native f16 refuses stage B");
+	in.native_f16_active   = false;
+	in.preserve16_declared = false;
+	Check(!T::StageBWanted(in) && T::Decide(in) == O::PerClass, "nothing to drop without DenormPreserve 16");
+	in.preserve16_declared = true;
+	in.force               = F::StageA;
+	Check(!T::StageBWanted(in) && T::Decide(in) == O::PerClass, "forced stage A");
+	in.force           = F::StageB;
+	in.stage_b_classes = 0u;
+	in.f16_passed      = false;
+	Check(T::StageBWanted(in) && T::Decide(in) == O::NoPreserve16, "forced stage B");
+	in.force           = F::Fail;
+	in.stage_b_classes = 29u; // the forced rsq mismatch in stage B too
+	in.f16_passed      = true;
+	Check(T::Decide(in) == O::PerClass, "forced mismatch: per class");
+}
+
 } // namespace
 
 int main() {
 	TestInputsAndOperands();
 	TestModel();
 	TestClassification();
+	TestF16Block();
+	TestDecision();
 	std::printf("F32FlushSelfTestTests: ok (%u inputs, %u operands, %u buffer words)\n", T::InputCount,
 	            T::OperandCount, T::BufferWords);
 	return 0;

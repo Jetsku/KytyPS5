@@ -34,7 +34,8 @@ static_assert(F32FlushClassRcp == 1u << static_cast<uint32_t>(UnaryOp::Rcp) &&
               F32FlushClassSqrt == 1u << static_cast<uint32_t>(UnaryOp::Sqrt) &&
               F32FlushClassExp == 1u << static_cast<uint32_t>(UnaryOp::Exp) &&
               F32FlushClassLog == 1u << static_cast<uint32_t>(UnaryOp::Log) &&
-              F32FlushClassCompare == ClassCompare && F32FlushClassAll == ClassAll);
+              F32FlushClassCompare == ClassCompare && F32FlushClassAll == ClassAll &&
+              F32FlushClassNoPreserve16 == ClassNoPreserve16);
 
 using UnaryEmit = uint32_t (*)(EmitterState&, uint32_t);
 // V_RCP/RSQ/SQRT/EXP/LOG_F32 as the translator lowers them (UnaryOp order).
@@ -167,6 +168,82 @@ std::vector<uint32_t> EmitModule(std::string* error) {
 		}
 		return {};
 	}
+	return b.Build();
+}
+
+std::vector<uint32_t> EmitF16Module() {
+	IR::Program program;
+	program.stage = ShaderType::Compute;
+	ShaderComputeInputInfo compute {};
+	compute.threads_num[0] = WorkgroupSize;
+	compute.threads_num[1] = 1;
+	compute.threads_num[2] = 1;
+	ShaderStageInputInfo input {};
+	input.compute = &compute;
+	EmitterState state(program, input);
+	auto&        b = state.builder;
+
+	const auto u32   = E::TypeU32(state);
+	const auto f32   = E::TypeF32(state);
+	const auto uvec3 = E::TypeU32Vector(state, 3);
+	const auto words = b.DecoratedType(spv::OpTypeRuntimeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, u32);
+	const auto block = b.DecoratedType(spv::OpTypeStruct,
+	                                   {{spv::OpDecorate, {spv::DecorationBlock}},
+	                                    {spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}}},
+	                                   words);
+	const auto buffer =
+	    b.DefineGlobalVariable(E::TypePointer(state, spv::StorageClassStorageBuffer, block), spv::StorageClassStorageBuffer);
+	const auto word_ptr = E::TypePointer(state, spv::StorageClassStorageBuffer, u32);
+	const auto global_id =
+	    b.DefineGlobalVariable(E::TypePointer(state, spv::StorageClassInput, uvec3), spv::StorageClassInput);
+	b.AddAnnotation(spv::OpDecorate, buffer, spv::DecorationDescriptorSet, 0u);
+	b.AddAnnotation(spv::OpDecorate, buffer, spv::DecorationBinding, 0u);
+	b.AddAnnotation(spv::OpDecorate, global_id, spv::DecorationBuiltIn, spv::BuiltInGlobalInvocationId);
+
+	state.main_func = b.AllocateId();
+	b.RequireCapability(spv::CapabilityShader);
+	b.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+	b.AddEntryPoint(spv::ExecutionModelGLCompute, state.main_func, "main", {global_id});
+	E::DeclareFloatControls(state);
+	b.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, WorkgroupSize, 1u, 1u);
+	b.AddName(state.main_func, "main");
+	b.AddFunction(spv::OpFunction, E::TypeVoid(state), state.main_func, spv::FunctionControlMaskNone,
+	              E::TypeFunction(state));
+	E::EmitLabel(state, b.AllocateId());
+	const auto id    = E::Unary(state, spv::OpLoad, uvec3, global_id);
+	const auto index = b.AllocateId();
+	b.AddFunction(spv::OpCompositeExtract, u32, index, id, 0u);
+	const auto pointer = [&](uint32_t word) {
+		const auto result = b.AllocateId();
+		b.AddFunction(spv::OpAccessChain, word_ptr, result, buffer, E::ConstantU32(state, 0u), word);
+		return result;
+	};
+	const auto at = [&](uint32_t base, uint32_t scale, uint32_t add) {
+		auto word = index;
+		if (scale != 1u) {
+			word = E::Binary(state, spv::OpIMul, u32, word, E::ConstantU32(state, scale));
+		}
+		return E::Binary(state, spv::OpIAdd, u32, word, E::ConstantU32(state, base + add));
+	};
+	const auto load  = [&](uint32_t word) { return E::Unary(state, spv::OpLoad, u32, pointer(word)); };
+	const auto store = [&](uint32_t word, uint32_t value) { b.AddFunction(spv::OpStore, pointer(word), value); };
+
+	// Unpack: EmitF16BitsToF32 of the low half and of the high half (shifted down, as the
+	// translator reads an f16 operand's high half).
+	const auto word = load(at(F16UnpackBase, 1u, 0u));
+	const auto low  = E::EmitF16BitsToF32(state, word);
+	const auto high = E::EmitF16BitsToF32(
+	    state, E::Binary(state, spv::OpShiftRightLogical, u32, word, E::ConstantU32(state, 16u)));
+	store(at(F16UnpackOutBase, 2u, 0u), E::Unary(state, spv::OpBitcast, u32, low));
+	store(at(F16UnpackOutBase, 2u, 1u), E::Unary(state, spv::OpBitcast, u32, high));
+	// Pack: EmitGlslPackHalf2x16 of (x, y).
+	const auto x    = E::Unary(state, spv::OpBitcast, f32, load(at(F16PackBase, 2u, 0u)));
+	const auto y    = E::Unary(state, spv::OpBitcast, f32, load(at(F16PackBase, 2u, 1u)));
+	const auto pair = b.AllocateId();
+	b.AddFunction(spv::OpCompositeConstruct, E::TypeF32Vector(state, 2), pair, x, y);
+	store(at(F16PackOutBase, 1u, 0u), E::EmitGlslPackHalf2x16(state, pair));
+	b.AddFunction(spv::OpReturn);
+	b.AddFunction(spv::OpFunctionEnd);
 	return b.Build();
 }
 

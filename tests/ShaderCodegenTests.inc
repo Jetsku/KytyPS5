@@ -2142,6 +2142,132 @@ void CheckF32FlushSelfTest(VulkanHarness *vulkan) {
               run.milliseconds, module.size());
 }
 
+// KYTY_F32_FLUSH_HOST=nvidia stage B (F32FlushSelfTest.h): the f16 module validates and carries
+// the float modes; the f32 job and the f16 block run with the device's modes minus
+// DenormPreserve 16 (and the f16 block also with them); the decision those runs give. Prints the
+// verdicts; KYTY_TEST_F32_FLUSH_REQUIRE=1 makes "stage B passes" a requirement on NVIDIA.
+void CheckF32FlushStageB(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF32FlushStageB";
+  namespace F = ShaderRecompiler::FlushSelfTest;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  const auto declared = vulkan->DeviceFloatControls();
+  auto without = declared;
+  without.denorm_preserve_f16 = false;
+  CodegenOptions on = GetCodegenOptions();
+  on.f32_flush_host = true;
+  on.f32_flush_host_classes = ShaderRecompiler::F32FlushClassAll;
+  ScopedCodegenOptions scope(on);
+  const auto memory = vulkan->MemoryProperties();
+  const auto device = vulkan->Device();
+  {
+    ShaderRecompiler::Spirv::SetHostFloatControls(without);
+    const auto module = F::EmitF16Module();
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string messages;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char *, const spv_position_t &,
+                                 const char *message) { messages += message; });
+    Require(name, "f16 module validates", tools.Validate(module), messages);
+    Require(name, "f16 module forms",
+            CountSpirv(module, "UnpackHalf2x16") == 2u && CountSpirv(module, "PackHalf2x16") == 1u &&
+                CountSpirv(module, "DenormPreserve 16") == 0u &&
+                CountSpirv(module, "SignedZeroInfNanPreserve 32") == 1u,
+            "");
+  }
+  const auto f32_a = [&] {
+    ShaderRecompiler::Spirv::SetHostFloatControls(declared);
+    return RunF32FlushSelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily(), false);
+  }();
+  ShaderRecompiler::Spirv::SetHostFloatControls(without);
+  const auto f32_b = RunF32FlushSelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily(), false);
+  const auto f16_b = RunF16SelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily());
+  ShaderRecompiler::Spirv::SetHostFloatControls(declared);
+  const auto f16_a = RunF16SelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily());
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  Require(name, "the jobs ran", f32_a.ran && f32_b.ran && f16_a.ran && f16_b.ran,
+          f32_a.error + f32_b.error + f16_a.error + f16_b.error);
+  const auto line = [&](const char *what, const F32FlushSelfTestRun &run) {
+    std::printf("[codegen] %-32s %s: %llu of %llu differ%s%s%s%s (%.1f ms)\n", name, what,
+                static_cast<unsigned long long>(run.verdict.mismatches),
+                static_cast<unsigned long long>(run.verdict.checked),
+                run.verdict.mismatches != 0 ? " (" : "", run.verdict.ByOpText().c_str(),
+                run.verdict.mismatches != 0 ? "), first " : "", run.verdict.first.c_str(), run.milliseconds);
+  };
+  line("stage A f32 job (declared modes)", f32_a);
+  line("stage B f32 job (no DenormPreserve 16)", f32_b);
+  line("f16 block, no DenormPreserve 16", f16_b);
+  line("f16 block, declared modes", f16_a);
+  F::DecisionInput in;
+  in.stage_a_classes = F::PassingClasses(f32_a.verdict);
+  in.preserve16_declared = declared.denorm_preserve_f16;
+  in.native_f16_active = ShaderRecompiler::NativeHalfActive();
+  in.stage_b_ran = true;
+  in.stage_b_classes = F::PassingClasses(f32_b.verdict);
+  in.f16_passed = f16_b.verdict.Passed();
+  const auto outcome = F::Decide(in);
+  std::printf("[codegen] %-32s decision on this device: %s (stage A classes %s, stage B classes %s, f16 %s)\n",
+              name,
+              outcome == F::Outcome::AllDeclared ? "all classes, modes as declared"
+              : outcome == F::Outcome::PerClass  ? "per class, modes as declared"
+                                                 : "all classes, no DenormPreserve 16",
+              F::ClassesText(in.stage_a_classes).c_str(), F::ClassesText(in.stage_b_classes).c_str(),
+              in.f16_passed ? "pass" : "fail");
+  if (vulkan->DeviceProperties().vendorID == 0x10deu && std::getenv("KYTY_TEST_F32_FLUSH_REQUIRE") != nullptr) {
+    Require(name, "stage B passes on this NVIDIA device", outcome != F::Outcome::PerClass,
+            f32_b.verdict.first + " / " + f16_b.verdict.first);
+  }
+  // A guest program in the stage B outcome (no DenormPreserve 16, every class on) gives the
+  // flushed results of rcp/rsq/sqrt/exp/log and v_cmp_lt/eq when stage B passed.
+  if (in.stage_b_classes == F::ClassAll) {
+    using O = ShaderOpcode;
+    const auto inputs = F::Inputs();
+    const auto operands = F::Operands();
+    std::vector<std::vector<u32>> values(2);
+    values[0] = inputs;
+    for (u32 i = 0; i < F::InputCount; i++) {
+      values[1].push_back(operands[i % F::OperandCount]);
+    }
+    const auto body = [](std::vector<u32> *code) {
+      code->push_back(EncodeVop1(0x2a, 10, Vgpr(2)));
+      code->push_back(EncodeVop1(0x2e, 11, Vgpr(2)));
+      code->push_back(EncodeVop1(0x33, 12, Vgpr(2)));
+      code->push_back(EncodeVop1(0x25, 13, Vgpr(2)));
+      code->push_back(EncodeVop1(0x27, 14, Vgpr(2)));
+      code->push_back(EncodeVop1(0x01, 20, InlineU32(1)));
+      code->push_back(EncodeVopc(0x01, Vgpr(2), 3));
+      code->push_back(EncodeVop2(0x01, 15, InlineU32(0), 20));
+      code->push_back(EncodeVopc(0x02, Vgpr(2), 3));
+      code->push_back(EncodeVop2(0x01, 16, InlineU32(0), 20));
+    };
+    const auto bulk = MakeBulkCase("CodegenF32FlushStageBGuest", 2, 7, values, body,
+                                   {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
+                                    O::V_LOG_F32, O::V_MOV_B32, O::V_CMP_LT_F32, O::V_CMP_EQ_F32,
+                                    O::V_CNDMASK_B32});
+    CodegenOptions guest = on;
+    guest.host_ftz_inputs = false;
+    guest.denorm_flush_skip = 0;
+    guest.f32_flush_host_classes = F::ClassAll | F::ClassNoPreserve16;
+    ShaderRecompiler::Spirv::SetHostFloatControls(without);
+    const auto result = RunBulk(vulkan, bulk, guest);
+    ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+    u32 differ = 0;
+    for (u32 e = 0; e < bulk.count; e++) {
+      for (u32 o = 0; o < 7; o++) {
+        const auto got = result.words[static_cast<size_t>(2 + o) * bulk.count + e];
+        const auto x = values[0][e];
+        const auto y = values[1][e];
+        const auto expected =
+            o < 5 ? F::ExpectedUnary(static_cast<F::UnaryOp>(o), x)
+                  : (F::ExpectedCompare(o == 5 ? F::CompareOp::OrdLessThan : F::CompareOp::OrdEqual, x, y)
+                         ? 1u : 0u);
+        differ += F::ResultsEqual(got, expected) ? 0u : 1u;
+      }
+    }
+    std::printf("[codegen] %-32s guest program in the stage B outcome: %u of %u results differ\n", name,
+                differ, bulk.count * 7u);
+    Require(name, "the stage B outcome gives the flushed results", differ == 0u, std::to_string(differ));
+  }
+}
+
 // Diagnostic for DenormPreserve 16 (declared where the device takes it): V_CVT_F32_F16 of every
 // f16 denormal and V_CVT_F16_F32 of f32 values that round to f16 denormals (exact ones and ties),
 // with the device's float controls and with DenormPreserve 16 left out, bit-exact against the CPU
@@ -3297,6 +3423,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckTranscendentalDenormInputs(vulkan);
   CheckF32FlushSelfTest(vulkan);
   CheckF16DenormConversions(vulkan);
+  CheckF32FlushStageB(vulkan);
   CheckExecSelects(vulkan);
   CheckInterpolationModes();
   CheckLdsSlots();

@@ -1006,6 +1006,9 @@ inline constexpr uint8_t F32FlushClassExp     = 8u;  // V_EXP_F32 (Exp2)
 inline constexpr uint8_t F32FlushClassLog     = 16u; // V_LOG_F32 (Log2)
 inline constexpr uint8_t F32FlushClassCompare = 32u; // f32 compares of two register operands
 inline constexpr uint8_t F32FlushClassAll     = 63u;
+// Not an op class: the self-test chose its stage B (modules leave DenormPreserve 16 out; the host
+// float controls say so too). Part of the fingerprint through f32_flush_host_classes.
+inline constexpr uint8_t F32FlushClassNoPreserve16 = 64u;
 
 // How a compute shader's LDS allocation is placed on this host (KYTY_LDS_DEVICE_BUFFER,
 // KYTY_LDS_LIMIT_OVERRIDE). dwords: the size the program declares and bounds its accesses by;
