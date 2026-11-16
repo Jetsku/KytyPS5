@@ -229,6 +229,41 @@ std::string Verdict::ByOpText() const {
 	return text;
 }
 
+uint8_t PassingClasses(const Verdict& verdict) {
+	if (verdict.checked == 0) {
+		return 0;
+	}
+	uint8_t classes = 0;
+	for (uint32_t op = 0; op < UnaryOps; op++) {
+		classes |= verdict.by_op[op] == 0u ? static_cast<uint8_t>(1u << op) : 0u;
+	}
+	bool compares = true;
+	for (uint32_t op = UnaryOps; op < UnaryOps + CompareOps; op++) {
+		compares = compares && verdict.by_op[op] == 0u;
+	}
+	return static_cast<uint8_t>(classes | (compares ? ClassCompare : 0u));
+}
+
+std::string ClassesText(uint8_t classes) {
+	if ((classes & ClassAll) == 0u) {
+		return "none";
+	}
+	if ((classes & ClassAll) == ClassAll) {
+		return "all";
+	}
+	std::string text;
+	for (uint32_t op = 0; op < UnaryOps; op++) {
+		if ((classes & (1u << op)) != 0u) {
+			text += text.empty() ? "" : ", ";
+			text += UnaryName(static_cast<UnaryOp>(op));
+		}
+	}
+	if ((classes & ClassCompare) != 0u) {
+		text += text.empty() ? "compares" : ", compares";
+	}
+	return text;
+}
+
 Verdict Classify(std::span<const uint32_t> buffer) {
 	return ClassifyAgainst(
 	    buffer, true,

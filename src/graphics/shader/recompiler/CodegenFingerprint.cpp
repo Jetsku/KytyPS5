@@ -399,6 +399,11 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.f32_flush_host) {
 		b.Text("f32_flush_host");
+		// The self-test's op classes ("nvidia"); absent with all of them (=1), as before.
+		if (options.f32_flush_host_classes != F32FlushClassAll) {
+			b.Text("f32_flush_host_classes");
+			b.U8(options.f32_flush_host_classes);
+		}
 	}
 	if (options.coherent_glc_only != 0u) {
 		b.Text("coherent_glc_only");

@@ -666,19 +666,20 @@ uint32_t EmitFPMaxTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, I
 // FLOAT_MODE 0xC0 flushes f32 denormal inputs to zeros of the same sign (so rcp(-denorm) is
 // -inf). KYTY_HOST_FTZ_INPUTS=1 leaves that to a module declaring DenormFlushToZero 32
 // (CodegenTranscendentalDenormInputs checks the host keeps the sign).
-static uint32_t FlushTranscendentalInput(EmitterState& state, uint32_t value) {
+static uint32_t FlushTranscendentalInput(EmitterState& state, uint32_t value, uint8_t op_class) {
 	if (GetCodegenOptions().host_ftz_inputs && GetHostFloatControls().denorm_flush_f32) {
 		return value;
 	}
-	// KYTY_F32_FLUSH_HOST: the host's default f32 mode flushes these inputs (CodegenOptions).
-	if (F32FlushHost(state)) {
+	// KYTY_F32_FLUSH_HOST: the host's default f32 mode flushes these inputs (CodegenOptions; per op
+	// class with "nvidia", F32FlushSelfTest.h).
+	if (F32FlushHost(state, op_class)) {
 		return value;
 	}
 	return EmitFlushF32DenormToSignedZero(state, value);
 }
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = FlushTranscendentalInput(state, arg0);
+	const auto source = FlushTranscendentalInput(state, arg0, F32FlushClassRcp);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -694,19 +695,19 @@ uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {FlushTranscendentalInput(state, arg0)});
+	               {FlushTranscendentalInput(state, arg0, F32FlushClassRsq)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt, {FlushTranscendentalInput(state, arg0)});
+	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt, {FlushTranscendentalInput(state, arg0, F32FlushClassSqrt)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {FlushTranscendentalInput(state, arg0)});
+	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {FlushTranscendentalInput(state, arg0, F32FlushClassExp)});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450Log2, {FlushTranscendentalInput(state, arg0)});
+	return EmitExt(state, TypeF32(state), GLSLstd450Log2, {FlushTranscendentalInput(state, arg0, F32FlushClassLog)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {

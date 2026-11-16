@@ -275,17 +275,19 @@ void SettleF32FlushHostSelfTest(GraphicContext& graphics) {
 	const char*            value  = std::getenv("KYTY_F32_FLUSH_SELFTEST");
 	const std::string_view setting(value != nullptr ? value : "");
 	if (setting == "off") {
-		ShaderRecompiler::SettleF32FlushHost(true);
-		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is on (device vendor 0x%04x; "
-		            "self-test skipped: KYTY_F32_FLUSH_SELFTEST=off)\n",
+		ShaderRecompiler::SettleF32FlushHost(FlushSelfTest::ClassAll);
+		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is on for all op classes (device vendor "
+		            "0x%04x; self-test skipped: KYTY_F32_FLUSH_SELFTEST=off)\n",
 		            vendor);
 		std::fflush(stdout);
 		return;
 	}
-	const bool force = setting == "fail";
-	const auto run   = RunF32FlushSelfTest(graphics.device, graphics.physical_device_memory_properties,
-	                                       graphics.queue, graphics.queue_family, force);
-	ShaderRecompiler::SettleF32FlushHost(run.Passed());
+	const bool force   = setting == "fail";
+	const auto run     = RunF32FlushSelfTest(graphics.device, graphics.physical_device_memory_properties,
+	                                         graphics.queue, graphics.queue_family, force);
+	// Per op class: the classes whose every result matched keep the host flush.
+	const auto classes = run.ran ? FlushSelfTest::PassingClasses(run.verdict) : uint8_t {0};
+	ShaderRecompiler::SettleF32FlushHost(classes);
 	char phases[128];
 	std::snprintf(phases, sizeof(phases), "%.1f ms: emit %.1f, pipeline %.1f, GPU %.1f, check %.1f",
 	              run.milliseconds, run.emit_ms, run.pipeline_ms, run.gpu_ms, run.check_ms);
@@ -294,20 +296,24 @@ void SettleF32FlushHostSelfTest(GraphicContext& graphics) {
 	        ? std::string("reference = IEEE model")
 	        : "reference differs from the IEEE model in " + std::to_string(run.reference.mismatches) +
 	              " results, first " + run.reference.first;
-	if (run.Passed()) {
-		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is on (device vendor 0x%04x; "
-		            "self-test passed: %" PRIu64 " results of rcp/rsq/sqrt/exp/log and 12 compares on %u "
-		            "denormals equal the flushed inputs' results, %s; %s)\n",
-		            vendor, run.verdict.checked, FlushSelfTest::InputCount, reference.c_str(), phases);
-	} else if (!run.ran) {
+	if (!run.ran) {
 		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is off: the self-test could not run "
 		            "(device vendor 0x%04x; %s; %s)\n",
 		            vendor, run.error.c_str(), phases);
+	} else if (run.verdict.mismatches == 0) {
+		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is on for all op classes (device vendor "
+		            "0x%04x; self-test passed: %" PRIu64 " results of rcp/rsq/sqrt/exp/log and 12 compares on %u "
+		            "denormals equal the flushed inputs' results, %s; %s)\n",
+		            vendor, run.verdict.checked, FlushSelfTest::InputCount, reference.c_str(), phases);
 	} else {
-		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is off: the self-test failed (device "
-		            "vendor 0x%04x; %" PRIu64 " of %" PRIu64 " results differ (%s), first %s; %s; %s)%s\n",
-		            vendor, run.verdict.mismatches, run.verdict.checked, run.verdict.ByOpText().c_str(),
-		            run.verdict.first.c_str(), reference.c_str(), phases,
+		const auto off   = static_cast<uint8_t>(FlushSelfTest::ClassAll & ~classes);
+		const auto state = classes != 0u ? "on for " + FlushSelfTest::ClassesText(classes) + ", off for " +
+		                                       FlushSelfTest::ClassesText(off)
+		                                 : std::string("off: the self-test failed");
+		std::printf("Kyty GPU capabilities: KYTY_F32_FLUSH_HOST=nvidia is %s (device vendor "
+		            "0x%04x; self-test: %" PRIu64 " of %" PRIu64 " results differ (%s), first %s; %s; %s)%s\n",
+		            state.c_str(), vendor, run.verdict.mismatches, run.verdict.checked,
+		            run.verdict.ByOpText().c_str(), run.verdict.first.c_str(), reference.c_str(), phases,
 		            force ? " (forced by KYTY_F32_FLUSH_SELFTEST=fail)" : "");
 	}
 	std::fflush(stdout);

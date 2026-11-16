@@ -29,6 +29,13 @@ constexpr CompareEmit CompareForms[CompareOps] = {
     Compare<spv::OpFOrdGreaterThanEqual>, Compare<spv::OpFUnordGreaterThanEqual>,
 };
 
+static_assert(F32FlushClassRcp == 1u << static_cast<uint32_t>(UnaryOp::Rcp) &&
+              F32FlushClassRsq == 1u << static_cast<uint32_t>(UnaryOp::Rsq) &&
+              F32FlushClassSqrt == 1u << static_cast<uint32_t>(UnaryOp::Sqrt) &&
+              F32FlushClassExp == 1u << static_cast<uint32_t>(UnaryOp::Exp) &&
+              F32FlushClassLog == 1u << static_cast<uint32_t>(UnaryOp::Log) &&
+              F32FlushClassCompare == ClassCompare && F32FlushClassAll == ClassAll);
+
 using UnaryEmit = uint32_t (*)(EmitterState&, uint32_t);
 // V_RCP/RSQ/SQRT/EXP/LOG_F32 as the translator lowers them (UnaryOp order).
 constexpr UnaryEmit UnaryForms[UnaryOps] = {E::EmitFPRecip32, E::EmitFPRecipSqrt32, E::EmitFPSqrt,
@@ -46,9 +53,10 @@ std::vector<uint32_t> EmitModule(std::string* error) {
 	ShaderStageInputInfo input {};
 	input.compute = &compute;
 	EmitterState state(program, input);
-	if (!E::F32FlushHost(state)) {
+	if (!GetCodegenOptions().f32_flush_host || GetCodegenOptions().f32_flush_host_classes != F32FlushClassAll ||
+	    !E::F32FlushHost(state, F32FlushClassAll)) {
 		if (error != nullptr) {
-			*error = "the emitter's host-flush path is off (KYTY_F32_FLUSH_HOST)";
+			*error = "the emitter's host-flush path is not on for every op class (KYTY_F32_FLUSH_HOST)";
 		}
 		return {};
 	}

@@ -703,6 +703,10 @@ struct CodegenOptions {
 	// row or row pair. A partly filled host subgroup lacks lanes the scan would read; the reduction
 	// counts them as the operation's identity, as the guest shader's own masking makes them.
 	bool lane_reductions = true;
+	// KYTY_F32_FLUSH_HOST: the op classes (F32FlushClass* bits) whose f32 denormal inputs are left to
+	// the host while f32_flush_host is on: all of them with =1, the classes that pass the start-up
+	// self-test with "nvidia" (SettleF32FlushHost). The other classes keep the shader-side flush.
+	uint8_t f32_flush_host_classes = 0x3f; // F32FlushClassAll (placed in padding: sizeof stays 256)
 	// KYTY_DISPATCHER_CAP=<n> (default 4096; 0: no cap): a program whose CFG cannot be structured runs
 	// as a dispatcher loop over its blocks (IR::Program::dispatcher_fallback), and an invocation
 	// leaves that loop after n block transitions. A guest loop that never ends (for example a trip
@@ -994,6 +998,14 @@ inline constexpr uint8_t SelectorKeysBitset     = 16u;
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;
 inline constexpr uint8_t DenormFlushSkipGeometry = 4u;
+// CodegenOptions::f32_flush_host_classes.
+inline constexpr uint8_t F32FlushClassRcp     = 1u;  // V_RCP_F32 (OpFDiv 1.0/x)
+inline constexpr uint8_t F32FlushClassRsq     = 2u;  // V_RSQ_F32 (InverseSqrt)
+inline constexpr uint8_t F32FlushClassSqrt    = 4u;  // V_SQRT_F32 (Sqrt)
+inline constexpr uint8_t F32FlushClassExp     = 8u;  // V_EXP_F32 (Exp2)
+inline constexpr uint8_t F32FlushClassLog     = 16u; // V_LOG_F32 (Log2)
+inline constexpr uint8_t F32FlushClassCompare = 32u; // f32 compares of two register operands
+inline constexpr uint8_t F32FlushClassAll     = 63u;
 
 // How a compute shader's LDS allocation is placed on this host (KYTY_LDS_DEVICE_BUFFER,
 // KYTY_LDS_LIMIT_OVERRIDE). dwords: the size the program declares and bounds its accesses by;
@@ -1071,11 +1083,12 @@ void SetCodegenOptions(const CodegenOptions& options);
 void ApplyHostVendor(uint32_t vendor_id);
 // KYTY_F32_FLUSH_HOST=nvidia on an NVIDIA device is on only until the device layer's start-up GPU
 // self-test (F32FlushSelfTest.h) has checked the host behaviour it relies on: true from
-// ApplyHostVendor until SettleF32FlushHost, which keeps the switch (pass) or turns it off (fail),
-// once, before any program is translated or fingerprinted. KYTY_F32_FLUSH_HOST=1 stays on
+// ApplyHostVendor until SettleF32FlushHost, which keeps the host flush for the op classes that
+// passed (F32FlushClass* bits; 0 turns the switch off), once, before any program is translated or
+// fingerprinted. KYTY_F32_FLUSH_HOST=1 stays on
 // without a test.
 [[nodiscard]] bool F32FlushHostAwaitsSelfTest();
-void               SettleF32FlushHost(bool keep);
+void               SettleF32FlushHost(uint8_t classes);
 
 // The BVH lowering mode in effect on this thread: rt_function, unless this thread overrides it
 // (KYTY_RT_DUMP_DIR also emits each RT module inline, mode 0, for size and build-time comparisons).

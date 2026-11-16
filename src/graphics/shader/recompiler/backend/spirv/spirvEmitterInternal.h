@@ -798,8 +798,8 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
 // (EmitFlushF32DenormToSignedZero then returns its operand).
 bool     DenormFlushSkipped(const EmitterState& state);
 // KYTY_F32_FLUSH_HOST in a program without f64: the host's default f32 mode flushes denormal
-// inputs of compares and transcendentals.
-bool     F32FlushHost(const EmitterState& state);
+// inputs of compares and transcendentals, for the op classes (F32FlushClass*) it is on for.
+bool     F32FlushHost(const EmitterState& state, uint8_t op_class);
 // KYTY_NATIVE_F16: two f16 lanes packed in a u32, one f16vec2 operation.
 enum class HalfPkOp : uint32_t { Add, Mul, Min, Max, Fma };
 uint32_t EmitHalfPk(EmitterState& state, HalfPkOp op, uint32_t a, uint32_t b, uint32_t c = 0);

@@ -121,6 +121,14 @@ struct Verdict {
 	[[nodiscard]] std::string ByOpText() const;
 	[[nodiscard]] bool Passed() const { return checked != 0 && mismatches == 0; }
 };
+// The op classes whose results all matched, as CodegenOptions::f32_flush_host_classes bits
+// (F32FlushClassRcp/Rsq/Sqrt/Exp/Log = 1 << UnaryOp, F32FlushClassCompare = 32 for all twelve
+// compares); 0 for a verdict that checked nothing.
+inline constexpr uint8_t ClassCompare = 32u;
+inline constexpr uint8_t ClassAll     = 63u;
+[[nodiscard]] uint8_t     PassingClasses(const Verdict& verdict);
+// "rsq, sqrt, exp, log" ("none" for 0, "all" for ClassAll).
+[[nodiscard]] std::string ClassesText(uint8_t classes);
 // Actual results against the shader's expected results.
 [[nodiscard]] Verdict Classify(std::span<const uint32_t> buffer);
 // The shader's expected results against the model (a check of the reference itself).

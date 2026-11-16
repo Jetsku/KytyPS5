@@ -449,9 +449,10 @@ bool F32FlushHostAwaitsSelfTest() {
 	return g_f32_flush_host_self_test;
 }
 
-void SettleF32FlushHost(bool keep) {
-	Storage().f32_flush_host   = keep;
-	g_f32_flush_host_self_test = false;
+void SettleF32FlushHost(uint8_t classes) {
+	Storage().f32_flush_host         = (classes & F32FlushClassAll) != 0u;
+	Storage().f32_flush_host_classes = static_cast<uint8_t>(classes & F32FlushClassAll);
+	g_f32_flush_host_self_test       = false;
 }
 
 namespace {

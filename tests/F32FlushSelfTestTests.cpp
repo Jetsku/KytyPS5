@@ -160,6 +160,13 @@ void TestClassification() {
 	compare[T::PlaneWord(T::ComparePlane(T::CompareOp::OrdLessThan, 0, false), 0)] |= 1u << 4u;
 	const auto cmp = T::Classify(compare);
 	Check(cmp.ByOpText() == "OpFOrdLessThan 1", "compare mismatches by op");
+	Check(T::PassingClasses(pass) == T::ClassAll && T::ClassesText(T::ClassAll) == "all", "all classes pass");
+	Check(T::PassingClasses(fail) == (T::ClassAll & ~2u) &&
+	          T::ClassesText(T::PassingClasses(fail)) == "rcp, sqrt, exp, log, compares",
+	      "a rsq mismatch removes the rsq class");
+	Check(T::PassingClasses(cmp) == 31u && T::ClassesText(31u) == "rcp, rsq, sqrt, exp, log",
+	      "one compare mismatch removes the compare class");
+	Check(T::PassingClasses(T::Verdict {}) == 0u && T::ClassesText(0u) == "none", "nothing checked, no class");
 	Check(cmp.mismatches == 1u &&
 	          cmp.first == "OpFOrdLessThan(0x00000001, 0x00000002) = true, expected false",
 	      "a compare mismatch names opcode and operands");

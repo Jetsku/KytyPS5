@@ -2000,6 +2000,7 @@ void CheckF32FlushSelfTest(VulkanHarness *vulkan) {
   }
   CodegenOptions on = off;
   on.f32_flush_host = true;
+  on.f32_flush_host_classes = ShaderRecompiler::F32FlushClassAll;
   // The emitter's own flush switches must not change the module (its reference flush is its own).
   on.denorm_flush_skip = ShaderRecompiler::DenormFlushSkipCompute;
   ScopedCodegenOptions scope(on);
@@ -2078,27 +2079,40 @@ void CheckF32FlushSelfTest(VulkanHarness *vulkan) {
                                    {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
                                     O::V_LOG_F32, O::V_MOV_B32, O::V_CMP_LT_F32, O::V_CMP_EQ_F32,
                                     O::V_CNDMASK_B32});
-    CodegenOptions guest = on;
-    guest.host_ftz_inputs = false;
-    guest.denorm_flush_skip = 0;
-    const auto result = RunBulk(vulkan, bulk, guest);
-    std::array<u32, 7> differ{};
-    for (u32 e = 0; e < bulk.count; e++) {
-      const auto x = values[0][e];
-      const auto y = values[1][e];
-      for (u32 o = 0; o < 7; o++) {
-        const auto got = result.words[static_cast<size_t>(2 + o) * bulk.count + e];
-        const auto expected =
-            o < 5 ? F::ExpectedUnary(static_cast<F::UnaryOp>(o), x)
-                  : (F::ExpectedCompare(o == 5 ? F::CompareOp::OrdLessThan : F::CompareOp::OrdEqual, x, y)
-                         ? 1u : 0u);
-        differ[o] += F::ResultsEqual(got, expected) ? 0u : 1u;
+    const auto run_guest = [&](uint8_t classes) {
+      CodegenOptions guest = on;
+      guest.host_ftz_inputs = false;
+      guest.denorm_flush_skip = 0;
+      guest.f32_flush_host_classes = classes;
+      const auto result = RunBulk(vulkan, bulk, guest);
+      std::array<u32, 7> counts{};
+      for (u32 e = 0; e < bulk.count; e++) {
+        const auto x = values[0][e];
+        const auto y = values[1][e];
+        for (u32 o = 0; o < 7; o++) {
+          const auto got = result.words[static_cast<size_t>(2 + o) * bulk.count + e];
+          const auto expected =
+              o < 5 ? F::ExpectedUnary(static_cast<F::UnaryOp>(o), x)
+                    : (F::ExpectedCompare(o == 5 ? F::CompareOp::OrdLessThan : F::CompareOp::OrdEqual, x, y)
+                           ? 1u : 0u);
+          counts[o] += F::ResultsEqual(got, expected) ? 0u : 1u;
+        }
       }
+      std::printf("[codegen] %-32s guest program, host flush for %s: differing results rcp %u rsq %u "
+                  "sqrt %u exp %u log %u lt %u eq %u of %u\n",
+                  name, F::ClassesText(classes).c_str(), counts[0], counts[1], counts[2], counts[3],
+                  counts[4], counts[5], counts[6], bulk.count);
+      return counts;
+    };
+    const auto differ = run_guest(F::ClassAll);
+    // KYTY_F32_FLUSH_HOST=nvidia's per-class mode: the classes the self-test passes give exactly
+    // the flushed results; the others keep the shader-side flush.
+    const auto passing = F::PassingClasses(run.verdict);
+    const auto exact = run_guest(passing);
+    for (u32 o = 0; o < 7; o++) {
+      Require(name, "the per-class mode gives the flushed results", exact[o] == 0u,
+              "output " + std::to_string(o) + ": " + std::to_string(exact[o]) + " differ");
     }
-    std::printf("[codegen] %-32s guest program, flush left to the host: differing results rcp %u "
-                "rsq %u sqrt %u exp %u log %u lt %u eq %u of %u\n",
-                name, differ[0], differ[1], differ[2], differ[3], differ[4], differ[5], differ[6],
-                bulk.count);
     for (u32 o = 0; o < 5; o++) {
       Require(name, "guest program and self-test agree on the unary op",
               (differ[o] == 0u) == (run.verdict.by_op[o] == 0u),
@@ -2126,6 +2140,89 @@ void CheckF32FlushSelfTest(VulkanHarness *vulkan) {
               static_cast<unsigned long long>(run.verdict.mismatches),
               run.verdict.first.empty() ? "" : ", first ", run.verdict.first.c_str(),
               run.milliseconds, module.size());
+}
+
+// Diagnostic for DenormPreserve 16 (declared where the device takes it): V_CVT_F32_F16 of every
+// f16 denormal and V_CVT_F16_F32 of f32 values that round to f16 denormals (exact ones and ties),
+// with the device's float controls and with DenormPreserve 16 left out, bit-exact against the CPU
+// (f16 denormals kept, round to nearest even). Prints the differing counts; fails nothing.
+void CheckF16DenormConversions(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF16DenormConversions";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> values(1);
+  std::vector<u32> expect_f32;  // V_CVT_F32_F16 of input (low half)
+  std::vector<u32> expect_f16;  // V_CVT_F16_F32 of the f32 bits in the input
+  std::vector<u32> f32_inputs;
+  for (u32 sign = 0; sign < 2; sign++) {
+    for (u32 m = 1; m < 1024u; m++) {
+      const u32 h = (sign << 15u) | m;
+      values[0].push_back(h);
+      const float v = static_cast<float>(m) * 0x1p-24f;  // exact
+      expect_f32.push_back(std::bit_cast<u32>(v) | (sign << 31u));
+      // Exact f16 denormal as f32, and the tie above it (k + 0.5) * 2^-24 -> even.
+      const u32 tie = (m % 2u) == 0u ? m : m + 1u;
+      f32_inputs.push_back(std::bit_cast<u32>(v) | (sign << 31u));
+      expect_f16.push_back(h);
+      const float t = (static_cast<float>(m) + 0.5f) * 0x1p-24f;
+      f32_inputs.push_back(std::bit_cast<u32>(t) | (sign << 31u));
+      expect_f16.push_back((sign << 15u) | tie);
+    }
+  }
+  while (values[0].size() % 64u != 0u) {
+    values[0].push_back(0u);
+    expect_f32.push_back(0u);
+  }
+  while (f32_inputs.size() % 64u != 0u) {
+    f32_inputs.push_back(0u);
+    expect_f16.push_back(0u);
+  }
+  const auto to_f32 = MakeBulkCase(name, 1, 1, values,
+                                   [](std::vector<u32> *code) {
+                                     code->push_back(EncodeVop1(0x0b, 10, Vgpr(2)));  // v_cvt_f32_f16
+                                   },
+                                   {O::V_CVT_F32_F16});
+  std::vector<std::vector<u32>> f32_values(1, f32_inputs);
+  const auto to_f16 = MakeBulkCase(name, 1, 1, f32_values,
+                                   [](std::vector<u32> *code) {
+                                     code->push_back(EncodeVop1(0x0a, 10, Vgpr(2)));  // v_cvt_f16_f32
+                                   },
+                                   {O::V_CVT_F16_F32});
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  const auto device = vulkan->DeviceFloatControls();
+  for (const bool preserve16 : {true, false}) {
+    auto controls = device;
+    controls.denorm_preserve_f16 = preserve16 && device.denorm_preserve_f16;
+    if (!preserve16 && !device.denorm_preserve_f16) {
+      continue;
+    }
+    ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+    const auto a = RunBulk(vulkan, to_f32, GetCodegenOptions());
+    const auto b = RunBulk(vulkan, to_f16, GetCodegenOptions());
+    u32 bad_f32 = 0;
+    u32 bad_f16 = 0;
+    std::string first;
+    for (u32 e = 0; e < to_f32.count; e++) {
+      const auto got = a.words[static_cast<size_t>(to_f32.count) + e];
+      if (got != expect_f32[e]) {
+        if (bad_f32++ == 0u) {
+          first = "f32(f16 " + Hex(values[0][e]) + ") = " + Hex(got) + ", expected " + Hex(expect_f32[e]);
+        }
+      }
+    }
+    for (u32 e = 0; e < to_f16.count; e++) {
+      const auto got = b.words[static_cast<size_t>(to_f16.count) + e] & 0xffffu;
+      if (got != expect_f16[e]) {
+        if (bad_f16++ == 0u && first.empty()) {
+          first = "f16(f32 " + Hex(f32_inputs[e]) + ") = " + Hex(got) + ", expected " + Hex(expect_f16[e]);
+        }
+      }
+    }
+    std::printf("[codegen] %-32s DenormPreserve 16 %s: v_cvt_f32_f16 %u of %u differ, v_cvt_f16_f32 %u of "
+                "%u differ%s%s\n",
+                name, controls.denorm_preserve_f16 ? "declared" : "left out", bad_f32, to_f32.count, bad_f16,
+                to_f16.count, first.empty() ? "" : ", first ", first.c_str());
+  }
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
 }
 
 // A compressed export to a SNORM16_ABGR target (SPI_SHADER_COL_FORMAT 6) carries
@@ -3199,6 +3296,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
   CheckF32FlushSelfTest(vulkan);
+  CheckF16DenormConversions(vulkan);
   CheckExecSelects(vulkan);
   CheckInterpolationModes();
   CheckLdsSlots();

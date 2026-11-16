@@ -266,8 +266,10 @@ bool DenormFlushSkipped(const EmitterState& state) {
 	return (skip & (1u << DenormFlushStage(state))) != 0u;
 }
 
-bool F32FlushHost(const EmitterState& state) {
-	return GetCodegenOptions().f32_flush_host && !state.requirements.float64;
+bool F32FlushHost(const EmitterState& state, uint8_t op_class) {
+	const auto& options = GetCodegenOptions();
+	return options.f32_flush_host && (options.f32_flush_host_classes & op_class) != 0u &&
+	       !state.requirements.float64;
 }
 
 // KYTY_NATIVE_F16 (Erlou93/KytyPS5-Yotei): V_PK_ADD/MUL/MIN/MAX_F16 as one f16vec2 instruction.
