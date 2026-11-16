@@ -4,11 +4,13 @@
 #include "common/handoffLean.h"
 #include "common/hangWatchdog.h"
 #include "common/helperPriority.h"
+#include "common/liveSwitch.h"
 #include "common/spinGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cinttypes>
 #include <new>
@@ -850,6 +852,16 @@ void Ring::WakeConsumer() noexcept {
 // ------------------------------------------------------------------------------------------------
 // Encoder
 
+// KYTY_RING_KICK_EVERY=<n> (live, default 0 = 1: every draw and dispatch packet): a draw or dispatch
+// packet kicks the consumer (publication plus the parked-consumer check, on the cache line the
+// recorder polls) only every n-th time; Submit and DrainMarker packets, and every wait of the
+// producer (WaitConsumed, a full ring), still kick. Packets in between are published by the
+// publication batch (Ring::SetPublishBatch). At the Playroom GPU Jungle the commit thread kicks
+// ~10,000 times per flip.
+static Live::Switch g_ring_kick_every("KYTY_RING_KICK_EVERY", [](const char* value) -> int64_t {
+	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 4096) : 0;
+});
+
 Encoder::Writer Encoder::Open(Op op, uint64_t payload, bool barrier) {
 	if (m_open_hook != nullptr) [[unlikely]] {
 		const auto hook = m_open_hook;
@@ -900,7 +912,11 @@ void Encoder::Close(Writer& writer, uint64_t hash) {
 	const auto op = writer.GetHeader()->op;
 	m_ring.Commit(writer.Size());
 	if (KicksConsumer(op)) {
-		m_ring.Kick(m_stats);
+		const auto every = static_cast<uint32_t>(g_ring_kick_every.Get());
+		if (every <= 1u || op == Op::Submit || op == Op::DrainMarker || ++m_kick_skipped >= every) {
+			m_kick_skipped = 0;
+			m_ring.Kick(m_stats);
+		}
 	}
 	if (m_options.after_commit != nullptr) {
 		// Inline replay reads only published packets.

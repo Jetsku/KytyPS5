@@ -799,6 +799,7 @@ private:
 	uint64_t  m_bytes      = 0;
 	uint64_t  m_cb_digest  = 0;
 	uint64_t  m_cb_packets = 0;
+	uint32_t  m_kick_skipped = 0; // KYTY_RING_KICK_EVERY
 	void (*m_open_hook)(void* context) = nullptr;
 	void* m_open_hook_context          = nullptr;
 };
