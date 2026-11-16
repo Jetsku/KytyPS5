@@ -362,7 +362,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
                     uint32_t slot, uint32_t& buffer_offset,
                     const std::vector<GuestRange>* written_ranges, bool uniform_view,
-                    std::pair<Buffer*, uint64_t>* obtained = nullptr) {
+                    std::pair<Buffer*, uint64_t>* obtained = nullptr, bool names = true) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -467,6 +467,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (invalidate_start != 0) {
 		BufferLookupStats::AddPart(BufferLookupStats::Part::Invalidate,
 		                           BufferLookupStats::Now() - invalidate_start);
+	}
+	if (!names) {
+		return result; // KYTY_REBIND_LEAN: no object names are wanted (RebindBuffers checked)
 	}
 	const char* access = "Read";
 	if (resource.written && resource.read) {
@@ -5485,6 +5488,8 @@ void Note(State& s) {
 }
 } // namespace KeepBindings
 
+static Live::Switch g_rebind_lean("KYTY_REBIND_LEAN", Live::ParseDefaultOff);
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	prepared.write_preparation_tick = BufferCache::ShaderWriteRetickEnabled()
@@ -5512,8 +5517,16 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	auto& write_scratch = ThreadWriteRangeScratch();
+	// KYTY_REBIND_LEAN (live, default 0): the per-call parts of this loop hoisted out of the bindings:
+	// the write-range scratch and the keep state (thread-locals) only when used, the uniform-view
+	// test as a bit mask built once instead of a binary search per binding, and the object-name
+	// gate checked once (no name is set unless the debug dump, RenderDoc or the address-binding
+	// report wants one). Results are the same.
+	const bool lean = g_rebind_lean.On();
+	WriteRangeScratch* write_scratch = lean ? nullptr : &ThreadWriteRangeScratch();
 	bool  write_ranges_evaluated = false;
+	const bool object_names = !lean || Config::GraphicsDebugDumpEnabled() || Config::RenderDocEnabled() ||
+	                          AddressBindingReportActive();
 	// All bindings' uploads share one barrier pair (KYTY_UPLOAD_BATCH).
 	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
 	// KYTY_CP_BINDING_BATCH_PREFETCH: the memo slots of every read binding first, so their cache
@@ -5540,20 +5553,39 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (keep_stage && !RegionManager::AnySerialEnabled()) {
 		RegionManager::EnableAnySerial();
 	}
-	auto& keep_state = KeepBindings::Get();
+	static KeepBindings::State unused_keep_state; // (never touched: keep_stage is false)
+	auto& keep_state = !lean || keep_stage ? KeepBindings::Get() : unused_keep_state;
 	auto& keep_slots = keep_state.stages[program.stage == ShaderType::Pixel ? 1 : 0];
 	auto& cache      = m_context.GetBufferCache();
+	uint64_t uniform_mask = 0;
+	bool     uniform_wide = false; // an index past the mask: binary search as before
+	if (lean && uniform_binding != nullptr) {
+		for (const auto index: uniform_binding->resources) {
+			if (index < 64u) {
+				uniform_mask |= uint64_t {1} << index;
+			} else {
+				uniform_wide = true;
+			}
+		}
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t   buffer_offset = 0;
 		const auto ranges_start  = program.info.buffers[i].written ? BufferLookupStats::Now() : 0;
-		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
-		                                                write_ranges_evaluated, write_scratch);
+		if (write_scratch == nullptr && program.info.buffers[i].written) {
+			write_scratch = &ThreadWriteRangeScratch();
+		}
+		const auto* written      = write_scratch == nullptr
+		                               ? nullptr
+		                               : ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
+		                                                      write_ranges_evaluated, *write_scratch);
 		if (ranges_start != 0) {
 			BufferLookupStats::AddPart(BufferLookupStats::Part::WriteRanges,
 			                           BufferLookupStats::Now() - ranges_start);
 		}
 		const bool uniform_view = uniform_binding != nullptr &&
-		                          std::ranges::binary_search(uniform_binding->resources, i);
+		                          (lean && (i < 64u || !uniform_wide)
+		                               ? i < 64u && (uniform_mask >> i & 1u) != 0
+		                               : std::ranges::binary_search(uniform_binding->resources, i));
 		const auto& source      = prepared.buffer_sources[i];
 		const auto& res         = program.info.buffers[i];
 		const bool  same_stats  = BindingSame::Enabled() && i < BindingSame::kSlots &&
@@ -5575,7 +5607,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			const auto stamp = keep_slot ? cache.KeepBegin() : BufferCache::KeepStamp {};
 			std::pair<Buffer*, uint64_t> obtained {nullptr, 0};
 			const auto info = NativeStorageBuffer(m_context, source, res, program.stage, i, buffer_offset, written,
-			                                      uniform_view, keep_slot ? &obtained : nullptr);
+			                                      uniform_view, keep_slot ? &obtained : nullptr, object_names);
 			if (keep_valid) {
 				// Verify (2) or the diagnostics' probe: what the keep would have bound.
 				keep_state.checks++;

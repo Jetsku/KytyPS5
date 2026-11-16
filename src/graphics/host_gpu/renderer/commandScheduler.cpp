@@ -316,13 +316,30 @@ static bool PendingOpsNoWait() {
 // operation belongs to the recording tick: the two cases in which the locked check returns without
 // doing anything. At the Playroom GPU Jungle the lock and unlock cost ~0.2 ms per flip (10,000 draws).
 // A push racing the read is seen by the next pop, as a push just after a locked check is.
-static Live::Switch g_pop_ready_fast("KYTY_POP_READY_FAST", Live::ParseDefaultOff);
+static Live::Switch g_pop_ready_fast("KYTY_POP_READY_FAST", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+});
 
+// KYTY_POP_READY_FAST=2: also without the lock while the front operation's tick is not known
+// complete; the GPU's progress is then queried (MasterSemaphore::Refresh, a driver call) at most every
+// 50 us, as KYTY_PENDING_REFRESH_US=50 would (the operations are deletions and recycling nothing at a
+// draw waits for; every blocking pop still queries).
 void CommandScheduler::PopReadyOperations() {
-	if (g_pop_ready_fast.On() && Common::RendererBatchEnabled()) {
+	if (const auto fast = g_pop_ready_fast.Get(); fast != 0 && Common::RendererBatchEnabled()) {
 		const auto front = m_pending_front_tick.load(std::memory_order_acquire);
 		if (front == UINT64_MAX || front >= CurrentTick()) {
 			return;
+		}
+		if (fast >= 2 && !m_master.IsFree(front)) {
+			const auto now = GpuTiming::NowNs();
+			if (now - m_last_pending_refresh_ns < 50'000u) {
+				return;
+			}
+			m_last_pending_refresh_ns = now;
+			m_master.Refresh();
+			if (!m_master.IsFree(front)) {
+				return;
+			}
 		}
 	}
 	PopOperations(!PendingOpsNoWait());
