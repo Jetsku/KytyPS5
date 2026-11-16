@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/staticOnce.h"
 #include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/aaMaskCoverage.h"
 #include "common/ramStats.h"
@@ -1047,10 +1048,12 @@ bool TryReadShaderCleanBacking(void*, uint64_t address, std::span<uint32_t> valu
 }
 
 bool ResourceReuseEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_RESOURCE_REUSE");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -3330,10 +3333,12 @@ struct PipelineCache::ProgramCache {
 	};
 
 	static bool LookupMemoEnabled() {
-		static const bool enabled = [] {
+		static constexpr auto enabled_init = [] {
 			const auto* value = std::getenv("KYTY_PROGRAM_LOOKUP_MEMO");
 			return value == nullptr || std::strcmp(value, "0") != 0;
-		}();
+		};
+		static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+		const bool& enabled = enabled_once.Get(enabled_init);
 		return enabled;
 	}
 

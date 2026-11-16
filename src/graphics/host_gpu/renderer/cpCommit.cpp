@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cpCommit.h"
+#include "common/staticOnce.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -66,7 +67,8 @@ uint32_t ParseParts() {
 } // namespace
 
 uint32_t Parts() {
-	static const uint32_t parts = ParseParts();
+	static constinit Common::StaticOnce<uint32_t> parts_once;
+	const uint32_t& parts = parts_once.Get([&] { return ParseParts(); });
 	return parts;
 }
 

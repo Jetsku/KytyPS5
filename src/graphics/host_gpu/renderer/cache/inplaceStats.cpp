@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/inplaceStats.h"
+#include "common/staticOnce.h"
 
 #include <algorithm>
 #include <atomic>
@@ -101,7 +102,7 @@ const char* KindName(int kind) {
 
 // 0 off, 1 full (per-page classification), 2 "lite" (byte and fault counts only, no page map).
 int Mode() noexcept {
-	static const int mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = std::getenv("KYTY_INPLACE_STATS");
 		if (value == nullptr) {
 			return 0;
@@ -110,7 +111,9 @@ int Mode() noexcept {
 			return 1;
 		}
 		return std::strcmp(value, "lite") == 0 ? 2 : 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const int& mode = mode_once.Get(mode_init);
 	return mode;
 }
 

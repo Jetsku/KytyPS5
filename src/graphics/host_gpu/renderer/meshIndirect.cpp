@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/meshIndirect.h"
+#include "common/staticOnce.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -19,7 +20,7 @@
 namespace Libs::Graphics::MeshIndirect {
 
 Mode GetMode() {
-	static const Mode mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = std::getenv("KYTY_NATIVE_INDIRECT_MESH");
 		// Default on: the CPU path drains the GPU for every argument record it reads.
 		if (value == nullptr || value[0] == '\0') {
@@ -45,7 +46,9 @@ Mode GetMode() {
 		             "empty\n",
 		             value);
 		return Mode::Empty;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const Mode& mode = mode_once.Get(mode_init);
 	return mode;
 }
 

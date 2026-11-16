@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/watchRange.h"
+#include "common/staticOnce.h"
 
 #include "common/logging/log.h"
 
@@ -22,7 +23,7 @@ struct Config {
 };
 
 const Config& Get() {
-	static const Config config = [] {
+	static constexpr auto config_init = [] {
 		Config c;
 		const char* text = std::getenv("KYTY_WATCH_RANGE");
 		while (text != nullptr && *text != '\0') {
@@ -40,7 +41,9 @@ const Config& Get() {
 			c.lines = static_cast<uint32_t>(std::strtoul(lines, nullptr, 0));
 		}
 		return c;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(config_init())>> config_once;
+	const Config& config = config_once.Get(config_init);
 	return config;
 }
 
@@ -56,10 +59,12 @@ bool Enabled() noexcept {
 }
 
 bool CpFaultWritersEnabled() noexcept {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_CP_FAULT_WRITERS");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

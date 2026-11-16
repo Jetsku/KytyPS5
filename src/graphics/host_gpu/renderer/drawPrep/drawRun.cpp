@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 #include "graphics/host_gpu/renderer/drawPrep/texDelta.h"
@@ -143,10 +144,12 @@ void NoteForeignActivity(const char* what) noexcept {
 }
 
 bool QuietOpsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_OPS");
 		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

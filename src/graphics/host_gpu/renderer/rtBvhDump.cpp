@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/rtBvhDump.h"
+#include "common/staticOnce.h"
 
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -24,7 +25,7 @@ namespace {
 
 // Requested dispatch ordinals, sorted and unique; empty = off.
 const std::vector<uint64_t>& DumpOrdinals() {
-	static const std::vector<uint64_t> ordinals = [] {
+	static constexpr auto ordinals_init = [] {
 		std::vector<uint64_t> list;
 		const char*           value = std::getenv("KYTY_RT_DUMP_BVH");
 		if (value == nullptr) {
@@ -44,7 +45,9 @@ const std::vector<uint64_t>& DumpOrdinals() {
 		std::sort(list.begin(), list.end());
 		list.erase(std::unique(list.begin(), list.end()), list.end());
 		return list;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(ordinals_init())>> ordinals_once;
+	const std::vector<uint64_t>& ordinals = ordinals_once.Get(ordinals_init);
 	return ordinals;
 }
 

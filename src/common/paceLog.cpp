@@ -1,4 +1,5 @@
 #include "common/paceLog.h"
+#include "common/staticOnce.h"
 
 #include <array>
 #include <atomic>
@@ -155,10 +156,12 @@ void NoteWait(uint64_t begin_ns, uint64_t end_ns, int tid, int filter, uint64_t 
 }
 
 bool StallTraceEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_STALL_TRACE");
 		return value != nullptr && value[0] == '1' && Enabled() && g_waits != nullptr;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

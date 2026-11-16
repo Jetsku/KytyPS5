@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "common/staticOnce.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -307,10 +308,12 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 // depth target whose pass sets DB_RENDER_CONTROL.DEPTH_COMPRESS_DISABLE is bound even with the
 // depth and stencil tests off, so its pending HTile clear is materialised.
 static bool DepthCompressDisableBind() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_DEPTH_COMPRESS_DISABLE_BIND");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -395,10 +398,12 @@ void SetStencilTraceDraw(uint32_t index_count, uint64_t ps_addr, uint32_t color_
 }
 
 static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r) {
-	static const int ref = [] {
+	static constexpr auto ref_init = [] {
 		const auto* value = std::getenv("KYTY_STENCIL_REF_TRACE");
 		return value != nullptr && value[0] != '\0' ? std::atoi(value) : -1;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(ref_init())>> ref_once;
+	const int& ref = ref_once.Get(ref_init);
 	const auto& sm = hw.GetStencilMask();
 	if (ref < 0 || (sm.stencil_testval != ref && sm.stencil_opval != ref)) {
 		return;

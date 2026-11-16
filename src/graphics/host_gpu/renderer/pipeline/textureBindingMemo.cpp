@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
+#include "common/staticOnce.h"
 
 #include "common/assert.h"
 #include "common/onceValue.h"
@@ -237,11 +238,13 @@ void TextureBindingMemo::ReportRevalidateMismatch() {
 }
 
 uint32_t TextureBindingMemo::SlotCount() {
-	static const uint32_t slots = [] {
+	static constexpr auto slots_init = [] {
 		const auto* value = std::getenv("KYTY_TEXTURE_MEMO_SLOTS");
 		const auto  count = value != nullptr && value[0] != '\0' ? std::strtoul(value, nullptr, 10) : 0ul;
 		return count >= 64 && count <= (1ul << 22u) ? static_cast<uint32_t>(count) : 4096u;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(slots_init())>> slots_once;
+	const uint32_t& slots = slots_once.Get(slots_init);
 	return slots;
 }
 
@@ -484,12 +487,14 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
 }
 
 uint32_t TextureBindingMemo::SecondSets() {
-	static const uint32_t sets = [] {
+	static constexpr auto sets_init = [] {
 		const auto* value = std::getenv("KYTY_IMG_MEMO2_SLOTS");
 		const auto  count = value != nullptr && value[0] != '\0' ? std::strtoul(value, nullptr, 10) : 0ul;
 		const auto  slots = count >= 256 && count <= (1ul << 22u) ? static_cast<uint32_t>(count) : 32768u;
 		return slots / SecondWays;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(sets_init())>> sets_once;
+	const uint32_t& sets = sets_once.Get(sets_init);
 	return sets;
 }
 

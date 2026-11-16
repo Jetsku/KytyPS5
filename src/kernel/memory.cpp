@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "common/staticOnce.h"
 #include "graphics/host_gpu/watchRange.h"
 #include "common/prepPhases.h"
 
@@ -330,10 +331,12 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 // (VirtualRanges::m_generation). Buffer bindings clamp every V# range (tens of thousands per
 // frame); the locked lookup was about 1.2 ms per flip on the command processor (U49).
 static bool ClampRangeMemoEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CLAMP_RANGE_MEMO");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -344,22 +347,26 @@ static bool ClampRangeMemoEnabled() {
 // generation they check. A streaming game changes protections hundreds of times a second, and
 // every change made every thread's next clamps miss and re-walk the ranges under the lock.
 static bool ClampCoverageGenerationEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_CLAMP_COVERAGE_GEN");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
 // KYTY_CLAMP_RANGE_MEMO_VERIFY=1|exit: every cached answer is compared with the locked lookup.
 static int ClampRangeMemoVerifyMode() {
-	static const int mode = [] {
+	static constexpr auto mode_init = [] {
 		const auto* value = std::getenv("KYTY_CLAMP_RANGE_MEMO_VERIFY");
 		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(mode_init())>> mode_once;
+	const int& mode = mode_once.Get(mode_init);
 	return mode;
 }
 

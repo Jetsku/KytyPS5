@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/watchRange.h"
+#include "common/staticOnce.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -358,7 +359,7 @@ uint32_t NanScanTake() {
 		std::filesystem::path trigger;
 		uint32_t              count = 8000;
 	};
-	static const Request request = [] {
+	static constexpr auto request_init = [] {
 		Request parsed;
 		if (const char* value = std::getenv("KYTY_NAN_SCAN"); value != nullptr && value[0] != '\0') {
 			std::string text(value);
@@ -369,7 +370,9 @@ uint32_t NanScanTake() {
 			parsed.trigger = std::filesystem::path(text) / "scan.now";
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(request_init())>> request_once;
+	const Request& request = request_once.Get(request_init);
 	if (request.trigger.empty()) return 0;
 	static uint32_t left  = 0; // GPU thread only
 	static uint32_t polls = 0;
@@ -428,7 +431,7 @@ struct State {
 };
 State& Get() {
 	static State s;
-	static const bool parsed = [] {
+	static constexpr auto parsed_init = [] {
 		State& st = s;
 		if (const char* value = std::getenv("KYTY_PASS_DUMP"); value != nullptr && value[0] != '\0') {
 			std::string text(value);
@@ -441,7 +444,9 @@ State& Get() {
 			            st.step);
 		}
 		return true;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(parsed_init())>> parsed_once;
+	const bool& parsed = parsed_once.Get(parsed_init);
 	(void)parsed;
 	return s;
 }
@@ -640,7 +645,7 @@ bool FrameTraceTake() {
 		std::filesystem::path trigger;
 		uint32_t              count = 4000;
 	};
-	static const Request request = [] {
+	static constexpr auto request_init = [] {
 		Request parsed;
 		if (const char* value = std::getenv("KYTY_FRAME_TRACE"); value != nullptr && value[0] != '\0') {
 			std::string text(value);
@@ -652,7 +657,9 @@ bool FrameTraceTake() {
 			parsed.trigger = std::filesystem::path(text) / "trace.now";
 		}
 		return parsed;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(request_init())>> request_once;
+	const Request& request = request_once.Get(request_init);
 	if (request.trigger.empty()) return false;
 	static std::atomic<uint32_t> left {0};
 	static std::atomic<uint32_t> polls {0};
@@ -1791,10 +1798,12 @@ bool RenderExecutor::BindComputeLds(const ShaderComputeInputInfo& input, Prepare
 // guest wave without emulated LDS runs one workgroup per vkCmdDispatchBase, in launch order with a
 // barrier between them, so ordered-append counters see the workgroups in order. Logged once.
 bool OrderedAppendSplitEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_ORDERED_APPEND");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

@@ -139,6 +139,20 @@ void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept;
 // line's live sequence number), e.g. the KYTY_HLE_WAIT_STATS per-thread totals.
 void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept;
 
+// jgcp measurement: event counters printed on every application line with KYTY_LIVE_FILE (once any
+// counter is non-zero), so a
+// per-event dose (KYTY_LIVE_TEST_*) converts into a cost per flip:
+//   ... counts [drawidx D, suspend S, submits B]: ...
+// drawidx: indexed draw ops the command processor executed (ExecDrawIndex, the per-draw spin's
+// site); suspend: sceAgcSuspendPoint calls; submits: AGC DCB/command-buffer submit calls.
+enum class TestCounter : uint32_t { DrawIndexOps, SuspendPoints, AgcSubmits, Count };
+// One writer per counter at a time is not required (relaxed add).
+void CountTest(TestCounter counter) noexcept;
+// Single-writer form (the command processor's thread only): no locked instruction.
+void CountTestSingleWriter(TestCounter counter) noexcept;
+// Busy-waits `ns` nanoseconds on the calling thread (doses).
+void TestSpinNs(int64_t ns) noexcept;
+
 namespace Testing {
 // What the live-control thread does with the file's text: parse it and stage the changes.
 void StageText(std::string_view text);

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/staticOnce.h"
 #include "common/common.h"
 #include "common/hangTrace.h"
 #include "common/liveSwitch.h"
@@ -65,10 +66,12 @@ static bool EnvSwitch(const char* name, bool default_value) {
 // write-after-write the barrier made for the shader reads did not cover) and a write-back for the
 // driver.
 static vk::AttachmentStoreOp DepthStoreOp(vk::ImageLayout layout, bool stencil) {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_DEPTH_RO_STORE_NONE");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (enabled) {
 		switch (layout) {
 			case vk::ImageLayout::eDepthStencilReadOnlyOptimal: return vk::AttachmentStoreOp::eNone;
@@ -103,7 +106,8 @@ bool BarrierSinkEnabled() {
 }
 
 bool UploadBatchEnabled() {
-	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_UPLOAD_BATCH", true);
+	static constinit Common::StaticOnce<bool> enabled_once;
+	const bool& enabled = enabled_once.Get([&] { return BarrierBatchEnabled() && EnvSwitch("KYTY_UPLOAD_BATCH", true); });
 	return enabled;
 }
 

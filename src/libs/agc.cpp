@@ -1,4 +1,5 @@
 #include "common/hleWaitStats.h"
+#include "common/liveSwitch.h"
 #include "libs/agc.h"
 
 #include "common/assert.h"
@@ -1746,9 +1747,24 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 	return OK;
 }
 
+// jgcp measurement doses on the guest threads (default 0, live; liveSwitch.h counts [..]):
+// KYTY_LIVE_TEST_SUSPEND_SPIN_US busy-waits that long in every sceAgcSuspendPoint before the frame
+// boundary is recorded (once per guest frame, on the thread that ends the frame);
+// KYTY_LIVE_TEST_SUBMIT_SPIN_NS busy-waits that long in every graphics DCB submit before the
+// submission is queued (on the submitting guest thread).
+static Live::Switch g_test_suspend_spin_us("KYTY_LIVE_TEST_SUSPEND_SPIN_US", [](const char* value) -> int64_t {
+	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 100000) : 0;
+});
+static Live::Switch g_test_submit_spin_ns("KYTY_LIVE_TEST_SUBMIT_SPIN_NS", [](const char* value) -> int64_t {
+	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 100000000) : 0;
+});
+
 int KYTY_SYSV_ABI AgcSuspendPoint() {
 	HleWait::Scope hle_wait_scope(HleWait::AgcSuspend); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
+
+	Live::CountTest(Live::TestCounter::SuspendPoints);
+	Live::TestSpinNs(g_test_suspend_spin_us.Get() * 1000);
 
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Done();
@@ -4392,6 +4408,8 @@ struct TessellationDriverState {
 static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	Live::CountTest(Live::TestCounter::AgcSubmits);
+	Live::TestSpinNs(Gen5::g_test_submit_spin_ns.Get());
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});

@@ -1,4 +1,5 @@
 #include "common/hangWatchdog.h"
+#include "common/staticOnce.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
@@ -561,10 +562,12 @@ void ReportDeadView(const char* where, const char* what, uint32_t index, VkImage
 } // namespace
 
 bool DeadViewScrubEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_DEAD_VIEW_SCRUB");
 		return value != nullptr && std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 

@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/command_processor/passCensus.h"
+#include "common/staticOnce.h"
 
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -113,22 +114,26 @@ bool OnGpuThread() {
 } // namespace
 
 bool Enabled() {
-	static const bool on = [] {
+	static constexpr auto on_init = [] {
 		const char* value = std::getenv("KYTY_TRACE_PASS_CENSUS");
 		const bool  o     = value != nullptr && value[0] == '1';
 		if (o) std::printf("KYTY_TRACE_PASS_CENSUS enabled (diagnostic)\n");
 		return o;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(on_init())>> on_once;
+	const bool& on = on_once.Get(on_init);
 	return on;
 }
 
 bool LabelsEnabled() {
-	static const bool on = [] {
+	static constexpr auto on_init = [] {
 		const char* value = std::getenv("KYTY_TRACE_VK_LABELS");
 		const bool  o     = value != nullptr && value[0] != '\0' ? value[0] != '0' : Config::RenderDocEnabled();
 		if (o) std::printf("Vulkan debug labels: on (game markers and shader hashes; KYTY_TRACE_VK_LABELS)\n");
 		return o;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(on_init())>> on_once;
+	const bool& on = on_once.Get(on_init);
 	return on;
 }
 

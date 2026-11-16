@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/occlusion.h"
+#include "common/staticOnce.h"
 #include "common/hangTrace.h"
 #include "common/alignment.h"
 #include "common/profiler.h"
@@ -34,13 +35,15 @@ std::mutex  g_debug_mutex;
 bool        g_debug_on = false;
 uint64_t    g_debug_checks = 0;
 bool DebugLogConfigured() {
-	static const bool configured = [] {
+	static constexpr auto configured_init = [] {
 		const auto* value = std::getenv("KYTY_OCCLUSION_LOG");
 		if (value == nullptr || value[0] == '\0') return false;
 		g_debug_log = std::fopen(value, "w");
 		g_debug_trigger = std::string(value) + ".on";
 		return g_debug_log != nullptr;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(configured_init())>> configured_once;
+	const bool& configured = configured_once.Get(configured_init);
 	return configured;
 }
 }

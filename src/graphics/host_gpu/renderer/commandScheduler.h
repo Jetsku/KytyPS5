@@ -203,6 +203,9 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
+	// KYTY_POP_READY_FAST: the tick of m_pending_operations' front (UINT64_MAX: empty), written under
+	// m_operation_mutex at every push and pop; PopReadyOperations reads it without the lock.
+	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
