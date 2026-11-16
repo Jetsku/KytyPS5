@@ -270,6 +270,9 @@ struct DrawAutoArgs {
 //   is memory dependencies of ShaderAccess/guest origin only (or empty). 3: as 2, and also when
 //   image/buffer barriers or upload copies of the dispatch's own resources are pending: those are
 //   recorded alone (without the memory dependency) before the dispatch.
+//   4: as 3, and a dispatch with untracked accesses (imprecise; all its accesses are compute shader
+//   accesses) keeps the chain valid but poisoned instead of ending it: nothing passes it, but the
+//   ShaderAccess flush after it (compute -> all commands) restarts a clean chain.
 // KYTY_GPU_HAZARD_COUNT=1 (live, default 0): per-flip counters on the live lines (" haz [..]"),
 // also at mode 0 for the batch/pass counts.
 [[nodiscard]] int64_t GpuHazardMode();

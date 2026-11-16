@@ -51,7 +51,7 @@ static Live::Switch g_pm4_guest_barriers("KYTY_PM4_BARRIERS", [](const char* val
 
 // KYTY_GPU_HAZARD / KYTY_GPU_HAZARD_COUNT (render.h GpuHazardMode): live; default 0.
 static Live::Switch g_gpu_hazard("KYTY_GPU_HAZARD", [](const char* value) -> int64_t {
-	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 3) : 0;
+	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 4) : 0;
 });
 static Live::Switch g_gpu_hazard_count("KYTY_GPU_HAZARD_COUNT", Live::ParseDefaultOff);
 
@@ -621,7 +621,7 @@ bool CommandBuffer::DecideDispatchHazard(const DispatchAccess& access, bool over
 		note(HazCount::Impre);
 		return false;
 	}
-	if (!m_haz_chain.Intact(m_haz_foreign)) {
+	if (!m_haz_chain.Intact(m_haz_foreign) || m_haz_chain.guest.Poisoned()) {
 		note(HazCount::Inval);
 		if (!m_haz_chain.valid) {
 			note(HazCount::InvalNone);
@@ -719,8 +719,9 @@ bool CommandBuffer::DecideDispatchHazard(const DispatchAccess& access, bool over
 }
 
 void CommandBuffer::NoteHazardDispatch(const DispatchAccess& access) const {
-	if (GpuHazardMode() != 0) {
-		m_haz_chain.NoteDispatch(m_haz_foreign - 1, m_haz_foreign, access.precise, access.guest, access.host);
+	if (const auto mode = GpuHazardMode(); mode != 0) {
+		m_haz_chain.NoteDispatch(m_haz_foreign - 1, m_haz_foreign, access.precise, access.guest, access.host,
+		                         mode >= 4);
 	} else if (m_haz_chain.valid) {
 		m_haz_chain.Invalidate();
 	}

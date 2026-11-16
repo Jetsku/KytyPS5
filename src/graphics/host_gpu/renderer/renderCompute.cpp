@@ -2882,6 +2882,8 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		buffer.Sink().insertDebugLabel(text);
 	}
 	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
+	// KYTY_GPU_HAZARD: not noted as a chain dispatch (its argument read is in the draw-indirect stage,
+	// which a later ShaderAccess flush does not order): the chain ends here.
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (auto& cache = m_context.GetTextureCache(); cache.HasStencilStorageShadows()) {
 		cache.FlushStencilStorageShadows(); // KYTY_STENCIL_STORAGE_SHADOW

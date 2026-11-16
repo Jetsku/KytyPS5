@@ -166,10 +166,24 @@ static void TestChain() {
 	foreign++;
 	Check(c.Intact(foreign) && c.guest.Size() == 1, "the dispatch joins the chain");
 	Check(c.guest.Check(std::span<const Range>(a_guest)) == Verdict::Waw, "the next dispatch sees the chain");
-	// An imprecise dispatch ends the chain.
+	// An imprecise dispatch poisons the chain: still intact, but every check is a hazard, until a
+	// ShaderAccess flush restarts it clean.
+	Chain d0 = c;
+	d0.NoteDispatch(foreign, foreign + 1, false, {}, {}, false);
+	Check(!d0.Intact(foreign + 1), "modes 1-3: an imprecise dispatch invalidates");
 	Chain d = c;
 	d.NoteDispatch(foreign, foreign + 1, false, {}, {});
-	Check(!d.Intact(foreign + 1), "an imprecise dispatch invalidates");
+	Check(d.Intact(foreign + 1), "an imprecise dispatch keeps the chain intact");
+	Check(d.guest.Check(std::span<const Range>(a_host)) != Verdict::Free &&
+	          d.guest.Check(std::span<const Range>()) != Verdict::Free,
+	      "a poisoned chain reports a hazard for any access");
+	d.OnFlush(foreign + 1, true, Compute, ShRead | ShWrite, AllCommands, MemRead | MemWrite, false);
+	Check(d.Intact(foreign + 1) && d.guest.Empty() && !d.guest.Poisoned(), "ShaderAccess after it restarts a clean chain");
+	// After a foreign command a poisoned chain is just invalid.
+	Chain d2 = c;
+	d2.NoteDispatch(foreign, foreign + 1, false, {}, {});
+	d2.OnFlush(foreign + 2, true, Compute, ShRead | ShWrite, AllCommands, MemRead | MemWrite, false);
+	Check(!d2.Intact(foreign + 2), "a foreign command after the imprecise dispatch invalidates");
 	// Two commands recorded (a label, then the dispatch): not the chain's only command.
 	Chain e = c;
 	e.NoteDispatch(foreign + 1, foreign + 2, true, a_guest, a_host);

@@ -48,6 +48,11 @@ public:
 	[[nodiscard]] bool   Empty() const noexcept { return m_ranges.empty() && !m_poisoned; }
 	[[nodiscard]] size_t Size() const noexcept { return m_ranges.size(); }
 	[[nodiscard]] bool   Poisoned() const noexcept { return m_poisoned; }
+	// Every later Check() is a hazard until Reset() (accesses not known).
+	void Poison() noexcept {
+		m_ranges.clear();
+		m_poisoned = true;
+	}
 
 	// The first hazard of `access` against the chain, in the order RAW, WAW, WAR; Free when none.
 	[[nodiscard]] Verdict Check(std::span<const Range> access) const noexcept {
@@ -174,10 +179,20 @@ struct Chain {
 	[[nodiscard]] bool Intact(uint64_t foreign) const noexcept { return valid && foreign == serial; }
 	// A dispatch was recorded as the only command since the chain state at `before` (the `foreign`
 	// value just before the dispatch command, after its batch flush).
+	// An imprecise dispatch (accesses not all known) keeps the chain valid but poisoned: no later
+	// dispatch can pass it, yet a ShaderAccess flush after it (Compute reset) orders it like any chain
+	// dispatch and starts a clean chain.
+	// keep_poisoned false: an imprecise dispatch invalidates the chain instead (KYTY_GPU_HAZARD 1-3).
 	void NoteDispatch(uint64_t before, uint64_t after, bool precise, std::span<const Range> guest_access,
-	                  std::span<const Range> host_access) {
-		if (!precise || !valid || before != serial || after != before + 1) {
+	                  std::span<const Range> host_access, bool keep_poisoned = true) {
+		if (!valid || before != serial || after != before + 1 || (!precise && !keep_poisoned)) {
 			Invalidate();
+			return;
+		}
+		if (!precise) {
+			guest.Poison();
+			host.Poison();
+			serial = after;
 			return;
 		}
 		guest.Add(guest_access);
