@@ -198,6 +198,17 @@ static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
 	    !RemapTrackerProtectionEnabled()) {
 		return;
 	}
+	// How often the host protection of GPU memory was replaced (a writable guest mprotect, a remap)
+	// before this resync re-protected the tracker's pages: a CPU write in between is not seen by the
+	// tracker (Senaxx/KytyPS5 c453d3fd5 closes that window for mprotect with one protect of
+	// min(guest, tracker) mode). Counted on the console to size the window.
+	static std::atomic<uint64_t> resyncs {0};
+	if (const auto n = resyncs.fetch_add(1, std::memory_order_relaxed) + 1; n <= 4 || (n & (n - 1)) == 0) {
+		std::printf("TrackerResync: host protection of GPU memory 0x%016" PRIx64 " +0x%" PRIx64
+		            " replaced and resynced (%" PRIu64 " so far)\n",
+		            vaddr, size, n);
+		std::fflush(stdout);
+	}
 	GetGpuResources().ResyncHostProtection(vaddr, size);
 }
 

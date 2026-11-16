@@ -4596,6 +4596,25 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// KYTY_DEPTH_EXTENT_RECREATE=1 (live, default off; based on Senaxx/KytyPS5 4b7fb3274): see
+// ResolveDepthOverlap. Off keeps the narrower cached image as before (and counts the case).
+static Live::Switch g_depth_extent_recreate("KYTY_DEPTH_EXTENT_RECREATE", Live::ParseDefaultOff);
+
+// How often ResolveDepthOverlap met a depth target asked for larger than the cached image: logged
+// the first 8 times and then at every power of two, with the switch's answer.
+static void NoteDepthExtentGrowth(const ImageInfo& requested, const ImageInfo& cached, bool recreated) {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 8 || (n & (n - 1)) == 0) {
+		std::printf("DepthExtent: depth target 0x%016" PRIx64 " asked %ux%u over a cached %ux%u (pitch %u, "
+		            "levels %u, layers %u): %s (%" PRIu64 " so far, KYTY_DEPTH_EXTENT_RECREATE)\n",
+		            requested.data.address, requested.extent.width, requested.extent.height,
+		            cached.extent.width, cached.extent.height, requested.pitch, requested.resources.levels,
+		            requested.resources.layers, recreated ? "re-created" : "kept", n);
+		std::fflush(stdout);
+	}
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -4662,8 +4681,31 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
+	// KYTY_DEPTH_EXTENT_RECREATE (based on Senaxx/KytyPS5 4b7fb3274): a depth target asked for
+	// wider than the cached depth image at the same address, pitch and height (the caller compared
+	// BlockExtent) was given the narrower image, while the render area follows the requested extent:
+	// the pass would render past the image's end. Counted whatever the switch says.
+	const bool depth_extent_grows = binding == BindingType::DepthTarget && !recreate &&
+	                                cached.info.IsDepth() &&
+	                                (requested.extent.width > cached.info.extent.width ||
+	                                 requested.extent.height > cached.info.extent.height);
+	if (depth_extent_grows) {
+		const bool enabled = g_depth_extent_recreate.On();
+		NoteDepthExtentGrowth(requested, cached.info, enabled);
+		if (enabled) {
+			if (IsDepthGrowth(requested, cached.info) && cached.registered && !cached.depth_id &&
+			    cached.backing.samples == 1) {
+				// One level and layer: the grown image keeps depth and stencil (KYTY_DEPTH_GROW_RECREATE's copy).
+				m_depth_path = DepthPath::Recreate;
+				return GrowDepthTarget(requested, cached_id);
+			}
+			recreate = true;
+		}
+	}
 	if (!recreate) {
-		m_depth_path = DepthPath::Same; // a function of the two infos and the switches
+		// A function of the two infos and the start-up switches; a growth the live switch left alone
+		// is not replayable (not Same: NoteDepthOverlap marks the lookup impure).
+		m_depth_path = depth_extent_grows ? DepthPath::Recreate : DepthPath::Same;
 		return cached_id;
 	}
 	// Guests reuse one allocation as depth and as color (e.g. D32F <-> R32F) every frame. Keep one
@@ -4911,11 +4953,20 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			}
 			return {GrowDepthTarget(requested, cached_id)};
 		}
-		if (static std::atomic<uint32_t> logged {0}; logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		if (static std::atomic<uint64_t> logged {0}; logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 			LOGF("TextureCache: depth target 0x%016" PRIx64 " grows %ux%u -> %ux%u (pitch %u); "
 			     "KYTY_DEPTH_GROW_RECREATE is off, the smaller image is kept\n",
 			     requested.data.address, cached.info.extent.width, cached.info.extent.height,
 			     requested.extent.width, requested.extent.height, requested.pitch);
+		}
+		// On the console too, counted (the LOGF above goes to the emulator log only).
+		static std::atomic<uint64_t> grows {0};
+		if (const auto n = grows.fetch_add(1, std::memory_order_relaxed) + 1; n <= 8 || (n & (n - 1)) == 0) {
+			std::printf("DepthGrow: depth target 0x%016" PRIx64 " grows %ux%u -> %ux%u (pitch %u), "
+			            "KYTY_DEPTH_GROW_RECREATE off (%" PRIu64 " so far)\n",
+			            requested.data.address, cached.info.extent.width, cached.info.extent.height,
+			            requested.extent.width, requested.extent.height, requested.pitch, n);
+			std::fflush(stdout);
 		}
 	}
 
@@ -11258,14 +11309,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 	std::scoped_lock lock {m_lock};
 	m_gpu_dcc_inspections.clear();
-	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
-		const auto base = metadata->first;
-		if (base >= address && base < address + size) {
-			metadata = m_surface_metas.erase(metadata);
-		} else {
-			++metadata;
-		}
-	}
+	// The map is ordered by base address: erase the entries with a base in [address, address +
+	// size) by range instead of walking the whole map on every unmap (as upstream does; based on
+	// Senaxx/KytyPS5 089bebdc2). GuestRange::Valid above rules out an overflowing end.
+	m_surface_metas.erase(m_surface_metas.lower_bound(address), m_surface_metas.lower_bound(address + size));
 	NoteSurfaceMetaChange();
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
