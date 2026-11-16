@@ -86,12 +86,18 @@ enum : uint32_t {
 	IConf,
 	IImp,
 	IHost,
+	FullGuest,   // full batches whose memory origins include a guest barrier
+	FullDispatch, // ... include ShaderAccess or ShaderWriteHazard
+	FullDraw,    // ... include a draw's ShaderWrite
+	FullOther,   // ... include none of these
+	InvalNone,   // inval split: no chain since the command buffer began / an invalidation
 	Count
 };
 constexpr const char* Names[Count] = {"disp", "ovl", "impre", "inval", "raw", "war", "waw", "hostmis", "fempty",
                                       "fmem", "fside", "fforeign", "fother", "skip", "flush", "full", "imgb",
                                       "imgonly", "rbeg", "iro", "iwr", "irw", "iww", "isame", "isplit", "iskip", "iconf",
-                                      "iimp", "ihost"};
+                                      "iimp", "ihost", "fguest", "fdisp", "fdraw", "fother2",
+                                      "invnone"};
 std::atomic<uint64_t> g_values[Count] {};
 inline void Add(uint32_t index, uint64_t amount = 1) {
 	g_values[index].fetch_add(amount, std::memory_order_relaxed);
@@ -617,6 +623,9 @@ bool CommandBuffer::DecideDispatchHazard(const DispatchAccess& access, bool over
 	}
 	if (!m_haz_chain.Intact(m_haz_foreign)) {
 		note(HazCount::Inval);
+		if (!m_haz_chain.valid) {
+			note(HazCount::InvalNone);
+		}
 		return false;
 	}
 	switch (m_haz_chain.guest.Check(access.guest)) {
@@ -1065,6 +1074,23 @@ void CommandBuffer::FlushBarriersImpl(bool side_own) const {
 		HazCount::Add(HazCount::Flushes);
 		if (m_pending.has_memory && IsFullBarrier(m_pending.memory)) {
 			HazCount::Add(HazCount::Full);
+			const auto o = m_pending.memory_origins;
+			bool       any = false;
+			if (o & OriginBit(BarrierOrigin::Guest)) {
+				HazCount::Add(HazCount::FullGuest);
+				any = true;
+			}
+			if (o & (OriginBit(BarrierOrigin::ShaderAccess) | OriginBit(BarrierOrigin::ShaderWriteHazard))) {
+				HazCount::Add(HazCount::FullDispatch);
+				any = true;
+			}
+			if (o & OriginBit(BarrierOrigin::ShaderWrite)) {
+				HazCount::Add(HazCount::FullDraw);
+				any = true;
+			}
+			if (!any) {
+				HazCount::Add(HazCount::FullOther);
+			}
 		}
 		if (!m_pending.images.empty()) {
 			HazCount::Add(HazCount::ImageBarriers, m_pending.images.size());
