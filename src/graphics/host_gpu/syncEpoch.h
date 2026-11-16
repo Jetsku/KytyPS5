@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_SYNCEPOCH_H_
 
 #include "common/profiler.h"
-#include "common/staticOnce.h"
 
 #include <atomic>
 #include <cstdint>
@@ -52,12 +51,10 @@ inline void AdvancePublish() noexcept {
 
 // KYTY_SYNC_EPOCH=0 disables every consumer of the epoch (they then check on every use).
 [[nodiscard]] inline bool Enabled() noexcept {
-	static constexpr auto enabled_init = [] {
+	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_SYNC_EPOCH");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	};
-	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
-	const bool& enabled = enabled_once.Get(enabled_init);
+	}();
 	return enabled;
 }
 
