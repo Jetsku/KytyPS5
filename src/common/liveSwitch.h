@@ -139,7 +139,8 @@ void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept;
 // line's live sequence number), e.g. the KYTY_HLE_WAIT_STATS per-thread totals.
 void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept;
 
-// jgcp measurement: event counters printed on every application line with KYTY_LIVE_FILE, so a
+// jgcp measurement: event counters printed on every application line with KYTY_LIVE_FILE (once any
+// counter is non-zero), so a
 // per-event dose (KYTY_LIVE_TEST_*) converts into a cost per flip:
 //   ... counts [drawidx D, suspend S, submits B]: ...
 // drawidx: indexed draw ops the command processor executed (ExecDrawIndex, the per-draw spin's
