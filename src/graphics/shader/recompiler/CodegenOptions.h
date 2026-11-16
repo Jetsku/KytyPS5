@@ -210,7 +210,13 @@ struct CodegenOptions {
 	// KYTY_F32_FLUSH_HOST=1 (default off; Erlou93/KytyPS5-Yotei): no shader-side flush of f32
 	// denormal inputs of compares and of rcp/rsq/sqrt/exp/log in programs without f64: the host's
 	// default f32 mode already flushes them. Checked on an RTX 3090 over all 2^24-2 denormals: those
-	// five ops and the six compares against 16 values give the flushed operand's result.
+	// five ops and the six compares against 16 values give the flushed operand's result. The value
+	// "nvidia" turns it on for an NVIDIA device only, and only after a start-up GPU self-test of
+	// that behaviour passes (F32FlushSelfTest.h; KYTY_F32_FLUSH_SELFTEST=off skips the test, =fail
+	// forces its failure path). The self-test (CodegenF32FlushSelfTest) on an RTX 3090 with the
+	// modes the emulator declares there (DenormPreserve 16) found rcp and every compare NOT flushing
+	// (rcp(0x00400000) = 0x7f000000), as did a translated guest program; with no denormal mode
+	// declared (KYTY_SHADER_FLOAT_CONTROLS=0) all of them flushed. So "nvidia" stays off there.
 	bool f32_flush_host = false;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
@@ -1063,6 +1069,13 @@ void SetCodegenOptions(const CodegenOptions& options);
 // the selected device is an NVIDIA one (vendor 0x10de), off otherwise. Called by the device layer
 // once the device is chosen, before any program is translated or fingerprinted.
 void ApplyHostVendor(uint32_t vendor_id);
+// KYTY_F32_FLUSH_HOST=nvidia on an NVIDIA device is on only until the device layer's start-up GPU
+// self-test (F32FlushSelfTest.h) has checked the host behaviour it relies on: true from
+// ApplyHostVendor until SettleF32FlushHost, which keeps the switch (pass) or turns it off (fail),
+// once, before any program is translated or fingerprinted. KYTY_F32_FLUSH_HOST=1 stays on
+// without a test.
+[[nodiscard]] bool F32FlushHostAwaitsSelfTest();
+void               SettleF32FlushHost(bool keep);
 
 // The BVH lowering mode in effect on this thread: rt_function, unless this thread overrides it
 // (KYTY_RT_DUMP_DIR also emits each RT module inline, mode 0, for size and build-time comparisons).

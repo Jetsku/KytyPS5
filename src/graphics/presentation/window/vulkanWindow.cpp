@@ -33,6 +33,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/presentation/window/f32FlushSelfTest.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -2652,6 +2653,9 @@ void WindowContext::CreateVulkan() {
 	CommandRecorder::InstallGuardHooks(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	// KYTY_F32_FLUSH_HOST=nvidia: keep the switch only if this device passes its self-test (before
+	// the renderer, and so the program cache and any translation, exists).
+	SettleF32FlushHostSelfTest(graphic_ctx);
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	if (graphic_ctx.side_queue_index != 0) {

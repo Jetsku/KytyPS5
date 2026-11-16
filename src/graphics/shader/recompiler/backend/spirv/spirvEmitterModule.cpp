@@ -1090,6 +1090,70 @@ void DefineOutputs(EmitterState& state) {
 
 } // namespace
 
+// The float-control declarations of every module (FLOAT_MODE 0xC0 on this host): also the
+// header of the KYTY_F32_FLUSH_HOST start-up self-test module (spirvEmitterFlushSelfTest.cpp).
+void DeclareFloatControls(EmitterState& state) {
+	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	state.builder.RequireExtension("SPV_KHR_float_controls");
+	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
+	// contract prevents host compilers from treating synthesized IEEE values as finite.
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+	                               32u);
+	// KYTY_NATIVE_F16: f16vec2 arithmetic rounds to nearest even and keeps signed zeros, infinities
+	// and NaNs, as the guest's packed f16 ops do (f16 denormals: DenormPreserve 16 below, when the
+	// device takes it, as before).
+	if (state.requirements.native_half) {
+		static std::atomic<uint64_t> native_half_programs {0};
+		const auto count = native_half_programs.fetch_add(1, std::memory_order_relaxed) + 1;
+		static const bool log = [] {
+			const auto* value = std::getenv("KYTY_COHERENT_GLC_LOG");
+			return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		}();
+		if (log) {
+			char text[160];
+			std::snprintf(text, sizeof(text),
+			              "Kyty native f16 program 0x%016" PRIx64 " stage %u; total %" PRIu64 "\n",
+			              state.program.shader_hash, static_cast<unsigned>(state.program.stage), count);
+			Log::WriteToConsoleAndLog(text);
+		}
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 16u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               16u);
+	}
+	// FLOAT_MODE 0xC0 flushes f32 denormals (inputs and outputs) and keeps f16/f64 ones.
+	// Declare only what the device supports; otherwise host defaults stay in effect.
+	const auto float_controls = GetHostFloatControls();
+	const auto denorm_mode = [&](spv::ExecutionMode mode, spv::Capability capability,
+	                             uint32_t width) {
+		state.builder.RequireCapability(capability);
+		state.builder.AddExecutionMode(state.main_func, mode, width);
+	};
+	if (float_controls.denorm_flush_f32) {
+		denorm_mode(spv::ExecutionModeDenormFlushToZero, spv::CapabilityDenormFlushToZero, 32u);
+	}
+	if (float_controls.denorm_preserve_f16) {
+		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 16u);
+	}
+	if (float_controls.denorm_preserve_f64) {
+		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 64u);
+	}
+	if (state.requirements.float64) {
+		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
+		                     state.input_info.compute->float_mode != 0xc0);
+		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic (declaring
+		// RoundingModeRTE for 32-bit floats here made the NVIDIA compiler never return from
+		// vkCreateComputePipelines for a large FP64 module, upstream PR 1034).
+		state.builder.RequireCapability(spv::CapabilityFloat64);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               64u);
+		// FP64 denormal preservation is temporarily disabled.
+		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
+		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
+	}
+}
+
 void DefineModule(EmitterState& state) {
 	state.interface_variables.reserve(state.program.info.inputs.size() +
 	                                  state.program.info.outputs.size());
@@ -1238,68 +1302,11 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
-	state.builder.RequireExtension("SPV_KHR_float_controls");
 	state.builder.AddMemoryModel(UsesPhysicalAddresses(state)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
-	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
-	// contract prevents host compilers from treating synthesized IEEE values as finite.
-	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
-	                               32u);
-	// KYTY_NATIVE_F16: f16vec2 arithmetic rounds to nearest even and keeps signed zeros, infinities
-	// and NaNs, as the guest's packed f16 ops do (f16 denormals: DenormPreserve 16 below, when the
-	// device takes it, as before).
-	if (state.requirements.native_half) {
-		static std::atomic<uint64_t> native_half_programs {0};
-		const auto count = native_half_programs.fetch_add(1, std::memory_order_relaxed) + 1;
-		static const bool log = [] {
-			const auto* value = std::getenv("KYTY_COHERENT_GLC_LOG");
-			return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-		}();
-		if (log) {
-			char text[160];
-			std::snprintf(text, sizeof(text),
-			              "Kyty native f16 program 0x%016" PRIx64 " stage %u; total %" PRIu64 "\n",
-			              state.program.shader_hash, static_cast<unsigned>(state.program.stage), count);
-			Log::WriteToConsoleAndLog(text);
-		}
-		state.builder.RequireCapability(spv::CapabilityFloat16);
-		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 16u);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
-		                               16u);
-	}
-	// FLOAT_MODE 0xC0 flushes f32 denormals (inputs and outputs) and keeps f16/f64 ones.
-	// Declare only what the device supports; otherwise host defaults stay in effect.
-	const auto float_controls = GetHostFloatControls();
-	const auto denorm_mode = [&](spv::ExecutionMode mode, spv::Capability capability,
-	                             uint32_t width) {
-		state.builder.RequireCapability(capability);
-		state.builder.AddExecutionMode(state.main_func, mode, width);
-	};
-	if (float_controls.denorm_flush_f32) {
-		denorm_mode(spv::ExecutionModeDenormFlushToZero, spv::CapabilityDenormFlushToZero, 32u);
-	}
-	if (float_controls.denorm_preserve_f16) {
-		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 16u);
-	}
-	if (float_controls.denorm_preserve_f64) {
-		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 64u);
-	}
-	if (state.requirements.float64) {
-		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
-		                     state.input_info.compute->float_mode != 0xc0);
-		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic (declaring
-		// RoundingModeRTE for 32-bit floats here made the NVIDIA compiler never return from
-		// vkCreateComputePipelines for a large FP64 module, upstream PR 1034).
-		state.builder.RequireCapability(spv::CapabilityFloat64);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
-		                               64u);
-		// FP64 denormal preservation is temporarily disabled.
-		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
-		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
-	}
+	DeclareFloatControls(state);
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;

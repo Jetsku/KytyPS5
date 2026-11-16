@@ -419,22 +419,39 @@ void SetCodegenOptions(const CodegenOptions& options) {
 	Storage() = options;
 }
 
+namespace {
+bool g_f32_flush_host_self_test = false;
+} // namespace
+
 void ApplyHostVendor(uint32_t vendor_id) {
 	constexpr uint32_t NvidiaVendorId = 0x10deu;
 	const bool         nvidia         = vendor_id == NvidiaVendorId;
 	auto&              options        = Storage();
-	const auto         apply          = [nvidia, vendor_id](const char* name, bool& option) {
+	const auto         apply          = [nvidia, vendor_id](const char* name, bool& option, bool deferred) {
 		if (!EnvNamesNvidia(name)) {
-			return;
+			return false;
 		}
 		option = nvidia;
-		// On the console, with the other "Kyty GPU capabilities:" lines of a player's log.
-		std::printf("Kyty GPU capabilities: %s=nvidia is %s (device vendor 0x%04x)\n", name,
-		            nvidia ? "on" : "off", vendor_id);
+		// On the console, with the other "Kyty GPU capabilities:" lines of a player's log (a
+		// deferred switch's line comes with its self-test verdict).
+		if (!(deferred && nvidia)) {
+			std::printf("Kyty GPU capabilities: %s=nvidia is %s (device vendor 0x%04x)\n", name,
+			            nvidia ? "on" : "off", vendor_id);
+		}
+		return nvidia;
 	};
-	apply("KYTY_F32_FLUSH_HOST", options.f32_flush_host);
-	apply("KYTY_VS_FULL_WAVE", options.vs_full_wave);
-	apply("KYTY_LDS_SLOTS", options.lds_slots);
+	g_f32_flush_host_self_test = apply("KYTY_F32_FLUSH_HOST", options.f32_flush_host, true);
+	apply("KYTY_VS_FULL_WAVE", options.vs_full_wave, false);
+	apply("KYTY_LDS_SLOTS", options.lds_slots, false);
+}
+
+bool F32FlushHostAwaitsSelfTest() {
+	return g_f32_flush_host_self_test;
+}
+
+void SettleF32FlushHost(bool keep) {
+	Storage().f32_flush_host   = keep;
+	g_f32_flush_host_self_test = false;
 }
 
 namespace {

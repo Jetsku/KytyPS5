@@ -774,6 +774,12 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(f32_flush_selftest_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/F32FlushSelfTestTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/F32FlushSelfTest.cpp"
+)
+target_include_directories(f32_flush_selftest_tests PRIVATE ${inc_headers})
+
 add_executable(hang_watchdog_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HangWatchdogTests.cpp")
 target_link_libraries(hang_watchdog_tests common)
 target_include_directories(hang_watchdog_tests PRIVATE ${inc_headers})
@@ -1586,6 +1592,7 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME f32_flush_selftest COMMAND $<TARGET_FILE:f32_flush_selftest_tests>)
 	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
 	add_test(NAME compile_watch COMMAND $<TARGET_FILE:compile_watch_tests>)
 	add_test(NAME kyty_events COMMAND $<TARGET_FILE:kyty_events_tests>)
@@ -2914,6 +2921,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		f32_flush_selftest_tests
 		lod_stats_report_tests
 		occlusion_pairs_tests
 		occlusion_query_state_tests

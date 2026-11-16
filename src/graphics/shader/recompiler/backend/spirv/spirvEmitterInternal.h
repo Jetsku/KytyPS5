@@ -560,6 +560,9 @@ uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
+// The float-control capabilities, extension and execution modes of state.main_func that every
+// module declares (part of DefineModule; also the KYTY_F32_FLUSH_HOST self-test module's header).
+void     DeclareFloatControls(EmitterState& state);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,

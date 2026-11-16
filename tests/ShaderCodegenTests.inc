@@ -1979,6 +1979,155 @@ void CheckTranscendentalDenormInputs(VulkanHarness *vulkan) {
               flushes(slow.spirv), flushes(fast.spirv));
 }
 
+// KYTY_F32_FLUSH_HOST=nvidia start-up self-test (recompiler/F32FlushSelfTest.h,
+// presentation/window/f32FlushSelfTest.cpp) on this device: no module with the switch off; the
+// module validates, has the float modes the emitter declares here and the host-flush forms; the
+// shader's reference equals the IEEE model; on an NVIDIA device the job passes, and the forced
+// mismatch (KYTY_F32_FLUSH_SELFTEST=fail) fails it with that one result.
+void CheckF32FlushSelfTest(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF32FlushSelfTest";
+  namespace F = ShaderRecompiler::FlushSelfTest;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  const auto controls = vulkan->DeviceFloatControls();
+  ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+  CodegenOptions off = GetCodegenOptions();
+  off.f32_flush_host = false;
+  {
+    ScopedCodegenOptions scope(off);
+    std::string error;
+    const auto none = F::EmitModule(&error);
+    Require(name, "no module with the switch off", none.empty() && !error.empty(), error);
+  }
+  CodegenOptions on = off;
+  on.f32_flush_host = true;
+  // The emitter's own flush switches must not change the module (its reference flush is its own).
+  on.denorm_flush_skip = ShaderRecompiler::DenormFlushSkipCompute;
+  ScopedCodegenOptions scope(on);
+  std::string error;
+  const auto module = F::EmitModule(&error);
+  Require(name, "module", !module.empty(), error);
+  {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string messages;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char *, const spv_position_t &,
+                                 const char *message) { messages += message; });
+    Require(name, "module validates", tools.Validate(module), messages);
+  }
+  const auto count = [&](const char *needle) { return CountSpirv(module, needle); };
+  Require(name, "SignedZeroInfNanPreserve 32", count("SignedZeroInfNanPreserve 32") == 1u,
+          std::to_string(count("SignedZeroInfNanPreserve 32")));
+  Require(name, "DenormFlushToZero 32 as the device declares it",
+          count("DenormFlushToZero 32") == (controls.denorm_flush_f32 ? 1u : 0u),
+          std::to_string(count("DenormFlushToZero 32")));
+  Require(name, "a program without f64", count("Float64") == 0u, "");
+  Require(name, "rcp/rsq/exp/log forms",
+          count("OpFDiv") == 2u && count("InverseSqrt") == 2u && count("Exp2") == 2u &&
+              count("Log2") == 2u,
+          "");
+  const auto compares = size_t{2} * 2u * F::OperandCount;
+  for (const char *opcode : {"OpFOrdEqual ", "OpFUnordEqual ", "OpFOrdNotEqual ", "OpFUnordNotEqual ",
+                             "OpFOrdLessThan ", "OpFUnordLessThan ", "OpFOrdGreaterThan ",
+                             "OpFUnordGreaterThan ", "OpFOrdLessThanEqual ", "OpFUnordLessThanEqual ",
+                             "OpFOrdGreaterThanEqual ", "OpFUnordGreaterThanEqual "}) {
+    Require(name, opcode, count(opcode) == compares, std::to_string(count(opcode)));
+  }
+  const auto properties = vulkan->DeviceProperties();
+  const auto memory = vulkan->MemoryProperties();
+  const auto run = RunF32FlushSelfTest(vulkan->Device(), memory, vulkan->Queue(),
+                                       vulkan->QueueFamily(), false);
+  Require(name, "the job ran", run.ran, run.error);
+  Require(name, "the shader's reference is the IEEE model", run.reference.Passed(),
+          run.reference.first);
+  std::printf("[codegen] %-32s self-test: %llu of %llu results differ (%s), first %s\n", name,
+              static_cast<unsigned long long>(run.verdict.mismatches),
+              static_cast<unsigned long long>(run.verdict.checked), run.verdict.ByOpText().c_str(),
+              run.verdict.first.c_str());
+  // Diagnostic: the same job with no denormal modes declared (KYTY_SHADER_FLOAT_CONTROLS=0).
+  {
+    ShaderRecompiler::Spirv::SetHostFloatControls({});
+    const auto bare = RunF32FlushSelfTest(vulkan->Device(), memory, vulkan->Queue(),
+                                          vulkan->QueueFamily(), false);
+    ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+    std::printf("[codegen] %-32s self-test without denormal modes: %llu mismatches (%s)\n", name,
+                static_cast<unsigned long long>(bare.verdict.mismatches), bare.verdict.ByOpText().c_str());
+  }
+  // The same inputs through a translated guest program (V_RCP/RSQ/SQRT/EXP/LOG_F32 and
+  // V_CMP_LT/EQ_F32 on two VGPRs, KYTY_F32_FLUSH_HOST on): the self-test must agree with it.
+  {
+    using O = ShaderOpcode;
+    const auto inputs = F::Inputs();
+    const auto operands = F::Operands();
+    std::vector<std::vector<u32>> values(2);
+    values[0] = inputs;
+    for (u32 i = 0; i < F::InputCount; i++) {
+      values[1].push_back(operands[i % F::OperandCount]);
+    }
+    const auto body = [](std::vector<u32> *code) {
+      code->push_back(EncodeVop1(0x2a, 10, Vgpr(2)));           // v_rcp_f32
+      code->push_back(EncodeVop1(0x2e, 11, Vgpr(2)));           // v_rsq_f32
+      code->push_back(EncodeVop1(0x33, 12, Vgpr(2)));           // v_sqrt_f32
+      code->push_back(EncodeVop1(0x25, 13, Vgpr(2)));           // v_exp_f32
+      code->push_back(EncodeVop1(0x27, 14, Vgpr(2)));           // v_log_f32
+      code->push_back(EncodeVop1(0x01, 20, InlineU32(1)));      // v_mov_b32 v20, 1
+      code->push_back(EncodeVopc(0x01, Vgpr(2), 3));            // v_cmp_lt_f32 vcc, v2, v3
+      code->push_back(EncodeVop2(0x01, 15, InlineU32(0), 20));  // v_cndmask_b32 v15, 0, v20
+      code->push_back(EncodeVopc(0x02, Vgpr(2), 3));            // v_cmp_eq_f32 vcc, v2, v3
+      code->push_back(EncodeVop2(0x01, 16, InlineU32(0), 20));  // v_cndmask_b32 v16, 0, v20
+    };
+    const auto bulk = MakeBulkCase("CodegenF32FlushGuest", 2, 7, values, body,
+                                   {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
+                                    O::V_LOG_F32, O::V_MOV_B32, O::V_CMP_LT_F32, O::V_CMP_EQ_F32,
+                                    O::V_CNDMASK_B32});
+    CodegenOptions guest = on;
+    guest.host_ftz_inputs = false;
+    guest.denorm_flush_skip = 0;
+    const auto result = RunBulk(vulkan, bulk, guest);
+    std::array<u32, 7> differ{};
+    for (u32 e = 0; e < bulk.count; e++) {
+      const auto x = values[0][e];
+      const auto y = values[1][e];
+      for (u32 o = 0; o < 7; o++) {
+        const auto got = result.words[static_cast<size_t>(2 + o) * bulk.count + e];
+        const auto expected =
+            o < 5 ? F::ExpectedUnary(static_cast<F::UnaryOp>(o), x)
+                  : (F::ExpectedCompare(o == 5 ? F::CompareOp::OrdLessThan : F::CompareOp::OrdEqual, x, y)
+                         ? 1u : 0u);
+        differ[o] += F::ResultsEqual(got, expected) ? 0u : 1u;
+      }
+    }
+    std::printf("[codegen] %-32s guest program, flush left to the host: differing results rcp %u "
+                "rsq %u sqrt %u exp %u log %u lt %u eq %u of %u\n",
+                name, differ[0], differ[1], differ[2], differ[3], differ[4], differ[5], differ[6],
+                bulk.count);
+    for (u32 o = 0; o < 5; o++) {
+      Require(name, "guest program and self-test agree on the unary op",
+              (differ[o] == 0u) == (run.verdict.by_op[o] == 0u),
+              F::UnaryName(static_cast<F::UnaryOp>(o)));
+    }
+  }
+  const bool nvidia = properties.vendorID == 0x10deu;
+  if (nvidia && std::getenv("KYTY_TEST_F32_FLUSH_REQUIRE") != nullptr) {
+    Require(name, "this NVIDIA device flushes", run.Passed(),
+            std::to_string(run.verdict.mismatches) + " mismatches, first " + run.verdict.first);
+  }
+  const auto forced = RunF32FlushSelfTest(vulkan->Device(), memory, vulkan->Queue(),
+                                          vulkan->QueueFamily(), true);
+  Require(name, "the forced mismatch fails", forced.ran && !forced.Passed(), forced.verdict.first);
+  if (run.Passed()) {
+    Require(name, "the forced mismatch is that one result",
+            forced.verdict.mismatches == 1u &&
+                forced.verdict.first == "rsq(0x80000001) = 0x7fc00000, expected 0xff800000",
+            forced.verdict.first);
+  }
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  std::printf("[codegen] %-32s ok (%s: %llu results, %llu mismatches%s%s; %.1f ms, %zu words)\n",
+              name, properties.deviceName.data(),
+              static_cast<unsigned long long>(run.verdict.checked),
+              static_cast<unsigned long long>(run.verdict.mismatches),
+              run.verdict.first.empty() ? "" : ", first ", run.verdict.first.c_str(),
+              run.milliseconds, module.size());
+}
+
 // A compressed export to a SNORM16_ABGR target (SPI_SHADER_COL_FORMAT 6) carries
 // V_CVT_PKNORM_I16_F32 pairs; they were unpacked as FP16.
 void CheckCompressedSnormExport() {
@@ -3049,6 +3198,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckLane2Share(vulkan);
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
+  CheckF32FlushSelfTest(vulkan);
   CheckExecSelects(vulkan);
   CheckInterpolationModes();
   CheckLdsSlots();
