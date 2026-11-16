@@ -81,11 +81,17 @@ enum : uint32_t {
 	ImgRw,       // read before, write after
 	ImgWw,       // write before and after
 	ImgSameLayout, // ... of all requests: old layout == new layout
+	ISplit,      // KYTY_INDIRECT_ARGS_RANGES (render.h HazIndirect)
+	ISkip,
+	IConf,
+	IImp,
+	IHost,
 	Count
 };
 constexpr const char* Names[Count] = {"disp", "ovl", "impre", "inval", "raw", "war", "waw", "hostmis", "fempty",
                                       "fmem", "fside", "fforeign", "fother", "skip", "flush", "full", "imgb",
-                                      "imgonly", "rbeg", "iro", "iwr", "irw", "iww", "isame"};
+                                      "imgonly", "rbeg", "iro", "iwr", "irw", "iww", "isame", "isplit", "iskip", "iconf",
+                                      "iimp", "ihost"};
 std::atomic<uint64_t> g_values[Count] {};
 inline void Add(uint32_t index, uint64_t amount = 1) {
 	g_values[index].fetch_add(amount, std::memory_order_relaxed);
@@ -118,6 +124,12 @@ int64_t GpuHazardMode() {
 
 bool GpuHazardCountEnabled() {
 	return g_gpu_hazard_count.On();
+}
+
+void GpuHazardCountIndirect(HazIndirect what) {
+	if (g_gpu_hazard_count.On()) {
+		HazCount::Add(HazCount::ISplit + static_cast<uint32_t>(what));
+	}
 }
 
 // KYTY_GUEST_BARRIER_SCOPE (render.h GuestBarrierScope): live; default every kind full.

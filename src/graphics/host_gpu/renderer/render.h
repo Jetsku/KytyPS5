@@ -274,6 +274,16 @@ struct DrawAutoArgs {
 // also at mode 0 for the batch/pass counts.
 [[nodiscard]] int64_t GpuHazardMode();
 [[nodiscard]] bool    GpuHazardCountEnabled();
+// KYTY_INDIRECT_ARGS_RANGES (live, default 0; renderDraw.cpp IndirectArgsBarrierNeeded): an indirect draw
+// in an active rendering instance that began without its argument barrier keeps the instance (no
+// barrier) when the guest ranges written by this instance's draws (sunk shader-write barriers) do not
+// overlap its argument and count ranges. Writers before the instance are ordered by their own
+// barriers, recorded before the instance began. Never with KYTY_PM4_BARRIERS=guest.
+// Counters (KYTY_GPU_HAZARD_COUNT): isplit (argument barrier needed inside an active instance, as
+// without the switch), iskip, iconf (overlap), iimp (an instance write not known), ihost (guest free,
+// host ranges overlap: the verify count; the barrier is kept).
+enum class HazIndirect : uint32_t { Split, Skip, Conflict, Imprecise, HostMismatch };
+void GpuHazardCountIndirect(HazIndirect what);
 
 // KYTY_HOLD_SKIPPED_DRAWS (videoOut.cpp, the GT7 fork's round 133, usa-ratt 65ed4150b): draws
 // KYTY_PIPELINE_SKIP left out while their pipelines built in the background, since the last flip
@@ -1618,9 +1628,21 @@ private:
 	// KYTY_INDIRECT_ARGS_COVERED: the rendering instance in which a draw last queued its shader-write
 	// barrier without ending the instance (KYTY_DRAW_WRITE_SINK); 0 if none.
 	uint64_t m_indirect_write_rendering = 0;
+	// KYTY_INDIRECT_ARGS_RANGES: the guest ranges the draws of rendering instance
+	// m_haz_write_instance wrote with sunk shader-write barriers (imprecise: some write not known).
+	uint64_t                   m_haz_write_instance  = 0;
+	bool                       m_haz_write_imprecise = false;
+	std::vector<Hazard::Range> m_haz_instance_writes;
+	std::vector<Hazard::Range> m_haz_instance_host_writes; // (VkBuffer, host offsets), the verify check
+	void NoteInstanceWrites(uint64_t instance, std::span<PreparedBindings* const> stages);
 	// Whether an indirect draw recorded in the active rendering instance needs its own argument
 	// barrier (which ends the instance).
-	[[nodiscard]] bool IndirectArgsBarrierNeeded(const CommandBuffer& buffer) const;
+	// source (KYTY_INDIRECT_ARGS_RANGES): the draw's argument/count ranges; count: the call that
+	// records the barrier (counters).
+	// host: the argument/count buffers' host ranges (verify: a host overlap with the instance's written
+	// host ranges keeps the barrier and counts ihost).
+	[[nodiscard]] bool IndirectArgsBarrierNeeded(const CommandBuffer& buffer, const DrawIndirectSource* source = nullptr,
+	                                             bool count = false, std::span<const Hazard::Range> host = {}) const;
 	// KYTY_DEPTH_FEEDBACK_KEEP: the depth attachment of the draw being recorded and whether the
 	// draw writes it, applied to Image::feedback_instance/_serial once BeginRendering() has
 	// chosen the draw's rendering instance (NoteDepthFeedback).

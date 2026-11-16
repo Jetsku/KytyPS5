@@ -1607,7 +1607,11 @@ static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            b
 // Not with KYTY_PM4_BARRIERS=guest (dispatches and draws record no barriers there).
 static Live::Switch g_indirect_args_covered("KYTY_INDIRECT_ARGS_COVERED", Live::ParseDefaultOff);
 
-bool RenderExecutor::IndirectArgsBarrierNeeded(const CommandBuffer& buffer) const {
+// KYTY_INDIRECT_ARGS_RANGES (render.h): live, default off.
+static Live::Switch g_indirect_args_ranges("KYTY_INDIRECT_ARGS_RANGES", Live::ParseDefaultOff);
+
+bool RenderExecutor::IndirectArgsBarrierNeeded(const CommandBuffer& buffer, const DrawIndirectSource* source,
+                                               bool count, std::span<const Hazard::Range> host) const {
 	const auto active = buffer.ActiveRenderingSerial();
 	if (active == 0) {
 		return true; // a new instance begins for this draw: its batch carries the request
@@ -1615,8 +1619,107 @@ bool RenderExecutor::IndirectArgsBarrierNeeded(const CommandBuffer& buffer) cons
 	if (active == m_indirect_barrier_rendering) {
 		return false;
 	}
+	if (count) {
+		GpuHazardCountIndirect(HazIndirect::Split);
+	}
+	if (g_indirect_args_ranges.On() && source != nullptr && BarrierBatchEnabled() && !GuestSyncBarriersEnabled()) {
+		// Writers before this instance recorded their barriers before it began (a new instance flushes
+		// the batch); within it only draws with sunk shader-write barriers wrote, at these ranges.
+		if (active == m_haz_write_instance) {
+			if (m_haz_write_imprecise) {
+				if (count) GpuHazardCountIndirect(HazIndirect::Imprecise);
+				return true;
+			}
+			Hazard::Range reads[2] {{0, source->args_addr, source->args_addr + source->ArgsSize(), false},
+			                        {0, source->count_addr, source->count_addr + sizeof(uint32_t), false}};
+			const uint32_t read_count = source->count_addr != 0 ? 2u : 1u;
+			for (const auto& write: m_haz_instance_writes) {
+				for (uint32_t i = 0; i < read_count; i++) {
+					if (Hazard::Overlap(write, reads[i])) {
+						if (count) GpuHazardCountIndirect(HazIndirect::Conflict);
+						return true;
+					}
+				}
+			}
+		}
+		// Verify: the same question on host buffer ranges (the instance's written bindings against the
+		// argument/count buffers); a disagreement keeps the barrier.
+		if (active == m_haz_write_instance) {
+			for (const auto& write: m_haz_instance_host_writes) {
+				for (const auto& read: host) {
+					if (Hazard::Overlap(write, read)) {
+						if (count) GpuHazardCountIndirect(HazIndirect::HostMismatch);
+						return true;
+					}
+				}
+			}
+		}
+		if (count) GpuHazardCountIndirect(HazIndirect::Skip);
+		return false;
+	}
 	return !(g_indirect_args_covered.On() && active != m_indirect_write_rendering &&
 	         BarrierBatchEnabled() && !GuestSyncBarriersEnabled());
+}
+
+void RenderExecutor::NoteInstanceWrites(uint64_t instance, std::span<PreparedBindings* const> stages) {
+	if (instance != m_haz_write_instance) {
+		m_haz_write_instance  = instance;
+		m_haz_write_imprecise = false;
+		m_haz_instance_writes.clear();
+		m_haz_instance_host_writes.clear();
+	}
+	if (m_haz_write_imprecise) {
+		return;
+	}
+	auto& textures = m_context.GetTextureCache();
+	for (const auto* stage: stages) {
+		const auto& program = *stage->runtime->program;
+		const auto& info    = program.info;
+		if (program.has_address_writes || info.uses_dma || info.bda_writes || stage->buffer_sources.size() != info.buffers.size() ||
+		    stage->images.size() != info.images.size()) {
+			m_haz_write_imprecise = true;
+			return;
+		}
+		for (uint32_t i = 0; i < info.buffers.size(); i++) {
+			if (!(info.buffers[i].written || info.buffers[i].atomic)) {
+				continue;
+			}
+			if (info.buffers[i].indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+			    !info.buffers[i].indirect_resources.empty()) {
+				m_haz_write_imprecise = true;
+				return;
+			}
+			const auto& source = stage->buffer_sources[i];
+			if (source.address != 0 && source.size != 0) {
+				m_haz_instance_writes.push_back({0, source.address, source.address + source.size, true});
+			}
+			if (i < stage->buffers.size() && stage->buffers[i].buffer) {
+				const auto& host = stage->buffers[i];
+				m_haz_instance_host_writes.push_back(
+				    {std::bit_cast<uint64_t>(static_cast<VkBuffer>(host.buffer)), host.offset,
+				     host.range == VK_WHOLE_SIZE ? UINT64_MAX : host.offset + host.range, true});
+			}
+		}
+		for (uint32_t i = 0; i < info.images.size(); i++) {
+			if (!(info.images[i].written || info.images[i].atomic || info.images[i].atomic64)) {
+				continue;
+			}
+			auto* image = textures.TryGetImage(stage->images[i].image_id);
+			if (image == nullptr || info.images[i].bindless || info.images[i].runtime ||
+			    info.images[i].indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage) {
+				m_haz_write_imprecise = true;
+				return;
+			}
+			for (const auto& range: {image->info.data, image->info.stencil, image->info.metadata.range}) {
+				if (range.size != 0) {
+					m_haz_instance_writes.push_back({0, range.address, range.address + range.size, true});
+				}
+			}
+		}
+	}
+	if (m_haz_instance_writes.size() > 4096) {
+		m_haz_write_imprecise = true;
+	}
 }
 
 static void IndirectArgumentsBarrier(const CommandBuffer& buffer, const CommandSink& vk_buffer) {
@@ -7333,7 +7436,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// KYTY_GPU_INSTANCE_COUNT: its copy ends rendering too.
 	const bool run_indirect_barrier =
 	    (indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering &&
-	     IndirectArgsBarrierNeeded(buffer)) ||
+	     IndirectArgsBarrierNeeded(buffer, indirect)) ||
 	    instance_record;
 	// KYTY_DRAW_RUN_TARGETS: kept targets whose attachments changed during the buffer work are
 	// resolved now, with the same repeated binding work as a continuation's fallback.
@@ -7976,7 +8079,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
 		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
 		// begun right after the previous barrier needs no new one while it remains active.
-		if (IndirectArgsBarrierNeeded(buffer)) {
+		const Hazard::Range indirect_host[2] {
+		    {std::bit_cast<uint64_t>(static_cast<VkBuffer>(indirect_buffers.args)), indirect_buffers.args_offset,
+		     indirect_buffers.args_offset + indirect->ArgsSize(), false},
+		    {std::bit_cast<uint64_t>(static_cast<VkBuffer>(indirect_buffers.count)), indirect_buffers.count_offset,
+		     indirect_buffers.count_offset + sizeof(uint32_t), false}};
+		if (IndirectArgsBarrierNeeded(buffer, indirect, true,
+		                              std::span<const Hazard::Range>(indirect_host, indirect_buffers.count ? 2u : 1u))) {
 			const CommitStats::SubScope barrier_scope(CommitStats::Sub::Barriers);
 			{
 				KYTY_GPU_OP_SITE("draw.indirect_args");
@@ -8387,6 +8496,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			// while this instance is active": it must end the instance and record a new one.
 			m_indirect_barrier_rendering = 0;
 			m_indirect_write_rendering   = buffer.ActiveRenderingSerial();
+			if (g_indirect_args_ranges.On()) {
+				NoteInstanceWrites(buffer.ActiveRenderingSerial(),
+				                   std::span<PreparedBindings* const>(descriptor_stages.data(), stage_count));
+			} else {
+				m_haz_write_imprecise = true; // the switch was off for this write: not recorded
+				m_haz_write_instance  = buffer.ActiveRenderingSerial();
+			}
 		} else {
 			{
 				KYTY_GPU_OP_SITE("draw.write_barrier");

@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/skipInvalid.h"
@@ -68,6 +69,9 @@ bool GuestStorageRepeatEnabled() {
 	return enabled;
 }
 thread_local bool g_guest_transit = false;
+
+// KYTY_IMAGE_STAGE_NARROW (Image::Transit): live, default off.
+static Live::Switch g_image_stage_narrow("KYTY_IMAGE_STAGE_NARROW", Live::ParseDefaultOff);
 
 constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWrite |
                                                 vk::AccessFlagBits2::eShaderWrite |
@@ -514,8 +518,22 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (static_cast<bool>(destination_access & transfer_access)) {
 		destination_stage |= vk::PipelineStageFlagBits2::eTransfer;
 	}
-	if (!destination_access ||
-	    static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
+	// KYTY_IMAGE_STAGE_NARROW=1 (live, default 0): an access made only of color (or only of depth/stencil)
+	// attachment bits happens only in the attachment stages (load/store/clear operations, blending,
+	// resolves, depth tests), so the transition's second scope - and the image's tracked stage, the first
+	// scope of its next barrier - is those stages instead of every graphics stage plus compute.
+	constexpr vk::AccessFlags2 ColorAccess =
+	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	constexpr vk::AccessFlags2 DepthAccess =
+	    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	const bool color_only = destination_access && !(destination_access & ~ColorAccess);
+	const bool depth_only = destination_access && !(destination_access & ~DepthAccess);
+	if (g_image_stage_narrow.On() && (color_only || depth_only)) {
+		destination_stage |= color_only ? vk::PipelineStageFlags2 {vk::PipelineStageFlagBits2::eColorAttachmentOutput}
+		                                : vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		                                      vk::PipelineStageFlagBits2::eLateFragmentTests;
+	} else if (!destination_access ||
+	           static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
