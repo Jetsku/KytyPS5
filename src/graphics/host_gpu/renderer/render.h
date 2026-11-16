@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/texDelta.h"
+#include "graphics/host_gpu/renderer/hazardTracker.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -253,6 +254,26 @@ struct DrawAutoArgs {
 // ordered-append and split-dispatch paths, keep their barriers. Any other value: the renderer's
 // barriers around every dispatch, as before.
 [[nodiscard]] bool GuestSyncBarriersEnabled();
+// KYTY_GPU_HAZARD (live, default 0; hazardTracker.h): resource-precise hazards between guest direct
+// dispatches. The command buffer keeps the guest address ranges (and, as a conservative second
+// check, the host buffer/image byte ranges) every dispatch of the current chain read and wrote; a
+// chain starts at a recorded barrier that orders everything earlier before later compute shader
+// accesses and ends at the first command recorded that is not a chain dispatch (a draw, a copy, a
+// helper, an indirect dispatch, upload copies, image/buffer barriers not of the dispatch's own
+// resources). A dispatch with no RAW/WAR/WAW overlap against the chain, in both checks, then skips
+// its ShaderWriteHazard request and keeps the chain's pending ShaderAccess (and any guest global
+// barrier queued since) pending past itself instead of recording it before itself: they are
+// re-queued right after the dispatch, so every later command sees exactly the barrier it saw before.
+// Dispatches whose accesses are not all in bindings (address writes, DMA/BDA, GDS, emulated LDS,
+// bindless or runtime images, indirect buffer tables, ray tracing) never skip and end the chain.
+//   0: off. 1: track and count only (no change in what is recorded). 2: skip when the pending batch
+//   is memory dependencies of ShaderAccess/guest origin only (or empty). 3: as 2, and also when
+//   image/buffer barriers or upload copies of the dispatch's own resources are pending: those are
+//   recorded alone (without the memory dependency) before the dispatch.
+// KYTY_GPU_HAZARD_COUNT=1 (live, default 0): per-flip counters on the live lines (" haz [..]"),
+// also at mode 0 for the batch/pass counts.
+[[nodiscard]] int64_t GpuHazardMode();
+[[nodiscard]] bool    GpuHazardCountEnabled();
 
 // KYTY_HOLD_SKIPPED_DRAWS (videoOut.cpp, the GT7 fork's round 133, usa-ratt 65ed4150b): draws
 // KYTY_PIPELINE_SKIP left out while their pipelines built in the background, since the last flip
@@ -381,6 +402,27 @@ public:
 	// returns true and 	ake is set, the pending request was dropped: the caller skips its
 	// ShaderWriteHazard request and keeps its own ShaderAccess request after the dispatch.
 	[[nodiscard]] bool TakeDispatchOverlap(bool lds, bool take) const;
+	// KYTY_GPU_HAZARD (see GpuHazardMode()). A direct dispatch's accesses: guest ranges (space 0)
+	// and host ranges (space = resource handle); precise = every access is in these.
+	struct DispatchAccess {
+		std::vector<Hazard::Range> guest;
+		std::vector<Hazard::Range> host;
+		std::vector<uint64_t>      handles; // host buffers and images of the bindings
+		bool                       precise = true;
+		void Clear() {
+			guest.clear();
+			host.clear();
+			handles.clear();
+			precise = true;
+		}
+	};
+	// After TakeDispatchOverlap and before the dispatch's own barrier requests: true when the
+	// dispatch must skip its ShaderWriteHazard request (the pending batch was then taken off: its
+	// memory dependency is re-queued by NoteHazardDispatch after the dispatch). overlap: the overlap
+	// chain already dropped the pending request.
+	[[nodiscard]] bool DecideDispatchHazard(const DispatchAccess& access, bool overlap) const;
+	// Right after the dispatch command was recorded.
+	void NoteHazardDispatch(const DispatchAccess& access) const;
 	// Whether anything is pending, and whether queued upload copies are (RequestUploadCopy).
 	[[nodiscard]] bool HasPendingBarriers() const noexcept { return !m_pending.Empty(); }
 	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending.uploads.empty(); }
@@ -539,6 +581,7 @@ private:
 		std::vector<PendingUpload>  uploads;
 		std::vector<vk::BufferCopy> upload_regions;
 		uint32_t                              origins = 0; // bit per BarrierOrigin
+		uint32_t                              memory_origins = 0; // origins of the memory requests
 		uint32_t                              guest_kinds = 0; // bit per GuestBarrierKind (profiler)
 
 		[[nodiscard]] bool Empty() const {
@@ -551,8 +594,9 @@ private:
 			buffers.clear();
 			uploads.clear();
 			upload_regions.clear();
-			origins     = 0;
-			guest_kinds = 0;
+			origins        = 0;
+			memory_origins = 0;
+			guest_kinds    = 0;
 		}
 	};
 	// Records the queued upload copies behind one barrier and queues their post-copy barriers.
@@ -562,7 +606,11 @@ private:
 		m_recorded_since_flush = true;
 		m_epoch_clean          = false;
 		m_overlap_open         = false;
+		++m_haz_foreign;
 	}
+	// FlushBarriers' recording with the KYTY_GPU_HAZARD bookkeeping; side_own: the batch's
+	// image/buffer barriers and uploads concern only the next dispatch's own resources.
+	void FlushBarriersImpl(bool side_own) const;
 	[[nodiscard]] bool CanSinkPending() const;
 	[[nodiscard]] bool CanSinkDrawWrites() const;
 	void               NoteDrawRecorded() const;
@@ -617,6 +665,15 @@ private:
 	mutable bool m_overlap_upload_fenced = false;
 	mutable bool m_upload_narrow         = false;
 	mutable bool m_dispatch_prep         = false;
+	// KYTY_GPU_HAZARD: commands recorded that are not chain dispatches (every NoteForeignCommand,
+	// draw and upload copy), the chain, and the memory dependency a skipping dispatch took off the
+	// batch (re-queued after it with its origins).
+	mutable uint64_t           m_haz_foreign = 0;
+	mutable Hazard::Chain      m_haz_chain;
+	mutable vk::MemoryBarrier2 m_haz_stash;
+	mutable bool               m_haz_stash_valid   = false;
+	mutable uint32_t           m_haz_stash_origins = 0;
+	mutable uint32_t           m_haz_stash_kinds   = 0;
 
 	// KYTY_CP_RECORDER: the scheduler's recorder and its encoder (null when off), and whether a
 	// direct window is open (the CP records natively after a drain; see Sink()).

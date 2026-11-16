@@ -1348,6 +1348,9 @@ static Live::Switch g_idle_flush_draws("KYTY_IDLE_FLUSH_DRAWS", [](const char* v
 	return static_cast<int64_t>(std::min(parsed, 65536ul));
 });
 
+// KYTY_IDLE_FLUSH_PASS (MaybeFlushIdleGpu): live, default off.
+static Live::Switch g_idle_flush_pass("KYTY_IDLE_FLUSH_PASS", Live::ParseDefaultOff);
+
 static uint32_t IdleFlushMinDraws() {
 	return static_cast<uint32_t>(g_idle_flush_draws.Get());
 }
@@ -1476,6 +1479,11 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	}
 	const bool in_pass = CurrentBuffer().ActiveRenderingSerial() != 0;
 	if (in_pass && m_idle_flush_draws < min_draws * 4u) {
+		return;
+	}
+	// KYTY_IDLE_FLUSH_PASS=1 (live, default 0): never inside an active rendering instance; the submit
+	// waits for the first draw or dispatch after the instance ended.
+	if (in_pass && g_idle_flush_pass.On()) {
 		return;
 	}
 	auto&          master = scheduler.GetMasterSemaphore();

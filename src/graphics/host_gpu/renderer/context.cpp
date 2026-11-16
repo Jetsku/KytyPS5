@@ -25,6 +25,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 #if defined(_MSC_VER)
@@ -47,6 +48,77 @@ static Live::Switch g_dispatch_overlap_uploads("KYTY_DISPATCH_OVERLAP_UPLOADS", 
 static Live::Switch g_pm4_guest_barriers("KYTY_PM4_BARRIERS", [](const char* value) -> int64_t {
 	return value != nullptr && std::strcmp(value, "guest") == 0 ? 1 : 0;
 });
+
+// KYTY_GPU_HAZARD / KYTY_GPU_HAZARD_COUNT (render.h GpuHazardMode): live; default 0.
+static Live::Switch g_gpu_hazard("KYTY_GPU_HAZARD", [](const char* value) -> int64_t {
+	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 3) : 0;
+});
+static Live::Switch g_gpu_hazard_count("KYTY_GPU_HAZARD_COUNT", Live::ParseDefaultOff);
+
+namespace HazCount {
+enum : uint32_t {
+	Disp,        // direct dispatches seen with KYTY_GPU_HAZARD != 0
+	Ovl,         // the dispatch-overlap chain already dropped the pending request
+	Impre,       // accesses not all in bindings
+	Inval,       // no intact chain (something else recorded since the last reset)
+	Raw,         // read-after-write overlap with the chain (guest ranges)
+	War,         // write-after-read
+	Waw,         // write-after-write
+	HostMis,     // guest ranges free, host ranges overlap (the verify count)
+	FreeEmpty,   // free, nothing pending
+	FreeMem,     // free, only ShaderAccess/guest memory dependencies pending
+	FreeSide,    // free, plus the dispatch's own image/buffer barriers or uploads
+	FreeForeign, // free, but other image/buffer barriers or uploads pending
+	FreeOther,   // free, but memory dependencies of other origins pending
+	Skips,       // the dispatch skipped (mode >= 2)
+	Flushes,     // batches recorded
+	Full,        // ... with a full ALL -> ALL memory dependency
+	ImageBarriers, // image barriers recorded in batches
+	ImageOnly,   // batches of image barriers only
+	Begins,      // rendering instances begun
+	ImgRoLayout, // image barrier requests: read-only before and after, layout change only
+	ImgWr,       // write before, read after
+	ImgRw,       // read before, write after
+	ImgWw,       // write before and after
+	ImgSameLayout, // ... of all requests: old layout == new layout
+	Count
+};
+constexpr const char* Names[Count] = {"disp", "ovl", "impre", "inval", "raw", "war", "waw", "hostmis", "fempty",
+                                      "fmem", "fside", "fforeign", "fother", "skip", "flush", "full", "imgb",
+                                      "imgonly", "rbeg", "iro", "iwr", "irw", "iww", "isame"};
+std::atomic<uint64_t> g_values[Count] {};
+inline void Add(uint32_t index, uint64_t amount = 1) {
+	g_values[index].fetch_add(amount, std::memory_order_relaxed);
+}
+std::string Line() {
+	uint64_t values[Count];
+	uint64_t any = 0;
+	for (uint32_t i = 0; i < Count; i++) {
+		values[i] = g_values[i].load(std::memory_order_relaxed);
+		any |= values[i];
+	}
+	if (any == 0) {
+		return {};
+	}
+	std::string text = " haz [";
+	for (uint32_t i = 0; i < Count; i++) {
+		text += Names[i];
+		text += ' ';
+		text += std::to_string(values[i]);
+		text += i + 1 < Count ? ", " : "]";
+	}
+	return text;
+}
+[[maybe_unused]] const bool g_line_registered = (Live::SetLineSuffixProvider(&Line), true);
+} // namespace HazCount
+
+int64_t GpuHazardMode() {
+	return BarrierBatchEnabled() ? g_gpu_hazard.Get() : 0;
+}
+
+bool GpuHazardCountEnabled() {
+	return g_gpu_hazard_count.On();
+}
 
 // KYTY_GUEST_BARRIER_SCOPE (render.h GuestBarrierScope): live; default every kind full.
 int64_t ParseGuestBarrierScope(const char* value) {
@@ -436,6 +508,10 @@ void CommandBuffer::ResetBarrierState() const {
 	m_overlap_upload_fenced = false;
 	m_upload_narrow         = false;
 	m_dispatch_prep         = false;
+	// KYTY_GPU_HAZARD: commands of earlier submissions precede this buffer; no chain until a reset.
+	++m_haz_foreign;
+	m_haz_chain.Invalidate();
+	m_haz_stash_valid = false;
 }
 
 bool DispatchOverlapEnabled() {
@@ -492,6 +568,7 @@ bool CommandBuffer::TakeDispatchOverlap(bool lds, bool take) const {
 			m_pending.memory     = vk::MemoryBarrier2 {};
 			m_pending.has_memory = false;
 			m_pending.origins    = OriginBit(BarrierOrigin::Upload);
+			m_pending.memory_origins = 0;
 			m_upload_narrow         = m_overlap_upload_fenced;
 			m_overlap_upload_fenced = true;
 		} else {
@@ -499,6 +576,152 @@ bool CommandBuffer::TakeDispatchOverlap(bool lds, bool take) const {
 		}
 	}
 	return true;
+}
+
+template <typename Handle>
+static uint64_t HandleBits(Handle handle) {
+	return std::bit_cast<uint64_t>(static_cast<typename Handle::CType>(handle));
+}
+
+bool CommandBuffer::DecideDispatchHazard(const DispatchAccess& access, bool overlap) const {
+	const auto mode = GpuHazardMode();
+	if (mode == 0) {
+		return false;
+	}
+	const bool count = GpuHazardCountEnabled();
+	auto       note  = [count](uint32_t index) {
+        if (count) {
+            HazCount::Add(index);
+        }
+	};
+	note(HazCount::Disp);
+	if (overlap) {
+		note(HazCount::Ovl);
+		return false;
+	}
+	if (!access.precise) {
+		note(HazCount::Impre);
+		return false;
+	}
+	if (!m_haz_chain.Intact(m_haz_foreign)) {
+		note(HazCount::Inval);
+		return false;
+	}
+	switch (m_haz_chain.guest.Check(access.guest)) {
+		case Hazard::Verdict::Raw: note(HazCount::Raw); return false;
+		case Hazard::Verdict::War: note(HazCount::War); return false;
+		case Hazard::Verdict::Waw: note(HazCount::Waw); return false;
+		case Hazard::Verdict::Free: break;
+	}
+	// Verify: the conservative host-range check of the same bindings (a mismatch keeps the barrier).
+	if (m_haz_chain.host.Check(access.host) != Hazard::Verdict::Free) {
+		note(HazCount::HostMis);
+		return false;
+	}
+	if (m_pending.Empty()) {
+		note(HazCount::FreeEmpty);
+		if (mode < 2) {
+			return false;
+		}
+		note(HazCount::Skips);
+		return true;
+	}
+	constexpr uint32_t Allowed = OriginBit(BarrierOrigin::ShaderAccess) | OriginBit(BarrierOrigin::Guest) |
+	                             OriginBit(BarrierOrigin::ShaderWriteHazard);
+	if (m_pending.has_memory && (m_pending.memory_origins & ~Allowed) != 0) {
+		note(HazCount::FreeOther);
+		return false;
+	}
+	const bool side = !m_pending.images.empty() || !m_pending.buffers.empty() || !m_pending.uploads.empty();
+	auto       own  = [&access](uint64_t handle) {
+        return std::ranges::find(access.handles, handle) != access.handles.end();
+	};
+	if (side) {
+		bool foreign = false;
+		for (const auto& barrier: m_pending.images) {
+			foreign |= !own(HandleBits(barrier.image));
+		}
+		for (const auto& barrier: m_pending.buffers) {
+			foreign |= !own(HandleBits(barrier.buffer));
+		}
+		uint32_t destinations = 0;
+		for (size_t i = 0; i < m_pending.uploads.size(); i++) {
+			const auto destination = m_pending.uploads[i].destination;
+			foreign |= !own(HandleBits(destination));
+			bool seen = false;
+			for (size_t j = 0; j < i; j++) {
+				seen |= m_pending.uploads[j].destination == destination;
+			}
+			destinations += seen ? 0u : 1u;
+		}
+		// More destinations make RecordPendingUploads merge the post-copy barrier into the memory
+		// dependency, which the dispatch needs before it.
+		if (foreign || destinations > 8) {
+			note(HazCount::FreeForeign);
+			return false;
+		}
+		note(HazCount::FreeSide);
+		if (mode < 3) {
+			return false;
+		}
+	} else {
+		note(HazCount::FreeMem);
+		if (mode < 2) {
+			return false;
+		}
+	}
+	// Take the memory dependency off the batch; NoteHazardDispatch re-queues it after the dispatch.
+	if (m_pending.has_memory) {
+		if (m_haz_stash_valid) {
+			m_haz_stash.srcStageMask |= m_pending.memory.srcStageMask;
+			m_haz_stash.srcAccessMask |= m_pending.memory.srcAccessMask;
+			m_haz_stash.dstStageMask |= m_pending.memory.dstStageMask;
+			m_haz_stash.dstAccessMask |= m_pending.memory.dstAccessMask;
+		} else {
+			m_haz_stash = m_pending.memory;
+		}
+		m_haz_stash_valid = true;
+		m_haz_stash_origins |= m_pending.memory_origins;
+		m_haz_stash_kinds |= m_pending.guest_kinds;
+		m_pending.origins &= ~m_pending.memory_origins;
+		m_pending.memory         = vk::MemoryBarrier2 {};
+		m_pending.has_memory     = false;
+		m_pending.memory_origins = 0;
+		m_pending.guest_kinds    = 0;
+	}
+	if (side) {
+		// The dispatch's own transitions, buffer barriers and uploads, each complete in itself, before it.
+		FlushBarriersImpl(true);
+	}
+	note(HazCount::Skips);
+	return true;
+}
+
+void CommandBuffer::NoteHazardDispatch(const DispatchAccess& access) const {
+	if (GpuHazardMode() != 0) {
+		m_haz_chain.NoteDispatch(m_haz_foreign - 1, m_haz_foreign, access.precise, access.guest, access.host);
+	} else if (m_haz_chain.valid) {
+		m_haz_chain.Invalidate();
+	}
+	if (m_haz_stash_valid) {
+		// The memory dependency taken off before the dispatch, queued again after it: every later
+		// command sees it as it would have (it also covers the dispatch, which recorded no barrier).
+		if (m_pending.has_memory) {
+			m_pending.memory.srcStageMask |= m_haz_stash.srcStageMask;
+			m_pending.memory.srcAccessMask |= m_haz_stash.srcAccessMask;
+			m_pending.memory.dstStageMask |= m_haz_stash.dstStageMask;
+			m_pending.memory.dstAccessMask |= m_haz_stash.dstAccessMask;
+		} else {
+			m_pending.memory     = m_haz_stash;
+			m_pending.has_memory = true;
+		}
+		m_pending.origins |= m_haz_stash_origins;
+		m_pending.memory_origins |= m_haz_stash_origins;
+		m_pending.guest_kinds |= m_haz_stash_kinds;
+		m_haz_stash_valid   = false;
+		m_haz_stash_origins = 0;
+		m_haz_stash_kinds   = 0;
+	}
 }
 
 void CommandBuffer::NoteFeedbackKeep(const vk::ImageMemoryBarrier2& ordering) const {
@@ -548,6 +771,7 @@ void CommandBuffer::RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages,
 		m_pending.has_memory = true;
 	}
 	m_pending.origins |= OriginBit(origin);
+	m_pending.memory_origins |= OriginBit(origin);
 	CountOriginRequest(origin);
 }
 
@@ -588,6 +812,20 @@ bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> 
 	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
 	if (!m_pending.Empty()) {
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::Merged);
+	}
+	if (GpuHazardCountEnabled()) {
+		constexpr vk::AccessFlags2 Writes = Access2::eShaderWrite | Access2::eShaderStorageWrite |
+		                                    Access2::eColorAttachmentWrite | Access2::eDepthStencilAttachmentWrite |
+		                                    Access2::eTransferWrite | Access2::eMemoryWrite | Access2::eHostWrite;
+		for (const auto& barrier: barriers) {
+			const bool before = static_cast<bool>(barrier.srcAccessMask & Writes);
+			const bool after  = static_cast<bool>(barrier.dstAccessMask & Writes);
+			HazCount::Add(before ? (after ? HazCount::ImgWw : HazCount::ImgWr)
+			                     : (after ? HazCount::ImgRw : HazCount::ImgRoLayout));
+			if (barrier.oldLayout == barrier.newLayout) {
+				HazCount::Add(HazCount::ImgSameLayout);
+			}
+		}
 	}
 	for (const auto& barrier: barriers) {
 		// Layout transitions of one image stay in separate, ordered barrier commands.
@@ -719,6 +957,7 @@ void CommandBuffer::RecordPendingUploads() const {
 	const auto     post_dst_access =
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	if (global) {
+		m_pending.memory_origins |= OriginBit(BarrierOrigin::Upload);
 		if (m_pending.has_memory) {
 			m_pending.memory.srcStageMask |= post_src_stage;
 			m_pending.memory.srcAccessMask |= post_src_access;
@@ -746,6 +985,10 @@ void CommandBuffer::RecordPendingUploads() const {
 }
 
 void CommandBuffer::FlushBarriers() const {
+	FlushBarriersImpl(false);
+}
+
+void CommandBuffer::FlushBarriersImpl(bool side_own) const {
 	if (m_pending.Empty()) {
 		return;
 	}
@@ -760,6 +1003,7 @@ void CommandBuffer::FlushBarriers() const {
 		// is entered, so the end is attributed to the site whose command needed the flush.
 		EndRendering();
 	}
+	const bool side = !m_pending.uploads.empty() || !m_pending.images.empty() || !m_pending.buffers.empty();
 	if (!m_pending.uploads.empty()) {
 		RecordPendingUploads();
 	}
@@ -792,6 +1036,31 @@ void CommandBuffer::FlushBarriers() const {
 	dependency.pImageMemoryBarriers     = m_pending.images.data();
 	StateSink().pipelineBarrier2(dependency);
 	--m_internal_recording;
+
+	// KYTY_GPU_HAZARD: the chain restarts at a barrier that orders everything (or the chain's
+	// dispatches) before later compute accesses; other recorded barriers end it.
+	if (GpuHazardMode() != 0) {
+		const auto& memory = m_pending.memory;
+		m_haz_chain.OnFlush(m_haz_foreign, m_pending.has_memory,
+		                    static_cast<VkPipelineStageFlags2>(memory.srcStageMask),
+		                    static_cast<VkAccessFlags2>(memory.srcAccessMask),
+		                    static_cast<VkPipelineStageFlags2>(memory.dstStageMask),
+		                    static_cast<VkAccessFlags2>(memory.dstAccessMask), side && !side_own);
+	} else if (m_haz_chain.valid) {
+		m_haz_chain.Invalidate();
+	}
+	if (GpuHazardCountEnabled()) {
+		HazCount::Add(HazCount::Flushes);
+		if (m_pending.has_memory && IsFullBarrier(m_pending.memory)) {
+			HazCount::Add(HazCount::Full);
+		}
+		if (!m_pending.images.empty()) {
+			HazCount::Add(HazCount::ImageBarriers, m_pending.images.size());
+			if (!m_pending.has_memory && m_pending.buffers.empty()) {
+				HazCount::Add(HazCount::ImageOnly);
+			}
+		}
+	}
 
 	m_last_memory_valid = m_pending.has_memory;
 	if (m_pending.has_memory) {
@@ -839,6 +1108,7 @@ bool CommandBuffer::CanSinkDrawWrites() const {
 void CommandBuffer::NoteDrawRecorded() const {
 	m_recorded_since_flush = true;
 	m_overlap_open         = false;
+	++m_haz_foreign;
 	if (!(m_draw_scope && m_draw_safe && m_rendering && m_epoch_instance == m_rendering_serial)) {
 		m_epoch_clean = false;
 	}
@@ -1118,6 +1388,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering    = true;
 	++m_rendering_serial;
+	if (GpuHazardCountEnabled()) {
+		HazCount::Add(HazCount::Begins);
+	}
 	m_occlusion_control = count_control;
 	if (BarrierBatchEnabled()) {
 		// The attachment load operations of the first instance begun after a full barrier belong

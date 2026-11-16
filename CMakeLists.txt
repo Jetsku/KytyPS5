@@ -695,6 +695,10 @@ add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool
 add_kyty_full_emulator_test(null_texture_desc_tests "${KYTY_TESTS_DIR}/NullTextureDescTests.cpp")
 add_kyty_full_emulator_test(guest_barrier_scope_tests "${KYTY_TESTS_DIR}/GuestBarrierScopeTests.cpp")
 add_kyty_full_emulator_test(sparse_residency_stress_tests "${KYTY_TESTS_DIR}/SparseResidencyStressTests.cpp")
+# KYTY_GPU_HAZARD: the dispatch hazard tracker and chain rules (hazardTracker.h, header only).
+add_executable(gpu_hazard_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuHazardTests.cpp")
+target_link_libraries(gpu_hazard_tests Vulkan::Headers)
+target_include_directories(gpu_hazard_tests PRIVATE ${inc_headers})
 
 # Times the driver's compile of SPIR-V modules (KYTY_DUMP_SPIRV_MIN_WORDS dumps), offline; a tool, not a test.
 add_executable(pipeline_build_timer EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineBuildTimer.cpp")
@@ -1532,6 +1536,7 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_cfg_cb_shader_mask_exports PROPERTIES ENVIRONMENT "KYTY_CB_SHADER_MASK_EXPORTS=1")
 	add_test(NAME null_texture_desc COMMAND $<TARGET_FILE:null_texture_desc_tests>)
 	add_test(NAME guest_barrier_scope COMMAND $<TARGET_FILE:guest_barrier_scope_tests>)
+	add_test(NAME gpu_hazard COMMAND $<TARGET_FILE:gpu_hazard_tests>)
 	# Bug A: sparse residency textures grown, retired and created while dispatches sample them.
 	add_test(NAME sparse_residency_stress COMMAND $<TARGET_FILE:sparse_residency_stress_tests> --iterations 400)
 	add_test(NAME unused_pixel_inputs COMMAND $<TARGET_FILE:shader_cfg_tests> --unused-pixel-inputs-only)
