@@ -4409,7 +4409,7 @@ static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	Live::CountTest(Live::TestCounter::AgcSubmits);
-	Live::TestSpinNs(g_test_submit_spin_ns.Get());
+	Live::TestSpinNs(Gen5::g_test_submit_spin_ns.Get());
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
