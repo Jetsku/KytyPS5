@@ -540,6 +540,8 @@ static Live::Switch g_test_cp_draw_spin_ns("KYTY_LIVE_TEST_CP_DRAW_SPIN_NS", [](
 });
 
 static void CpTestDrawSpin() {
+	// jgcp measurement: the spin's sites per flip on the live lines (counts [drawidx ..]).
+	Live::CountTestSingleWriter(Live::TestCounter::DrawIndexOps);
 	const auto ns = g_test_cp_draw_spin_ns.Get();
 	if (ns <= 0) {
 		return;

@@ -66,6 +66,7 @@ std::atomic<void (*)(const std::string&)> g_log_sink {nullptr};
 std::atomic<GpuTotals (*)()>              g_gpu_totals {nullptr};
 std::atomic<CpIdleTotals (*)()>           g_cp_idle {nullptr};
 std::atomic<std::string (*)(uint64_t)>    g_extra_lines {nullptr};
+std::atomic<uint64_t> g_test_counts[static_cast<uint32_t>(TestCounter::Count)] {};
 
 void WriteLog(const std::string& line) {
 	if (auto* sink = g_log_sink.load(std::memory_order_acquire); sink != nullptr) {
@@ -390,6 +391,10 @@ void Registry::Apply(uint64_t flip) {
 		gpu += fmt::format(" cpidle [tsc {}, nowork {}, empty {}, blocked {}, fence {}, starved {}]", i.tsc,
 		                   i.nowork, i.empty, i.blocked, i.fence, i.starved);
 	}
+	gpu += fmt::format(" counts [drawidx {}, suspend {}, submits {}]",
+	                   g_test_counts[0].load(std::memory_order_relaxed),
+	                   g_test_counts[1].load(std::memory_order_relaxed),
+	                   g_test_counts[2].load(std::memory_order_relaxed));
 	WriteLog(fmt::format("Live: seq {} applied at CP flip {} (t_ms {}, t_us {}, cp_busy_us {}){}: {}\n",
 	                     seq, flip, t_ms, now_ns / 1000u, busy_ns / 1000u, gpu,
 	                     changes.empty() ? std::string("no change") : changes));
@@ -430,6 +435,27 @@ bool Enabled() noexcept {
 
 void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept {
 	g_extra_lines.store(provider, std::memory_order_release);
+}
+
+void CountTest(TestCounter counter) noexcept {
+	g_test_counts[static_cast<uint32_t>(counter)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountTestSingleWriter(TestCounter counter) noexcept {
+	auto& c = g_test_counts[static_cast<uint32_t>(counter)];
+	c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+void TestSpinNs(int64_t ns) noexcept {
+	if (ns <= 0) {
+		return;
+	}
+	const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+	while (std::chrono::steady_clock::now() < end) {
+#if defined(_M_X64) || defined(__x86_64__)
+		_mm_pause();
+#endif
+	}
 }
 
 void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept {
