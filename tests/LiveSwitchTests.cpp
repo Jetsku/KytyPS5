@@ -9,8 +9,10 @@
 //    Run-AstroAB.ps1 does it (write a temporary file, then rename over the live one).
 
 #include "common/liveSwitch.h"
+#include "common/staticOnce.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdint>
@@ -334,6 +336,59 @@ void TestThread() {
 	std::printf("thread: ok\n");
 }
 
+// 5. Common::StaticOnce (common/staticOnce.h): the initializer runs exactly once with 8 threads
+//    racing the first call, every caller sees its value, a non-trivial type works, and
+//    KYTY_STATIC_ONCE_FAST changes nothing but the cost. Also the live line's counts [..] field.
+std::atomic<int> g_once_runs {0};
+
+int OnceValue() {
+	static constexpr auto value_init = [] {
+		g_once_runs.fetch_add(1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		return 42;
+	};
+	static constinit Common::StaticOnce<int> value_once;
+	return value_once.Get(value_init);
+}
+
+const std::string& OnceText() {
+	static constinit Common::StaticOnce<std::string> text_once;
+	return text_once.Get([] { return std::string(64, 'x'); });
+}
+
+void TestStaticOnce() {
+	std::vector<std::thread> threads;
+	std::atomic<int>         wrong {0};
+	for (int i = 0; i < 8; i++) {
+		threads.emplace_back([&] {
+			for (int k = 0; k < 1000; k++) {
+				if (OnceValue() != 42 || OnceText().size() != 64) {
+					wrong.fetch_add(1);
+				}
+			}
+		});
+	}
+	for (auto& t: threads) {
+		t.join();
+	}
+	Check(g_once_runs.load() == 1, "StaticOnce initializer ran once");
+	Check(wrong.load() == 0, "StaticOnce value seen by every thread");
+	Live::Testing::StageText("KYTY_STATIC_ONCE_FAST=1\n");
+	Live::OnCpFlip();
+	Check(Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST=1 applied");
+	Check(OnceValue() == 42 && g_once_runs.load() == 1, "StaticOnce fast path keeps the value");
+	Live::Testing::StageText("KYTY_STATIC_ONCE_FAST=\n");
+	Live::OnCpFlip();
+	Check(!Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST unset again");
+	Live::CountTestSingleWriter(Live::TestCounter::DrawIndexOps);
+	Live::CountTest(Live::TestCounter::AgcSubmits);
+	(void)TakeLog();
+	Live::Testing::StageText("KYTY_LIVE_SEQ=77\nKYTY_STATIC_ONCE_FAST=1\n");
+	Live::OnCpFlip();
+	const auto log = TakeLog();
+	Check(Contains(log, "counts [drawidx ") && Contains(log, "Live: seq 77 applied"), "counts field on the live line");
+}
+
 } // namespace
 
 int main() {
@@ -342,6 +397,7 @@ int main() {
 	TestRegistration();
 	TestSpin();
 	TestThread();
+	TestStaticOnce();
 	std::printf("LiveSwitchTests: all passed\n");
 	return 0;
 }
