@@ -126,6 +126,7 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
+std::vector<bool> g_protection_writable; // per g_protection_ranges entry: made read-write
 std::mutex g_protection_log_mutex;
 // Runs once, on the calling thread, before the next host protection call (a window inside the
 // page manager's host update: host_lock held, the counts read, the result not yet recorded).
@@ -148,6 +149,7 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     std::lock_guard lock(g_protection_log_mutex);
     g_protection_calls++;
     g_protection_ranges.push_back({vaddr, size});
+    g_protection_writable.push_back(protection == PAGE_READWRITE);
   }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
@@ -234,6 +236,56 @@ void TestResyncHostProtection() {
   manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
   Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
         "unwatch after a resync did not restore access");
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// KYTY_MPROTECT_TRACKED_ONCE (based on Senaxx/KytyPS5 c453d3fd5): a writable guest mprotect over
+// watched pages never makes a watched page writable, not even for a moment: each page gets the
+// tracker's protection or the guest's mode in its single host call.
+void TestProtectGuestWritable() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(region_size * 3);
+  const auto allocation_base = reinterpret_cast<uint64_t>(allocation);
+  const auto address = (allocation_base + region_size - 1) & ~(region_size - 1);
+  auto *memory = reinterpret_cast<uint8_t *>(address);
+
+  RegionBits read_mask;
+  read_mask.Set(2);
+  manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<true, true>(address, read_mask);
+  // The guest had made the range read-only before (the tracker's pages keep theirs).
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) != 0 &&
+            VirtualProtect(memory + page_size * 3, page_size, PAGE_READONLY, &old_protection) != 0,
+        "VirtualProtect failed");
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_protection_ranges.clear();
+    g_protection_writable.clear();
+  }
+  manager.ProtectGuestWritable(address, page_size * 4, Common::VirtualMemory::Mode::ReadWrite);
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS && IsWritable(memory + page_size * 3),
+        "a writable guest protect did not keep the watched pages' protection");
+  bool opened_watched = false;
+  for (size_t i = 0; i < g_protection_ranges.size(); i++) {
+    const auto &call = g_protection_ranges[i];
+    if (g_protection_writable[i] && call.address < address + page_size * 3 &&
+        call.address + call.size > address + page_size) {
+      opened_watched = true;
+    }
+  }
+  Check(!opened_watched, "a writable guest protect opened a watched page");
+  // The tracker's record stays right: unwatching makes the pages writable again.
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
+  Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
+        "unwatch after a writable guest protect did not restore access");
+  // A region the tracker never watched gets the guest's mode.
+  manager.ProtectGuestWritable(address + region_size, page_size, Common::VirtualMemory::Mode::Read);
+  Check(Protection(memory + region_size) == PAGE_READONLY, "an unwatched region did not get the guest's mode");
   Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -1094,6 +1146,7 @@ int main(int argc, char **argv) {
   TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestProtectGuestWritable();
   TestConcurrentSharedWatchers();
   TestFatalPaths();
 
@@ -1108,6 +1161,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestProtectGuestWritable();
   TestConcurrentSharedWatchers();
   const auto verify_after = PageManager::GetDeferStats();
   Check(verify_after.verify_checks > verify_before.verify_checks &&
