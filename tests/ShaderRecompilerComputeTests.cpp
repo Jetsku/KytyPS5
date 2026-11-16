@@ -62,6 +62,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/window/f32FlushSelfTest.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
@@ -3108,6 +3109,18 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] vk::Queue Queue() const { return m_queue; }
+  [[nodiscard]] u32 QueueFamily() const { return m_queue_family; }
+  [[nodiscard]] vk::PhysicalDeviceProperties DeviceProperties() const {
+    vk::PhysicalDeviceProperties properties{};
+    m_physical_device.getProperties(&properties);
+    return properties;
+  }
+  [[nodiscard]] vk::PhysicalDeviceMemoryProperties MemoryProperties() const {
+    vk::PhysicalDeviceMemoryProperties memory{};
+    m_physical_device.getMemoryProperties(&memory);
+    return memory;
+  }
   // robustStorageBufferAccessSizeAlignment, or 0 without robustBufferAccess2.
   [[nodiscard]] vk::DeviceSize RobustStorageAlignment() const {
     return m_robust_storage_alignment;

@@ -153,7 +153,8 @@ uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// KYTY_F32_FLUSH_HOST: two register operands are flushed by the host's compare (CodegenOptions,
 	// checked with dynamic operands only); a compare with an immediate keeps the explicit flush, as
 	// the driver may lower it to an integer test.
-	const bool host_flush = F32FlushHost(ctx.state) && !inst.Arg(0).IsImmediate() &&
+	const bool host_flush = F32FlushHost(ctx.state, F32FlushClassCompare) &&
+	                        !inst.Arg(0).IsImmediate() &&
 	                        !inst.Arg(1).IsImmediate();
 	const bool flush =
 	    inst.Flags<IR::FPCompareFlags>().flush_input_denorms && !DenormFlushSkipped(ctx.state);
