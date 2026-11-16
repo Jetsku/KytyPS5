@@ -275,6 +275,30 @@ enum class BarrierOrigin : uint32_t {
 	Count,
 };
 
+// The guest packet behind a CP global barrier (CommandProcessor::EmitGlobalBarrier). Names the
+// gpuOpProfiler site of the recorded batch (batch.guest.<kind>, batch.mixed.guest.<kind>) and selects
+// the KYTY_GUEST_BARRIER_SCOPE mode.
+enum class GuestBarrierKind : uint32_t {
+	CsPartialFlush,    // EVENT_WRITE CS_PARTIAL_FLUSH
+	GfxPartialFlush,   // EVENT_WRITE VS/PS_PARTIAL_FLUSH
+	CbDbWriteback,     // EVENT_WRITE CB/DB data writeback-invalidate (0x16, 0x31)
+	MetaWriteback,     // EVENT_WRITE DB data / DB, CB metadata writeback-invalidate (0x2a, 0x2c, 0x2e)
+	ReleaseMem,        // RELEASE_MEM with an end-of-pipe event or cache actions
+	Pm4Sync,           // KYTY_PM4_BARRIERS=guest waits, slice starts
+	Count,
+};
+// KYTY_GUEST_BARRIER_SCOPE (live, default unset = every kind full): what a CP global barrier of each
+// kind records. Comma list of <kind>=<mode>, kinds cs, gfx, cbdb, meta, rel, sync, all; modes full
+// (ALL_COMMANDS -> ALL_COMMANDS, memory write -> memory read/write, as before), narrow (first scope
+// only the stages the packet waits for: cs = compute shader, gfx = graphics shader and attachment
+// stages, cbdb/meta = attachment stages; rel and sync stay full) and drop (nothing recorded: the
+// renderer's own resource barriers order the work; TheCruZ's fork records none for these events).
+// Shorthands: "narrow" = cs,gfx,cbdb,meta narrow; "drop" = cs,gfx,cbdb,meta drop.
+enum class GuestBarrierMode : uint32_t { Full = 0, Narrow = 1, Drop = 2 };
+[[nodiscard]] GuestBarrierMode GuestBarrierScope(GuestBarrierKind kind);
+// Parser of KYTY_GUEST_BARRIER_SCOPE (2 bits per kind); -1 for a malformed value (then all full).
+[[nodiscard]] int64_t ParseGuestBarrierScope(const char* value);
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -322,6 +346,8 @@ public:
 	void RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
 	                          vk::PipelineStageFlags2 dst_stages, vk::AccessFlags2 dst_access,
 	                          BarrierOrigin origin) const;
+	// Profiler attribution only: the Guest request just queued came from `kind`.
+	void NoteGuestBarrierKind(GuestBarrierKind kind) const;
 	// Queues a buffer memory barrier.
 	void RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier, BarrierOrigin origin) const;
 	// Routes image barriers built for `target` into the batch. Returns false (nothing done) when
@@ -513,6 +539,7 @@ private:
 		std::vector<PendingUpload>  uploads;
 		std::vector<vk::BufferCopy> upload_regions;
 		uint32_t                              origins = 0; // bit per BarrierOrigin
+		uint32_t                              guest_kinds = 0; // bit per GuestBarrierKind (profiler)
 
 		[[nodiscard]] bool Empty() const {
 			return !has_memory && images.empty() && buffers.empty() && uploads.empty();
@@ -524,7 +551,8 @@ private:
 			buffers.clear();
 			uploads.clear();
 			upload_regions.clear();
-			origins = 0;
+			origins     = 0;
+			guest_kinds = 0;
 		}
 	};
 	// Records the queued upload copies behind one barrier and queues their post-copy barriers.
@@ -1530,6 +1558,12 @@ private:
 	// are recorded outside rendering, or end it (shader-write barrier), so while this instance
 	// stays active the barrier still covers every argument write.
 	uint64_t m_indirect_barrier_rendering = 0;
+	// KYTY_INDIRECT_ARGS_COVERED: the rendering instance in which a draw last queued its shader-write
+	// barrier without ending the instance (KYTY_DRAW_WRITE_SINK); 0 if none.
+	uint64_t m_indirect_write_rendering = 0;
+	// Whether an indirect draw recorded in the active rendering instance needs its own argument
+	// barrier (which ends the instance).
+	[[nodiscard]] bool IndirectArgsBarrierNeeded(const CommandBuffer& buffer) const;
 	// KYTY_DEPTH_FEEDBACK_KEEP: the depth attachment of the draw being recorded and whether the
 	// draw writes it, applied to Image::feedback_instance/_serial once BeginRendering() has
 	// chosen the draw's rendering instance (NoteDepthFeedback).

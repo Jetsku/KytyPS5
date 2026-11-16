@@ -25,6 +25,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -46,6 +47,72 @@ static Live::Switch g_dispatch_overlap_uploads("KYTY_DISPATCH_OVERLAP_UPLOADS", 
 static Live::Switch g_pm4_guest_barriers("KYTY_PM4_BARRIERS", [](const char* value) -> int64_t {
 	return value != nullptr && std::strcmp(value, "guest") == 0 ? 1 : 0;
 });
+
+// KYTY_GUEST_BARRIER_SCOPE (render.h GuestBarrierScope): live; default every kind full.
+int64_t ParseGuestBarrierScope(const char* value) {
+	if (value == nullptr || value[0] == '\0') {
+		return 0;
+	}
+	constexpr auto Kinds = static_cast<uint32_t>(GuestBarrierKind::Count);
+	auto set = [](int64_t bits, uint32_t kind, uint32_t mode) {
+		return (bits & ~(int64_t {3} << (2 * kind))) | (int64_t {mode} << (2 * kind));
+	};
+	auto mode_of = [](std::string_view text) -> int {
+		if (text == "full") return 0;
+		if (text == "narrow") return 1;
+		if (text == "drop") return 2;
+		return -1;
+	};
+	int64_t          bits = 0;
+	std::string_view rest(value);
+	while (!rest.empty()) {
+		const auto comma = rest.find(',');
+		auto       item  = rest.substr(0, comma);
+		rest             = comma == std::string_view::npos ? std::string_view {} : rest.substr(comma + 1);
+		if (item.empty()) {
+			continue;
+		}
+		const auto equals = item.find('=');
+		if (equals == std::string_view::npos) {
+			// Shorthand: the four EVENT_WRITE kinds.
+			const int mode = mode_of(item);
+			if (mode < 0) {
+				return -1;
+			}
+			for (uint32_t kind = 0; kind <= static_cast<uint32_t>(GuestBarrierKind::MetaWriteback); kind++) {
+				bits = set(bits, kind, static_cast<uint32_t>(mode));
+			}
+			continue;
+		}
+		const auto name = item.substr(0, equals);
+		const int  mode = mode_of(item.substr(equals + 1));
+		if (mode < 0) {
+			return -1;
+		}
+		static constexpr std::string_view Names[Kinds] = {"cs", "gfx", "cbdb", "meta", "rel", "sync"};
+		bool found = false;
+		for (uint32_t kind = 0; kind < Kinds; kind++) {
+			if (name == Names[kind] || name == "all") {
+				bits  = set(bits, kind, static_cast<uint32_t>(mode));
+				found = true;
+			}
+		}
+		if (!found) {
+			return -1;
+		}
+	}
+	return bits;
+}
+
+static Live::Switch g_guest_barrier_scope("KYTY_GUEST_BARRIER_SCOPE", [](const char* value) -> int64_t {
+	const auto bits = ParseGuestBarrierScope(value);
+	return bits < 0 ? 0 : bits; // malformed: every kind full
+});
+
+GuestBarrierMode GuestBarrierScope(GuestBarrierKind kind) {
+	const auto bits = g_guest_barrier_scope.Get();
+	return static_cast<GuestBarrierMode>((bits >> (2 * static_cast<uint32_t>(kind))) & 3);
+}
 
 // ------------------------------------------------------------------------------------------------
 // Barrier batcher
@@ -229,7 +296,24 @@ constinit GpuOpProfiler::Site g_batch_sites[static_cast<size_t>(BarrierOrigin::C
     GpuOpProfiler::Site {"batch.mixed"},
 };
 
-GpuOpProfiler::Site& BatchSite(uint32_t origins) {
+// Batches with exactly one GuestBarrierKind: guest-only, and mixed with other origins.
+constinit GpuOpProfiler::Site g_guest_kind_sites[2][static_cast<size_t>(GuestBarrierKind::Count)] = {
+    {GpuOpProfiler::Site {"batch.guest.cs_flush"}, GpuOpProfiler::Site {"batch.guest.gfx_flush"},
+     GpuOpProfiler::Site {"batch.guest.cbdb_wb"}, GpuOpProfiler::Site {"batch.guest.meta_wb"},
+     GpuOpProfiler::Site {"batch.guest.release_mem"}, GpuOpProfiler::Site {"batch.guest.pm4_sync"}},
+    {GpuOpProfiler::Site {"batch.mixed.guest.cs_flush"}, GpuOpProfiler::Site {"batch.mixed.guest.gfx_flush"},
+     GpuOpProfiler::Site {"batch.mixed.guest.cbdb_wb"}, GpuOpProfiler::Site {"batch.mixed.guest.meta_wb"},
+     GpuOpProfiler::Site {"batch.mixed.guest.release_mem"}, GpuOpProfiler::Site {"batch.mixed.guest.pm4_sync"}},
+};
+
+GpuOpProfiler::Site& BatchSite(uint32_t origins, uint32_t guest_kinds) {
+	constexpr uint32_t GuestBit = 1u << static_cast<uint32_t>(BarrierOrigin::Guest);
+	if ((origins & GuestBit) != 0 && guest_kinds != 0 && std::has_single_bit(guest_kinds)) {
+		const auto kind = static_cast<size_t>(std::countr_zero(guest_kinds));
+		if (kind < static_cast<size_t>(GuestBarrierKind::Count)) {
+			return g_guest_kind_sites[origins == GuestBit ? 0 : 1][kind];
+		}
+	}
 	if (origins != 0 && std::has_single_bit(origins)) {
 		const auto index = static_cast<size_t>(std::countr_zero(origins));
 		if (index < static_cast<size_t>(BarrierOrigin::Count)) {
@@ -467,6 +551,12 @@ void CommandBuffer::RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages,
 	CountOriginRequest(origin);
 }
 
+void CommandBuffer::NoteGuestBarrierKind(GuestBarrierKind kind) const {
+	if (GpuOpProfiler::Active() && (m_pending.origins & OriginBit(BarrierOrigin::Guest)) != 0) {
+		m_pending.guest_kinds |= 1u << static_cast<uint32_t>(kind);
+	}
+}
+
 void CommandBuffer::RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier,
                                          BarrierOrigin                   origin) const {
 	EXIT_IF(IsInvalid());
@@ -673,7 +763,7 @@ void CommandBuffer::FlushBarriers() const {
 	if (!m_pending.uploads.empty()) {
 		RecordPendingUploads();
 	}
-	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
+	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins, m_pending.guest_kinds));
 	++m_internal_recording;
 	if (m_pending.has_memory) {
 		// The requests were issued in some order with nothing recorded between them. Widening

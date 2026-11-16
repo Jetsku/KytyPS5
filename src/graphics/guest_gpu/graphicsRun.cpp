@@ -1813,7 +1813,7 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 	}
 	// KYTY_PM4_BARRIERS=guest (render.h): what comes after the wait comes after what it waited for.
 	if (GuestSyncBarriersEnabled()) {
-		EmitGlobalBarrier();
+		EmitGlobalBarrier(GuestBarrierKind::Pm4Sync);
 	}
 	return {};
 }
@@ -5056,9 +5056,39 @@ void CommandProcessor::ExecEndOfPipe(const CpSeq::EndOfPipeOp& op) {
 	                 op.interrupt_context_id);
 }
 
-void CommandProcessor::EmitGlobalBarrier() {
+void CommandProcessor::EmitGlobalBarrier(GuestBarrierKind kind) {
 	KYTY_GPU_OP_SITE("guest.global_barrier");
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	// KYTY_GUEST_BARRIER_SCOPE (render.h): drop, or narrow the first scope to what the packet waits for.
+	const auto mode = GuestBarrierScope(kind);
+	if (mode == GuestBarrierMode::Drop) {
+		return;
+	}
+	auto src_stages = vk::PipelineStageFlags2 {vk::PipelineStageFlagBits2::eAllCommands};
+	auto src_access = vk::AccessFlags2 {vk::AccessFlagBits2::eMemoryWrite};
+	if (mode == GuestBarrierMode::Narrow) {
+		constexpr auto AttachmentStages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+		                                  vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		                                  vk::PipelineStageFlagBits2::eLateFragmentTests;
+		constexpr auto AttachmentWrites = vk::AccessFlagBits2::eColorAttachmentWrite |
+		                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		switch (kind) {
+			case GuestBarrierKind::CsPartialFlush:
+				src_stages = vk::PipelineStageFlagBits2::eComputeShader;
+				src_access = vk::AccessFlagBits2::eShaderWrite;
+				break;
+			case GuestBarrierKind::GfxPartialFlush:
+				src_stages = vk::PipelineStageFlagBits2::eAllGraphics;
+				src_access = vk::AccessFlagBits2::eShaderWrite | AttachmentWrites;
+				break;
+			case GuestBarrierKind::CbDbWriteback:
+			case GuestBarrierKind::MetaWriteback:
+				src_stages = AttachmentStages;
+				src_access = AttachmentWrites;
+				break;
+			default: break;
+		}
+	}
 	RenderLockGuard lock(m_renderer.GetMutex());
 	// Keep renderer-lock contention in the parent zone's self time.
 	KYTY_PROFILER_DETAIL_BLOCK("CommandProcessor::RecordGlobalBarrier");
@@ -5068,16 +5098,16 @@ void CommandProcessor::EmitGlobalBarrier() {
 		// it with nothing recorded since, recorded before the next memory-accessing command.
 		// The rendering instance ends only if the barrier is recorded (see render.h).
 		CurrentBuffer().RequestMemoryBarrier(
-		    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
-		    vk::PipelineStageFlagBits2::eAllCommands,
+		    src_stages, src_access, vk::PipelineStageFlagBits2::eAllCommands,
 		    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
 		    BarrierOrigin::Guest);
+		CurrentBuffer().NoteGuestBarrierKind(kind);
 		return;
 	}
 
 	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.srcStageMask  = src_stages;
+	barrier.srcAccessMask = src_access;
 	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 
@@ -5118,7 +5148,10 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: EmitGlobalBarrier(); break;
+		case 0x00000010:
+			EmitGlobalBarrier(event_type == 0x00000007 ? GuestBarrierKind::CsPartialFlush
+			                                           : GuestBarrierKind::GfxPartialFlush);
+			break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
 		case 0x00000016:
 		case 0x00000031:
@@ -5126,7 +5159,7 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
+			EmitGlobalBarrier(GuestBarrierKind::CbDbWriteback);
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x0000002a:
@@ -5136,7 +5169,7 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
+			EmitGlobalBarrier(GuestBarrierKind::MetaWriteback);
 			break;
 		case 0x0000000d:
 		case 0x0000000e:

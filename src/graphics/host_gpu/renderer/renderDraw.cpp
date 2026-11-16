@@ -1597,6 +1597,28 @@ static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            b
 
 // Shader and transfer writes (compute culling, DMA, cache uploads) -> indirect command fetch.
 // Must be recorded outside a rendering instance.
+// KYTY_INDIRECT_ARGS_COVERED (live, default off): an indirect draw in a rendering instance that began
+// after other work (a submission, a target change, a barrier split) does not end it for its own
+// argument barrier when no draw of that instance queued a shader-write barrier without ending it
+// (KYTY_DRAW_WRITE_SINK). Every argument writer's own barrier already reaches indirect command reads
+// and was recorded before the instance began (BeginRendering flushes the batch of a new instance):
+// dispatches ShaderAccess (compute -> all commands, memory read), draws ShaderWrite (-> all graphics,
+// indirect command read), buffer fills, copies and uploads (transfer -> all commands, memory read).
+// Not with KYTY_PM4_BARRIERS=guest (dispatches and draws record no barriers there).
+static Live::Switch g_indirect_args_covered("KYTY_INDIRECT_ARGS_COVERED", Live::ParseDefaultOff);
+
+bool RenderExecutor::IndirectArgsBarrierNeeded(const CommandBuffer& buffer) const {
+	const auto active = buffer.ActiveRenderingSerial();
+	if (active == 0) {
+		return true; // a new instance begins for this draw: its batch carries the request
+	}
+	if (active == m_indirect_barrier_rendering) {
+		return false;
+	}
+	return !(g_indirect_args_covered.On() && active != m_indirect_write_rendering &&
+	         BarrierBatchEnabled() && !GuestSyncBarriersEnabled());
+}
+
 static void IndirectArgumentsBarrier(const CommandBuffer& buffer, const CommandSink& vk_buffer) {
 	if (BarrierBatchEnabled()) {
 		// Recorded (outside rendering) by the BeginRendering() that precedes the draw.
@@ -7310,7 +7332,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// rendering instance (recording one ends rendering, which a continuation never does).
 	// KYTY_GPU_INSTANCE_COUNT: its copy ends rendering too.
 	const bool run_indirect_barrier =
-	    (indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering) ||
+	    (indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering &&
+	     IndirectArgsBarrierNeeded(buffer)) ||
 	    instance_record;
 	// KYTY_DRAW_RUN_TARGETS: kept targets whose attachments changed during the buffer work are
 	// resolved now, with the same repeated binding work as a continuation's fallback.
@@ -7953,8 +7976,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
 		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
 		// begun right after the previous barrier needs no new one while it remains active.
-		const auto active = buffer.ActiveRenderingSerial();
-		if (active == 0 || active != m_indirect_barrier_rendering) {
+		if (IndirectArgsBarrierNeeded(buffer)) {
 			const CommitStats::SubScope barrier_scope(CommitStats::Sub::Barriers);
 			{
 				KYTY_GPU_OP_SITE("draw.indirect_args");
@@ -8364,6 +8386,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			// An indirect draw can no longer rely on "no buffer write since the argument barrier
 			// while this instance is active": it must end the instance and record a new one.
 			m_indirect_barrier_rendering = 0;
+			m_indirect_write_rendering   = buffer.ActiveRenderingSerial();
 		} else {
 			{
 				KYTY_GPU_OP_SITE("draw.write_barrier");

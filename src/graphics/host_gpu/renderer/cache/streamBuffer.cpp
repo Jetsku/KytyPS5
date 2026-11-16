@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/ramStats.h"
@@ -365,10 +366,36 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 	return barrier;
 }
 
+// KYTY_DMA_BARRIER_BATCH (live, default off; needs the barrier batcher): Buffer::Fill and
+// Buffer::CopyFrom queue their before/after buffer barriers in the batch (render.h) instead of
+// recording each pair around the command: the before barriers join the pending batch (often a
+// guest RELEASE_MEM barrier) in one call, the after barriers join whatever is flushed next. Same
+// scopes; only the number of barrier commands changes.
+static Live::Switch g_dma_barrier_batch("KYTY_DMA_BARRIER_BATCH", Live::ParseDefaultOff);
+
+static vk::BufferMemoryBarrier2 Barrier2(const vk::BufferMemoryBarrier& barrier, vk::PipelineStageFlags2 src_stages,
+                                         vk::PipelineStageFlags2 dst_stages) {
+	vk::BufferMemoryBarrier2 out {};
+	out.srcStageMask        = src_stages;
+	out.srcAccessMask       = vk::AccessFlags2(static_cast<VkAccessFlags2>(static_cast<VkAccessFlags>(barrier.srcAccessMask)));
+	out.dstStageMask        = dst_stages;
+	out.dstAccessMask       = vk::AccessFlags2(static_cast<VkAccessFlags2>(static_cast<VkAccessFlags>(barrier.dstAccessMask)));
+	out.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	out.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	out.buffer              = barrier.buffer;
+	out.offset              = barrier.offset;
+	out.size                = barrier.size;
+	return out;
+}
+
+static vk::PipelineStageFlags2 Stages2(vk::PipelineStageFlags stages) {
+	return vk::PipelineStageFlags2(static_cast<VkPipelineStageFlags2>(static_cast<VkPipelineStageFlags>(stages)));
+}
+
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
-                      vk::AccessFlags destination_after) {
+                      vk::AccessFlags destination_after, bool batch) {
 	KYTY_GPU_OP_SITE("buffer.copy");
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
@@ -388,6 +415,29 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
+	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
+	if (static_cast<bool>((source_after | destination_after) & host_access)) {
+		after_stage |= vk::PipelineStageFlagBits::eHost;
+	}
+	if (batch && DmaBarrierBatchEnabled()) {
+		// KYTY_DMA_BARRIER_BATCH: the same barriers through the batch (see Fill).
+		for (const auto& barrier: before) {
+			command.RequestBufferBarrier(Barrier2(barrier, Stages2(before_stage), vk::PipelineStageFlagBits2::eTransfer),
+			                             BarrierOrigin::Upload);
+		}
+		const vk::BufferCopy copy {source_offset, destination_offset, size};
+		command.HelperSink().copyBuffer(source.Handle(), Handle(), 1, &copy);
+		MarkContentWritten();
+		const vk::BufferMemoryBarrier after[] = {
+		    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
+		    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
+		};
+		for (const auto& barrier: after) {
+			command.RequestBufferBarrier(Barrier2(barrier, vk::PipelineStageFlagBits2::eTransfer, Stages2(after_stage)),
+			                             BarrierOrigin::Upload);
+		}
+		return;
+	}
 	const auto native = command.HelperSink();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
@@ -398,10 +448,6 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
 	};
-	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_after | destination_after) & host_access)) {
-		after_stage |= vk::PipelineStageFlagBits::eHost;
-	}
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
@@ -449,13 +495,33 @@ void Buffer::CopyRegionsFrom(CommandBuffer& command, const Buffer& source, std::
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
-void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
+bool Buffer::DmaBarrierBatchEnabled() {
+	return g_dma_barrier_batch.On() && BarrierBatchEnabled();
+}
+
+void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value, bool batch) {
 	KYTY_GPU_OP_SITE("buffer.fill");
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}
 	auto& command = Scheduler().Current();
 	command.EndRendering();
+	if (batch && DmaBarrierBatchEnabled()) {
+		const auto before =
+		    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		            vk::AccessFlagBits::eTransferWrite);
+		command.RequestBufferBarrier(Barrier2(before, vk::PipelineStageFlagBits2::eAllCommands,
+		                                      vk::PipelineStageFlagBits2::eTransfer),
+		                             BarrierOrigin::Upload);
+		command.HelperSink().fillBuffer(Handle(), offset, size, value);
+		MarkContentWritten();
+		const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
+		                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+		command.RequestBufferBarrier(Barrier2(after, vk::PipelineStageFlagBits2::eTransfer,
+		                                      vk::PipelineStageFlagBits2::eAllCommands),
+		                             BarrierOrigin::Upload);
+		return;
+	}
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
