@@ -322,8 +322,10 @@ static Live::Switch g_pop_ready_fast("KYTY_POP_READY_FAST", [](const char* value
 
 // KYTY_POP_READY_FAST=2: also without the lock while the front operation's tick is not known
 // complete; the GPU's progress is then queried (MasterSemaphore::Refresh, a driver call) at most every
-// 50 us, as KYTY_PENDING_REFRESH_US=50 would (the operations are deletions and recycling nothing at a
+// KYTY_PENDING_REFRESH_US (preset 200), else every 50 us (the operations are deletions and recycling nothing at a
 // draw waits for; every blocking pop still queries).
+static uint64_t PendingRefreshIntervalNs();
+
 void CommandScheduler::PopReadyOperations() {
 	if (const auto fast = g_pop_ready_fast.Get(); fast != 0 && Common::RendererBatchEnabled()) {
 		const auto front = m_pending_front_tick.load(std::memory_order_acquire);
@@ -332,7 +334,8 @@ void CommandScheduler::PopReadyOperations() {
 		}
 		if (fast >= 2 && !m_master.IsFree(front)) {
 			const auto now = GpuTiming::NowNs();
-			if (now - m_last_pending_refresh_ns < 50'000u) {
+			const auto interval = PendingRefreshIntervalNs(); // KYTY_PENDING_REFRESH_US, else 50 us
+			if (now - m_last_pending_refresh_ns < (interval != 0 ? interval : 50'000u)) {
 				return;
 			}
 			m_last_pending_refresh_ns = now;

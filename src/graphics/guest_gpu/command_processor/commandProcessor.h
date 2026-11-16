@@ -550,6 +550,7 @@ private:
 	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
 	uint64_t  m_idle_flush_tick             = 0;
 	uint32_t  m_idle_flush_draws            = 0;
+	uint64_t  m_idle_flush_refresh_ns       = 0; // KYTY_IDLE_FLUSH_REFRESH_US: the last timeline query
 	uint32_t  m_held_flush_checks           = 0; // KYTY_FLUSH_DEFER (MaybeReleaseHeldFlush)
 	// KYTY_SUBMIT_EVERY: the recording's idle-early submit is armed (its first command after a
 	// non-batch submit found the GPU idle), and the tick our last batch submit opened.

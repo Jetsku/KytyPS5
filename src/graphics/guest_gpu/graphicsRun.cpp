@@ -1436,6 +1436,10 @@ static Live::Switch g_submit_every("KYTY_SUBMIT_EVERY", [](const char* value) ->
 	return static_cast<int64_t>(std::min(parsed, 65536ul));
 });
 
+static Live::Switch g_idle_flush_refresh_us("KYTY_IDLE_FLUSH_REFRESH_US", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+});
+
 void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
 	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
@@ -1480,6 +1484,14 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 		// Refresh the timeline value only every few draws (a driver query).
 		if ((m_idle_flush_draws % 4u) != 0) {
 			return;
+		}
+		// KYTY_IDLE_FLUSH_REFRESH_US (live, default 0): and at most once per that many microseconds.
+		if (const auto us = static_cast<uint64_t>(g_idle_flush_refresh_us.Get()); us != 0) {
+			const auto now = CpDecide::NowNs();
+			if (now - m_idle_flush_refresh_ns < us * 1000u) {
+				return;
+			}
+			m_idle_flush_refresh_ns = now;
 		}
 		master.Refresh();
 		if (master.KnownGpuTick() + ahead < current) {
