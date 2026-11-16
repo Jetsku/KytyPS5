@@ -373,17 +373,18 @@ void TestStaticOnce() {
 	}
 	Check(g_once_runs.load() == 1, "StaticOnce initializer ran once");
 	Check(wrong.load() == 0, "StaticOnce value seen by every thread");
-	Live::Testing::StageText("KYTY_STATIC_ONCE_FAST=1\n");
+	Check(Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST is on by default");
+	Live::Testing::StageText("KYTY_STATIC_ONCE_FAST=0\n");
 	Live::OnCpFlip();
-	Check(Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST=1 applied");
-	Check(OnceValue() == 42 && g_once_runs.load() == 1, "StaticOnce fast path keeps the value");
+	Check(!Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST=0 applied");
+	Check(OnceValue() == 42 && g_once_runs.load() == 1, "StaticOnce guarded path keeps the value");
 	Live::Testing::StageText("KYTY_STATIC_ONCE_FAST=\n");
 	Live::OnCpFlip();
-	Check(!Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST unset again");
+	Check(Common::StaticOnceFast(), "KYTY_STATIC_ONCE_FAST unset again");
 	Live::CountTestSingleWriter(Live::TestCounter::DrawIndexOps);
 	Live::CountTest(Live::TestCounter::AgcSubmits);
 	(void)TakeLog();
-	Live::Testing::StageText("KYTY_LIVE_SEQ=77\nKYTY_STATIC_ONCE_FAST=1\n");
+	Live::Testing::StageText("KYTY_LIVE_SEQ=77\nKYTY_STATIC_ONCE_FAST=0\n");
 	Live::OnCpFlip();
 	const auto log = TakeLog();
 	Check(Contains(log, "counts [drawidx ") && Contains(log, "Live: seq 77 applied"), "counts field on the live line");

@@ -426,9 +426,9 @@ Switch g_test_cp_spin_us("KYTY_LIVE_TEST_CP_SPIN_US", [](const char* value) -> i
 
 } // namespace Live
 
-// KYTY_STATIC_ONCE_FAST (common/staticOnce.h; live, default 0).
+// KYTY_STATIC_ONCE_FAST (common/staticOnce.h; live, default 1).
 namespace Common::StaticOnceDetail {
-Live::Switch g_fast("KYTY_STATIC_ONCE_FAST", Live::ParseDefaultOff);
+Live::Switch g_fast("KYTY_STATIC_ONCE_FAST", Live::ParseDefaultOn);
 } // namespace Common::StaticOnceDetail
 
 namespace Live {

@@ -28,7 +28,7 @@ namespace Common {
 // thread-safe static did (side effects such as a log line happen once). T needs no default
 // constructor; it is never destroyed (like most such gates' values, it lives until the process ends).
 //
-// KYTY_STATIC_ONCE_FAST (live, default 0): 0 keeps the old per-call cost (a thread-safe static guard
+// KYTY_STATIC_ONCE_FAST (live, default 1): 0 restores the old per-call cost (a thread-safe static guard
 // check is made on every Get, so a same-boot A/B measures what the guards cost); 1 skips it.
 namespace StaticOnceDetail {
 extern Live::Switch g_fast; // liveSwitch.cpp
