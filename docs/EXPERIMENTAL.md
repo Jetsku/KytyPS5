@@ -36,6 +36,52 @@ This release builds on the U59 renderer of the previous U59 releases.
   an illegal instruction. The check is compiled for the x86-64 baseline and runs from the C run-time's C initializer
   table, before any other code of the program. `KYTY_TEST_CPU_CHECK=fail` shows the message on any CPU.
 
+### int22: Astro Bot and Astro's Playroom
+
+- **Title presets.** Beside `u59-preset.json` the package has one preset per game, `u59-preset.<title id>.json`
+  (`u59-preset.PPSA21567.json` for Astro Bot, `u59-preset.PPSA01325.json` for Astro's Playroom, and ten more). The
+  launcher applies a game's title preset over `u59-preset.json` when it starts that game; the emulator does it
+  itself when it is started without the launcher. `u59-preset.json` is the same as in int21: everything new for a
+  game is in its title preset, so keep all the preset files next to the launcher. A switch that only one game has
+  been tested with is on for that game only.
+- **Less work on the commit thread**, the one thread that hands the game's draws to Vulkan in the game's order and
+  that limits the frame rate where the GPU has time to spare. On in both title presets, each one a live switch that
+  was compared inside one boot and checked with its verify mode: draw runs that continue the previous draw's state
+  (`KYTY_CONT_KERNEL`, `KYTY_CONT_KERNEL_INPLACE`, `KYTY_BK_HANDOVER`, `KYTY_BK_ADOPT`, `KYTY_BK_RECORD`,
+  `KYTY_BK_LEAN`), buffers that shaders read through computed addresses synchronised only as far as the shader can
+  reach (`KYTY_BDA_REACH`), image look-ups reused across draws (`KYTY_IMG_MEMO2`, `KYTY_IMG_INPLACE`,
+  `KYTY_IMG_PARTNER`, `KYTY_IMG_DEPTHALIAS`), and smaller per-draw costs (`KYTY_LAZY_FIND_BUFFER`,
+  `KYTY_SKIP_TARGETS_MEMO`, `KYTY_REBIND_LEAN`, `KYTY_POP_READY_FAST=2`, `KYTY_IDLE_FLUSH_REFRESH_US=100`,
+  `KYTY_CERT_PREFETCH`, `KYTY_CERT_COUNT_LAZY`). `KYTY_STATIC_ONCE_FAST` is on by default for every game (0 turns it
+  off). Astro's Playroom also sets `KYTY_BDA_LIVE_PAGES=1` (pages the game rewrites every frame are read from the
+  game's memory instead of being uploaded each frame) and `KYTY_HANDOFF_LEAN=1`.
+- **Shader code for NVIDIA GPUs**: `KYTY_F32_FLUSH_HOST=nvidia`, `KYTY_LDS_SLOTS=nvidia` and
+  `KYTY_VS_FULL_WAVE=nvidia` are on only when the GPU is an NVIDIA one (they were measured on an RTX 3090 only, and
+  the first relies on NVIDIA's default float mode, which a self-test checks at start-up). Astro Bot also sets
+  `KYTY_BRANCHLESS_LOADS=1` and `KYTY_LANE_LOCAL=1`. These change the generated shaders: the first start after the
+  update rebuilds the program cache once.
+- **Astro Bot, sponge level**: `KYTY_READBACK_EAGER_WRITES=1` with `KYTY_READBACK_EAGER_PAGES=256`. The level's
+  fluid job writes memory on the GPU that the game's threads write again a frame later; those pages are now copied
+  back when the GPU work is recorded, so the game's threads no longer wait for the GPU at every such write.
+- **CPUs with fewer than 16 logical processors**: `KYTY_SMALL_CPU_RULE=1` sets `KYTY_GUEST_PRIORITY_FLAT=1` (the
+  game's spinning job workers no longer hold every processor while the threads they wait for cannot run; on 4 cores
+  / 8 threads and on 6 cores without SMT this removed 2.5-second stalls) and, from 10 logical processors up,
+  `KYTY_SPIN_BUDGET=1`. One "Kyty small-CPU rule" console line says what it chose. It does nothing on larger CPUs.
+- **Off by default**: the "Faster GPU synchronisation" launcher option described above. (The code of an unfinished
+  change, `KYTY_EMIT_SPLIT`, is in this build but must stay off: switched on from the start it froze a level load.)
+
+### int22: other games
+
+- **Fixed (GPU device loss during a level load, another title):** a compute dispatch that writes through addresses it
+  computes itself, into memory the emulator had not yet given a GPU buffer, kept only its first 4,096 stores; the
+  rest were dropped, and a later dispatch that read the half-written array could hang the GPU. Whether the load hit
+  it depended on timing, and the fastest builds hit it most. The log of such stores now holds 262,144 per dispatch
+  (the part past the first 4,096 is fetched only when a dispatch needs it). Atomic operations and formatted stores
+  into such memory are still dropped until the memory has its buffer (a frame later).
+- Per-title presets for Gran Turismo 7, Ghost of Yotei (02.002), Spider-Man: Miles Morales, Ratchet & Clank: Rift
+  Apart, Demon's Souls and Beyond Good & Evil 20th Anniversary hold the switches collected for these games. They are
+  experimental: on the test PC each of them starts and reaches its menu or the game with this build.
+
 Pre-release int16.1: int16 plus one fix.
 
 - Reverted the upstream libFont commits "font: fix glyph metrics and raster sizes" (32e9fa30) and "font: add scaled
@@ -381,7 +427,7 @@ also use the second CCD (`KYTY_VCACHE_GUEST=all`, default; `hot` keeps them on t
   Windows 11). The limits at which the windows grow come from that PC, a simulation of slow faults on it and one
   Linux user's log. `"KYTY_OCCLUSION_BATCH": "0"` and `"KYTY_FAULT_AHEAD_ADAPT": "0"` in `u59-preset.json` restore
   the previous behaviour.
-- The PGO profile comes from Astro Bot only. Other games run with code laid out for Astro Bot.
+- The PGO profile comes from Astro Bot and Astro's Playroom only. Other games run with code laid out for these two.
 - Microsoft Defender flagged the int7 `launcher.exe` as `Trojan:Win32/Bearfoos.A!ml` on the test PC. The `!ml` marks a
   machine-learning verdict, not the signature of known malware. The launcher is built by the GitHub Actions workflow
   `.github/workflows/u59-windows-release.yml` from `src/launcher` in this repository. Since upsync 5 it is named
@@ -404,8 +450,10 @@ Release with Ninja in an x64 Visual Studio developer shell, as in `.github/workf
 - Add `-DKYTY_CP_DIAGNOSTICS=OFF`, as the release does: it compiles out the command processor's per-draw
   developer statistics (`KYTY_CP_COMMIT_STATS`, `KYTY_BUFFER_LOOKUP_STATS`, which are then ignored). The hang
   watchdog, crash context and hang trace are unaffected. Keep the default `ON` to use those statistics.
-- Build `launcher` and `kyty_emulator`, install to `_Build/windows/install`, and copy `tools/u59-preset.json` beside
-  `kyty_launcher.exe`.
+- Add `-DKYTY_MARCH=x86-64-v3`, as the release does (host code for CPUs with AVX2, BMI2 and FMA, with the start-up
+  CPU check). Leave it out for a build that runs on any x86-64 CPU.
+- Build `launcher` and `kyty_emulator`, install to `_Build/windows/install`, and copy `tools/u59-preset.json` and
+  the title presets `tools/u59-preset.*.json` beside `kyty_launcher.exe`.
 
 The Windows release is produced by a tagged GitHub Actions build. Original licenses and credits remain intact.
 Personal handoffs, local editor configuration, captures, saves and caches are excluded. Historical results and their
