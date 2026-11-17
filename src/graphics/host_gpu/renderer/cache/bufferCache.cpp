@@ -5730,7 +5730,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
 			EXIT("BufferCache: GDS fill range is out of bounds\n");
 		}
-		m_gds_buffer.Fill(vaddr, size, value);
+		m_gds_buffer.Fill(vaddr, size, value, true);
 		return;
 	}
 	if (vaddr == 0) {
@@ -5776,7 +5776,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (preserve_images) {
 		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	}
-	dst->Fill(dst_offset, size, value);
+	dst->Fill(dst_offset, size, value, true);
 	RecordKnownFill(vaddr, size, value);
 }
 
@@ -5796,7 +5796,7 @@ void BufferCache::FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>>
 		if (preserve_images) {
 			m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 		}
-		dst->Fill(dst_offset, size, value);
+		dst->Fill(dst_offset, size, value, true);
 		RecordKnownFill(vaddr, size, value);
 	}
 }
@@ -6151,7 +6151,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		std::tie(src, src_offset) = ObtainBuffer(src_vaddr, size, false, true, BufferId {});
 		EXIT_IF(src->is_deleted);
 	}
-	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	// KYTY_DMA_BARRIER_BATCH: nothing is recorded through an earlier native handle after this copy.
+	dst->CopyFrom(command, *src, src_offset, dst_offset, size, vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite, true);
 }
 
 Buffer& BufferCache::PrepareImageBytes(const RangeSet& ranges, Buffer* target) {

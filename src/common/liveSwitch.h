@@ -138,6 +138,9 @@ void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept;
 // wholecp measurement: extra log lines written right after every application line (argument: the
 // line's live sequence number), e.g. the KYTY_HLE_WAIT_STATS per-thread totals.
 void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept;
+// gpuhaz measurement: text appended to every application line after the counts (empty: nothing),
+// e.g. " haz [disp N, ..]" cumulative KYTY_GPU_HAZARD counters.
+void SetLineSuffixProvider(std::string (*provider)()) noexcept;
 
 // jgcp measurement: event counters printed on every application line with KYTY_LIVE_FILE (once any
 // counter is non-zero), so a

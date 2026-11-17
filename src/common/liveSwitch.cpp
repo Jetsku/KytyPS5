@@ -66,6 +66,7 @@ std::atomic<void (*)(const std::string&)> g_log_sink {nullptr};
 std::atomic<GpuTotals (*)()>              g_gpu_totals {nullptr};
 std::atomic<CpIdleTotals (*)()>           g_cp_idle {nullptr};
 std::atomic<std::string (*)(uint64_t)>    g_extra_lines {nullptr};
+std::atomic<std::string (*)()>            g_line_suffix {nullptr};
 std::atomic<uint64_t> g_test_counts[static_cast<uint32_t>(TestCounter::Count)] {};
 
 void WriteLog(const std::string& line) {
@@ -398,6 +399,9 @@ void Registry::Apply(uint64_t flip) {
 	if (drawidx + suspend + submits != 0) {
 		gpu += fmt::format(" counts [drawidx {}, suspend {}, submits {}]", drawidx, suspend, submits);
 	}
+	if (auto* suffix = g_line_suffix.load(std::memory_order_acquire); suffix != nullptr) {
+		gpu += suffix();
+	}
 	WriteLog(fmt::format("Live: seq {} applied at CP flip {} (t_ms {}, t_us {}, cp_busy_us {}){}: {}\n",
 	                     seq, flip, t_ms, now_ns / 1000u, busy_ns / 1000u, gpu,
 	                     changes.empty() ? std::string("no change") : changes));
@@ -447,6 +451,10 @@ bool Enabled() noexcept {
 
 void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept {
 	g_extra_lines.store(provider, std::memory_order_release);
+}
+
+void SetLineSuffixProvider(std::string (*provider)()) noexcept {
+	g_line_suffix.store(provider, std::memory_order_release);
 }
 
 void CountTest(TestCounter counter) noexcept {

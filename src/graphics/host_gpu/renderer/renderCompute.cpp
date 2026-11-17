@@ -42,7 +42,10 @@
 #include "libs/errno.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include <algorithm>
+#include <bit>
 #include <tuple>
 #include <array>
 #include <atomic>
@@ -1213,6 +1216,91 @@ static void CountDispatchOverlap(bool unordered, bool enabled) {
 	PrintDispatchOverlap(enabled);
 }
 
+// KYTY_GPU_HAZARD (render.h): what a direct dispatch reads and writes, from its committed bindings.
+// Guest ranges: each buffer binding's guest range (written if the program writes that buffer), each
+// image binding's guest data, stencil and metadata ranges (written for storage writes). Host ranges:
+// each buffer binding's host buffer byte range and each image's whole host image. Anything the
+// program can reach outside its bindings makes the access imprecise.
+static void CollectDispatchAccess(TextureCache& textures, const ShaderStageRuntime& stage,
+                                  const PreparedBindings& bindings, CommandBuffer::DispatchAccess& out) {
+	out.Clear();
+	const auto& program = *stage.program;
+	const auto& info    = program.info;
+	if (program.has_address_writes || info.uses_dma || info.bda_writes || info.uses_bvh || info.ray_query_sites != 0 ||
+	    bindings.shared_memory.buffer != nullptr || bindings.gds.buffer != nullptr || !bindings.bindless_heaps.empty() ||
+	    !bindings.bindless_patches.empty() || bindings.buffer_sources.size() != info.buffers.size() ||
+	    bindings.buffers.size() != info.buffers.size() || bindings.images.size() != info.images.size() ||
+	    ShaderRecompiler::IR::FindBinding(program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
+		out.precise = false;
+		return;
+	}
+	auto bits = [](auto handle) {
+		return std::bit_cast<uint64_t>(static_cast<typename decltype(handle)::CType>(handle));
+	};
+	for (uint32_t i = 0; i < info.buffers.size(); i++) {
+		const auto& resource = info.buffers[i];
+		if (resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+		    !resource.indirect_resources.empty()) {
+			out.precise = false;
+			return;
+		}
+		const auto& source = bindings.buffer_sources[i];
+		const auto& host   = bindings.buffers[i];
+		if (source.address == 0 || source.size == 0 || host.buffer == nullptr) {
+			continue;
+		}
+		const bool write = resource.written || resource.atomic;
+		out.guest.push_back({0, source.address, source.address + source.size, write});
+		const auto handle = bits(host.buffer);
+		const auto end    = host.range == VK_WHOLE_SIZE ? UINT64_MAX : host.offset + host.range;
+		out.host.push_back({handle, host.offset, end, write});
+		out.handles.push_back(handle);
+	}
+	for (uint32_t i = 0; i < info.images.size(); i++) {
+		const auto& resource = info.images[i];
+		if (resource.bindless || resource.runtime || !resource.indirect_resources.empty() ||
+		    resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage) {
+			out.precise = false;
+			return;
+		}
+		const auto& binding = bindings.images[i];
+		if (binding.image_view == nullptr) {
+			continue;
+		}
+		auto* image = textures.TryGetImage(binding.image_id);
+		if (image == nullptr || !image->backing.image) {
+			// A null-image fallback (no guest memory) or an image the binding no longer names.
+			if (resource.written) {
+				out.precise = false;
+				return;
+			}
+			continue;
+		}
+		const bool write = (resource.written || resource.atomic) &&
+		                   resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		const bool any_write = resource.written || resource.atomic;
+		if (any_write && !write) {
+			out.precise = false; // a write through a non-storage class: not modelled
+			return;
+		}
+		auto add = [&](const GuestRange& range) {
+			if (range.size != 0) {
+				out.guest.push_back({0, range.address, range.address + range.size, write});
+			}
+		};
+		add(image->info.data);
+		if (image->info.HasStencil()) {
+			add(image->info.stencil);
+		}
+		if (image->info.HasMetadata()) {
+			add(image->info.metadata.range);
+		}
+		const auto handle = bits(image->backing.image);
+		out.host.push_back({handle, 0, UINT64_MAX, write});
+		out.handles.push_back(handle);
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -2243,9 +2331,21 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	const bool overlap         = buffer.TakeDispatchOverlap(no_overlap, overlap_enabled);
 	dispatch_prep.End();
 	CountDispatchOverlap(overlap, overlap_enabled);
+	// KYTY_GPU_HAZARD (render.h): no barrier against the chain when no range of this dispatch
+	// overlaps a range the chain wrote (or reads one it writes).
+	static thread_local CommandBuffer::DispatchAccess hazard_access;
+	const bool hazard_on   = GpuHazardMode() != 0;
+	bool       hazard_skip = false;
+	if (hazard_on) {
+		CollectDispatchAccess(m_context.GetTextureCache(), input_info.stage, bindings, hazard_access);
+		if (no_overlap) {
+			hazard_access.precise = false; // emulated LDS, BDA-write settles
+		}
+		hazard_skip = buffer.DecideDispatchHazard(hazard_access, overlap && overlap_enabled);
+	}
 	// KYTY_PM4_BARRIERS=guest (render.h): the guest's own sync points order dispatches instead.
 	const bool guest_barriers = GuestSyncBarriersEnabled() && !no_overlap;
-	if (has_storage_writes && !(overlap && overlap_enabled) && !guest_barriers) {
+	if (has_storage_writes && !(overlap && overlap_enabled) && !guest_barriers && !hazard_skip) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -2355,6 +2455,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 			LiveProbe::Dispatch(m_context, buffer, input_info);
 		}
 		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	if (hazard_on) {
+		buffer.NoteHazardDispatch(hazard_access);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (auto& cache = m_context.GetTextureCache(); cache.HasStencilStorageShadows()) {
@@ -2779,6 +2882,8 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		buffer.Sink().insertDebugLabel(text);
 	}
 	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
+	// KYTY_GPU_HAZARD: not noted as a chain dispatch (its argument read is in the draw-indirect stage,
+	// which a later ShaderAccess flush does not order): the chain ends here.
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (auto& cache = m_context.GetTextureCache(); cache.HasStencilStorageShadows()) {
 		cache.FlushStencilStorageShadows(); // KYTY_STENCIL_STORAGE_SHADOW

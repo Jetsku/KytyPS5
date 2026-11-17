@@ -6354,6 +6354,25 @@ private:
 
 } // namespace
 
+// KYTY_IMAGE_STORAGE_READONLY (CommitBindingsSideEffects): live, default off.
+static Live::Switch g_image_storage_readonly("KYTY_IMAGE_STORAGE_READONLY", Live::ParseDefaultOff);
+
+// Whether a binding of any stage of the command stores to or does atomics on image `id`.
+static bool ImageWrittenByAnyBinding(std::span<PreparedBindings* const> stages, ImageId id) {
+	for (const auto* stage: stages) {
+		const auto& images = stage->runtime->program->info.images;
+		if (images.size() != stage->images.size()) {
+			return true; // not matched one to one: assume a write
+		}
+		for (uint32_t j = 0; j < images.size(); j++) {
+			if ((images[j].written || images[j].atomic || images[j].atomic64) && stage->images[j].image_id == id) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 // The cache and barrier work of a commit, ahead of its encode (CommitBindings): buffer-cache retags
 // and content revisions, the GDS dependency, the image transitions and the bindless table. None of
 // it depends on the encode, and the encode reads only what it leaves behind (the bindings'
@@ -6480,8 +6499,15 @@ void RenderExecutor::CommitBindingsSideEffects(CommandBuffer& buffer, const Pipe
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer, true);
 			} else if (storage) {
+				// KYTY_IMAGE_STORAGE_READONLY=1 (live, default 0): a storage binding that no binding of the
+				// command writes (no store, no atomic, in any stage) transitions with shader-read access
+				// only. Its access then holds no write, so the next read-only storage use of the image in
+				// GENERAL needs no barrier (with the write access every use was a write-after-write).
+				const bool read_only = g_image_storage_readonly.On() &&
+				                       !ImageWrittenByAnyBinding(prepared_bindings, descriptors.images[i].image_id);
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+				              read_only ? vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead}
+				                        : vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
 				              range, vk_buffer, true);
 			} else {
 				image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal

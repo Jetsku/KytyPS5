@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/texDelta.h"
+#include "graphics/host_gpu/renderer/hazardTracker.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -253,6 +254,39 @@ struct DrawAutoArgs {
 // ordered-append and split-dispatch paths, keep their barriers. Any other value: the renderer's
 // barriers around every dispatch, as before.
 [[nodiscard]] bool GuestSyncBarriersEnabled();
+// KYTY_GPU_HAZARD (live, default 0; hazardTracker.h): resource-precise hazards between guest direct
+// dispatches. The command buffer keeps the guest address ranges (and, as a conservative second
+// check, the host buffer/image byte ranges) every dispatch of the current chain read and wrote; a
+// chain starts at a recorded barrier that orders everything earlier before later compute shader
+// accesses and ends at the first command recorded that is not a chain dispatch (a draw, a copy, a
+// helper, an indirect dispatch, upload copies, image/buffer barriers not of the dispatch's own
+// resources). A dispatch with no RAW/WAR/WAW overlap against the chain, in both checks, then skips
+// its ShaderWriteHazard request and keeps the chain's pending ShaderAccess (and any guest global
+// barrier queued since) pending past itself instead of recording it before itself: they are
+// re-queued right after the dispatch, so every later command sees exactly the barrier it saw before.
+// Dispatches whose accesses are not all in bindings (address writes, DMA/BDA, GDS, emulated LDS,
+// bindless or runtime images, indirect buffer tables, ray tracing) never skip and end the chain.
+//   0: off. 1: track and count only (no change in what is recorded). 2: skip when the pending batch
+//   is memory dependencies of ShaderAccess/guest origin only (or empty). 3: as 2, and also when
+//   image/buffer barriers or upload copies of the dispatch's own resources are pending: those are
+//   recorded alone (without the memory dependency) before the dispatch.
+//   4: as 3, and a dispatch with untracked accesses (imprecise; all its accesses are compute shader
+//   accesses) keeps the chain valid but poisoned instead of ending it: nothing passes it, but the
+//   ShaderAccess flush after it (compute -> all commands) restarts a clean chain.
+// KYTY_GPU_HAZARD_COUNT=1 (live, default 0): per-flip counters on the live lines (" haz [..]"),
+// also at mode 0 for the batch/pass counts.
+[[nodiscard]] int64_t GpuHazardMode();
+[[nodiscard]] bool    GpuHazardCountEnabled();
+// KYTY_INDIRECT_ARGS_RANGES (live, default 0; renderDraw.cpp IndirectArgsBarrierNeeded): an indirect draw
+// in an active rendering instance that began without its argument barrier keeps the instance (no
+// barrier) when the guest ranges written by this instance's draws (sunk shader-write barriers) do not
+// overlap its argument and count ranges. Writers before the instance are ordered by their own
+// barriers, recorded before the instance began. Never with KYTY_PM4_BARRIERS=guest.
+// Counters (KYTY_GPU_HAZARD_COUNT): isplit (argument barrier needed inside an active instance, as
+// without the switch), iskip, iconf (overlap), iimp (an instance write not known), ihost (guest free,
+// host ranges overlap: the verify count; the barrier is kept).
+enum class HazIndirect : uint32_t { Split, Skip, Conflict, Imprecise, HostMismatch };
+void GpuHazardCountIndirect(HazIndirect what);
 
 // KYTY_HOLD_SKIPPED_DRAWS (videoOut.cpp, the GT7 fork's round 133, usa-ratt 65ed4150b): draws
 // KYTY_PIPELINE_SKIP left out while their pipelines built in the background, since the last flip
@@ -274,6 +308,30 @@ enum class BarrierOrigin : uint32_t {
 	Upload,            // after queued buffer uploads: copy writes -> everything later
 	Count,
 };
+
+// The guest packet behind a CP global barrier (CommandProcessor::EmitGlobalBarrier). Names the
+// gpuOpProfiler site of the recorded batch (batch.guest.<kind>, batch.mixed.guest.<kind>) and selects
+// the KYTY_GUEST_BARRIER_SCOPE mode.
+enum class GuestBarrierKind : uint32_t {
+	CsPartialFlush,    // EVENT_WRITE CS_PARTIAL_FLUSH
+	GfxPartialFlush,   // EVENT_WRITE VS/PS_PARTIAL_FLUSH
+	CbDbWriteback,     // EVENT_WRITE CB/DB data writeback-invalidate (0x16, 0x31)
+	MetaWriteback,     // EVENT_WRITE DB data / DB, CB metadata writeback-invalidate (0x2a, 0x2c, 0x2e)
+	ReleaseMem,        // RELEASE_MEM with an end-of-pipe event or cache actions
+	Pm4Sync,           // KYTY_PM4_BARRIERS=guest waits, slice starts
+	Count,
+};
+// KYTY_GUEST_BARRIER_SCOPE (live, default unset = every kind full): what a CP global barrier of each
+// kind records. Comma list of <kind>=<mode>, kinds cs, gfx, cbdb, meta, rel, sync, all; modes full
+// (ALL_COMMANDS -> ALL_COMMANDS, memory write -> memory read/write, as before), narrow (first scope
+// only the stages the packet waits for: cs = compute shader, gfx = graphics shader and attachment
+// stages, cbdb/meta = attachment stages; rel and sync stay full) and drop (nothing recorded: the
+// renderer's own resource barriers order the work; TheCruZ's fork records none for these events).
+// Shorthands: "narrow" = cs,gfx,cbdb,meta narrow; "drop" = cs,gfx,cbdb,meta drop.
+enum class GuestBarrierMode : uint32_t { Full = 0, Narrow = 1, Drop = 2 };
+[[nodiscard]] GuestBarrierMode GuestBarrierScope(GuestBarrierKind kind);
+// Parser of KYTY_GUEST_BARRIER_SCOPE (2 bits per kind); -1 for a malformed value (then all full).
+[[nodiscard]] int64_t ParseGuestBarrierScope(const char* value);
 
 class CommandBuffer {
 public:
@@ -322,6 +380,8 @@ public:
 	void RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
 	                          vk::PipelineStageFlags2 dst_stages, vk::AccessFlags2 dst_access,
 	                          BarrierOrigin origin) const;
+	// Profiler attribution only: the Guest request just queued came from `kind`.
+	void NoteGuestBarrierKind(GuestBarrierKind kind) const;
 	// Queues a buffer memory barrier.
 	void RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier, BarrierOrigin origin) const;
 	// Routes image barriers built for `target` into the batch. Returns false (nothing done) when
@@ -355,6 +415,27 @@ public:
 	// returns true and 	ake is set, the pending request was dropped: the caller skips its
 	// ShaderWriteHazard request and keeps its own ShaderAccess request after the dispatch.
 	[[nodiscard]] bool TakeDispatchOverlap(bool lds, bool take) const;
+	// KYTY_GPU_HAZARD (see GpuHazardMode()). A direct dispatch's accesses: guest ranges (space 0)
+	// and host ranges (space = resource handle); precise = every access is in these.
+	struct DispatchAccess {
+		std::vector<Hazard::Range> guest;
+		std::vector<Hazard::Range> host;
+		std::vector<uint64_t>      handles; // host buffers and images of the bindings
+		bool                       precise = true;
+		void Clear() {
+			guest.clear();
+			host.clear();
+			handles.clear();
+			precise = true;
+		}
+	};
+	// After TakeDispatchOverlap and before the dispatch's own barrier requests: true when the
+	// dispatch must skip its ShaderWriteHazard request (the pending batch was then taken off: its
+	// memory dependency is re-queued by NoteHazardDispatch after the dispatch). overlap: the overlap
+	// chain already dropped the pending request.
+	[[nodiscard]] bool DecideDispatchHazard(const DispatchAccess& access, bool overlap) const;
+	// Right after the dispatch command was recorded.
+	void NoteHazardDispatch(const DispatchAccess& access) const;
 	// Whether anything is pending, and whether queued upload copies are (RequestUploadCopy).
 	[[nodiscard]] bool HasPendingBarriers() const noexcept { return !m_pending.Empty(); }
 	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending.uploads.empty(); }
@@ -513,6 +594,8 @@ private:
 		std::vector<PendingUpload>  uploads;
 		std::vector<vk::BufferCopy> upload_regions;
 		uint32_t                              origins = 0; // bit per BarrierOrigin
+		uint32_t                              memory_origins = 0; // origins of the memory requests
+		uint32_t                              guest_kinds = 0; // bit per GuestBarrierKind (profiler)
 
 		[[nodiscard]] bool Empty() const {
 			return !has_memory && images.empty() && buffers.empty() && uploads.empty();
@@ -524,7 +607,9 @@ private:
 			buffers.clear();
 			uploads.clear();
 			upload_regions.clear();
-			origins = 0;
+			origins        = 0;
+			memory_origins = 0;
+			guest_kinds    = 0;
 		}
 	};
 	// Records the queued upload copies behind one barrier and queues their post-copy barriers.
@@ -534,7 +619,11 @@ private:
 		m_recorded_since_flush = true;
 		m_epoch_clean          = false;
 		m_overlap_open         = false;
+		++m_haz_foreign;
 	}
+	// FlushBarriers' recording with the KYTY_GPU_HAZARD bookkeeping; side_own: the batch's
+	// image/buffer barriers and uploads concern only the next dispatch's own resources.
+	void FlushBarriersImpl(bool side_own) const;
 	[[nodiscard]] bool CanSinkPending() const;
 	[[nodiscard]] bool CanSinkDrawWrites() const;
 	void               NoteDrawRecorded() const;
@@ -589,6 +678,15 @@ private:
 	mutable bool m_overlap_upload_fenced = false;
 	mutable bool m_upload_narrow         = false;
 	mutable bool m_dispatch_prep         = false;
+	// KYTY_GPU_HAZARD: commands recorded that are not chain dispatches (every NoteForeignCommand,
+	// draw and upload copy), the chain, and the memory dependency a skipping dispatch took off the
+	// batch (re-queued after it with its origins).
+	mutable uint64_t           m_haz_foreign = 0;
+	mutable Hazard::Chain      m_haz_chain;
+	mutable vk::MemoryBarrier2 m_haz_stash;
+	mutable bool               m_haz_stash_valid   = false;
+	mutable uint32_t           m_haz_stash_origins = 0;
+	mutable uint32_t           m_haz_stash_kinds   = 0;
 
 	// KYTY_CP_RECORDER: the scheduler's recorder and its encoder (null when off), and whether a
 	// direct window is open (the CP records natively after a drain; see Sink()).
@@ -1530,6 +1628,24 @@ private:
 	// are recorded outside rendering, or end it (shader-write barrier), so while this instance
 	// stays active the barrier still covers every argument write.
 	uint64_t m_indirect_barrier_rendering = 0;
+	// KYTY_INDIRECT_ARGS_COVERED: the rendering instance in which a draw last queued its shader-write
+	// barrier without ending the instance (KYTY_DRAW_WRITE_SINK); 0 if none.
+	uint64_t m_indirect_write_rendering = 0;
+	// KYTY_INDIRECT_ARGS_RANGES: the guest ranges the draws of rendering instance
+	// m_haz_write_instance wrote with sunk shader-write barriers (imprecise: some write not known).
+	uint64_t                   m_haz_write_instance  = 0;
+	bool                       m_haz_write_imprecise = false;
+	std::vector<Hazard::Range> m_haz_instance_writes;
+	std::vector<Hazard::Range> m_haz_instance_host_writes; // (VkBuffer, host offsets), the verify check
+	void NoteInstanceWrites(uint64_t instance, std::span<PreparedBindings* const> stages);
+	// Whether an indirect draw recorded in the active rendering instance needs its own argument
+	// barrier (which ends the instance).
+	// source (KYTY_INDIRECT_ARGS_RANGES): the draw's argument/count ranges; count: the call that
+	// records the barrier (counters).
+	// host: the argument/count buffers' host ranges (verify: a host overlap with the instance's written
+	// host ranges keeps the barrier and counts ihost).
+	[[nodiscard]] bool IndirectArgsBarrierNeeded(const CommandBuffer& buffer, const DrawIndirectSource* source = nullptr,
+	                                             bool count = false, std::span<const Hazard::Range> host = {}) const;
 	// KYTY_DEPTH_FEEDBACK_KEEP: the depth attachment of the draw being recorded and whether the
 	// draw writes it, applied to Image::feedback_instance/_serial once BeginRendering() has
 	// chosen the draw's rendering instance (NoteDepthFeedback).

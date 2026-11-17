@@ -91,6 +91,11 @@ private:
 	// Reuse is ordered by GPU barriers; no CPU recycling or completion callback is needed.
 	std::unique_ptr<Buffer> m_scratch;
 	std::unique_ptr<Buffer> m_palette;
+	// KYTY_DCC_PALETTE_REUSE: what the palette buffer holds since the last RecordPalette.
+	bool                                              m_palette_valid  = false;
+	vk::Format                                        m_palette_format = vk::Format::eUndefined;
+	uint32_t                                          m_palette_mask   = 0;
+	std::array<std::array<uint32_t, 4>, ClearCodes.size()> m_palette_bits {};
 	// One 1x1 image with a layer per clear code, per view format.
 	struct PaletteImages;
 	std::unique_ptr<PaletteImages> m_palette_images;

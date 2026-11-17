@@ -214,7 +214,7 @@ public:
 	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 	// KYTY_PM4_BARRIERS=guest: the full barrier at the start of a queue's slice (executor thread).
-	void SliceStartBarrier() { EmitGlobalBarrier(); }
+	void SliceStartBarrier() { EmitGlobalBarrier(GuestBarrierKind::Pm4Sync); }
 	// COND_EXEC: whether the condition dword at `address` is non-zero (read in order).
 	[[nodiscard]] bool CondExec(uint64_t address);
 	// Conditional INDIRECT_BUFFER: whether the then-buffer is taken (the 64-bit value at
@@ -422,7 +422,7 @@ private:
 	// A back-only helper: GET_LOD_STATS with KYTY_LOD_STATS_MODE=gpu.
 	void ReportLodStats(uint64_t destination, uint32_t size, uint32_t control);
 	// Back-only helpers of RELEASE_MEM and EVENT_WRITE.
-	void EmitGlobalBarrier();
+	void EmitGlobalBarrier(GuestBarrierKind kind);
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	// Flush requested by an end-of-pipe interrupt. Interrupts fire when their tick completes, so
 	// only every KYTY_EOP_FLUSH_BATCH-th request flushes (default 8; 1 = flush every time); a
