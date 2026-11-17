@@ -36,6 +36,170 @@ inline void RebuildDescriptorWrites(ReplayState& state, const DescriptorWriteRec
 	}
 	EXIT_IF(next != info_count);
 }
+
+// KYTY_EMIT_SPLIT=verify: a verify-only resolved draw against the state the packets before it left
+// (ResolvedDrawModel). Every field the record would set must hold the same value there.
+inline void CheckResolvedDraw(ReplayState& state, const ResolvedDrawPacket& p, const vk::Buffer* vb,
+                              const vk::DeviceSize* vo, const vk::DeviceSize* vs, const DescriptorWriteRecord* writes,
+                              const DescriptorInfo* infos, const uint32_t* push, const uint32_t* clip) {
+	using P     = ResolvedDrawPacket;
+	using M     = ResolvedDrawModel;
+	auto& model = state.record_model;
+	auto& stats = state.record_stats;
+	if ((++stats.verify_records & 1023u) == 0) {
+		PublishResolvedDraw(stats, state.record_published);
+	}
+	if (!model.on) {
+		model.on = true; // modelled from the next Begin on
+	}
+	if (!model.valid) {
+		stats.verify_unmodeled++;
+		return;
+	}
+	stats.verify_checks++;
+	bool bad[M::FieldCount] = {};
+	bad[M::Pipeline]        = model.pipeline != p.pipeline;
+	if ((p.flags & P::FlagVertex) != 0) {
+		bad[M::Vertex] = model.vb_buffers.size() != p.vertex_count || !model.vb_sizes_set;
+		for (uint32_t i = 0; !bad[M::Vertex] && i < p.vertex_count; i++) {
+			bad[M::Vertex] = model.vb_buffers[i] != vb[i] || model.vb_offsets[i] != vo[i] || model.vb_sizes[i] != vs[i];
+		}
+	}
+	if ((p.flags & P::FlagIndex) != 0) {
+		bad[M::Index] = model.ib_buffer != p.index_buffer || model.ib_offset != p.index_offset ||
+		                model.ib_type != p.index_type;
+	}
+	if ((p.flags & P::FlagPush) != 0 && p.write_count != 0) {
+		bad[M::Layout] = model.desc_layout != p.layout;
+		uint32_t next  = 0;
+		for (uint32_t w = 0; w < p.write_count && !bad[M::Layout]; w++) {
+			const auto& record = writes[w];
+			for (uint32_t j = 0; j < record.count; j++) {
+				const auto* d = model.Find(record.binding, record.element + j);
+				if (d == nullptr || d->type != record.type) {
+					bad[M::Writes] = true;
+				} else if (std::memcmp(&d->info, infos + next + j, sizeof(DescriptorInfo)) != 0) {
+					bad[M::Infos] = true;
+				}
+			}
+			next += record.count;
+		}
+	}
+	// Push constants as the expansion leaves them: the block, then the clip planes, then the object id.
+	std::array<uint32_t, 64> expect {};
+	uint64_t                 mask = 0;
+	if ((p.flags & P::FlagPushData) != 0) {
+		std::memcpy(expect.data(), push, ResolvedDrawPushDwords * 4u);
+		mask |= (uint64_t {1} << ResolvedDrawPushDwords) - 1u;
+	}
+	for (uint32_t d = 0; d < p.clip_bytes / 4u && p.clip_offset / 4u + d < 64u; d++) {
+		expect[p.clip_offset / 4u + d] = clip[d];
+		mask |= uint64_t {1} << (p.clip_offset / 4u + d);
+	}
+	if ((p.flags & P::FlagObjprim) != 0 && p.objprim_offset / 4u < 64u) {
+		expect[p.objprim_offset / 4u] = p.object_id;
+		mask |= uint64_t {1} << (p.objprim_offset / 4u);
+	}
+	bad[M::Constants] = (model.constants_valid & mask) != mask;
+	for (uint32_t d = 0; !bad[M::Constants] && d < 64u; d++) {
+		bad[M::Constants] = ((mask >> d) & 1u) != 0 && model.constants[d] != expect[d];
+	}
+	const bool     indexed = (p.flags & P::FlagIndexed) != 0;
+	const uint32_t args[5] = {p.count, p.instance_count, indexed ? 0u : p.first_vertex,
+	                          indexed ? static_cast<uint32_t>(p.vertex_offset) : 0u, p.first_instance};
+	bad[M::Draw]           = model.draw_indexed != indexed || std::memcmp(model.draw_args, args, sizeof(args)) != 0;
+	bool any               = false;
+	for (uint32_t f = 0; f < M::FieldCount; f++) {
+		if (bad[f]) {
+			stats.mismatches[f]++;
+			any = true;
+		}
+	}
+	if (any) {
+		PublishResolvedDraw(stats, state.record_published);
+	}
+	if (any && stats.reported < 16) {
+		stats.reported++;
+		std::printf("EmitSplit verify: resolved draw differs from the encoded draw:%s%s%s%s%s%s%s%s\n",
+		            bad[0] ? " pipeline" : "", bad[1] ? " vertex" : "", bad[2] ? " index" : "", bad[3] ? " layout" : "",
+		            bad[4] ? " writes" : "", bad[5] ? " infos" : "", bad[6] ? " constants" : "", bad[7] ? " draw" : "");
+		std::fflush(stdout);
+	}
+}
+
+// KYTY_EMIT_SPLIT: a resolved draw's commands (ResolvedDrawPacket, in its order) into `exec`.
+template <typename Exec>
+void ExpandResolvedDraw(Exec& exec, ReplayState& state, const ResolvedDrawPacket& p, const vk::Buffer* vb,
+                        const vk::DeviceSize* vo, const vk::DeviceSize* vs, const DescriptorWriteRecord* writes,
+                        const DescriptorInfo* infos, const uint32_t* push, const uint32_t* clip) {
+	using P      = ResolvedDrawPacket;
+	auto& shadow = state.record_shadow;
+	auto& stats  = state.record_stats;
+	if ((++stats.records & 1023u) == 0) {
+		PublishResolvedDraw(stats, state.record_published);
+	}
+	if ((p.flags & P::FlagShadowReset) != 0) {
+		shadow.Reset();
+		stats.shadow_resets++;
+	}
+	constexpr auto graphics = vk::PipelineBindPoint::eGraphics;
+	if ((p.flags & P::FlagVertex) != 0 && p.vertex_count != 0) {
+		exec.bindVertexBuffers2(0, p.vertex_count, vb, vo, vs, nullptr);
+	}
+	if ((p.flags & P::FlagPushData) != 0) {
+		const auto stages = vk::ShaderStageFlags(p.push_stages);
+		if ((p.flags & P::FlagConstDedup) != 0 && shadow.SameConstants(p.layout, p.push_stages, push)) {
+			stats.constants_avoided++;
+		} else {
+			exec.pushConstants(p.layout, stages, 0, ResolvedDrawPushDwords * 4u, push);
+			stats.constants++;
+			if ((p.flags & P::FlagConstDedup) != 0) {
+				shadow.KeepConstants(p.layout, p.push_stages, push);
+			} else {
+				shadow.const_valid = false;
+			}
+		}
+	}
+	if ((p.flags & P::FlagPush) != 0 && p.write_count != 0) {
+		const bool known_miss = (p.flags & P::FlagKnownMiss) != 0;
+		const bool dedup      = (p.flags & P::FlagPushDedup) != 0;
+		if (!known_miss && dedup && shadow.SameDescriptors(p.layout, p.write_count, writes, p.info_count, infos)) {
+			stats.pushes_avoided++;
+		} else {
+			RebuildDescriptorWrites(state, writes, p.write_count, infos, p.info_count, nullptr);
+			exec.pushDescriptorSetKHR(graphics, p.layout, 0, p.write_count, state.writes.data());
+			stats.pushes++;
+			if (known_miss || !dedup) {
+				shadow.desc_valid = false;
+			} else {
+				shadow.KeepDescriptors(p.layout, p.write_count, writes, p.info_count, infos);
+			}
+		}
+	}
+	if ((p.flags & P::FlagBindless) != 0) {
+		exec.bindDescriptorSets(graphics, p.layout, 1, 1, &p.bindless_set, 0, nullptr);
+	}
+	if ((p.flags & P::FlagIndex) != 0) {
+		exec.bindIndexBuffer(p.index_buffer, p.index_offset, static_cast<vk::IndexType>(p.index_type));
+	}
+	if ((p.flags & P::FlagBind) != 0) {
+		exec.bindPipeline(graphics, p.pipeline);
+	}
+	if (p.clip_bytes != 0) {
+		// As the commit thread records them: raw, the block's shadow kept (the planes follow every draw).
+		exec.pushConstants(p.layout, vk::ShaderStageFlags(p.clip_stages), p.clip_offset, p.clip_bytes, clip);
+	}
+	if ((p.flags & P::FlagObjprim) != 0) {
+		exec.pushConstants(p.layout, vk::ShaderStageFlags(p.objprim_stages), p.objprim_offset, sizeof(p.object_id),
+		                   &p.object_id);
+		shadow.const_valid = false;
+	}
+	if ((p.flags & P::FlagIndexed) != 0) {
+		exec.drawIndexed(p.count, p.instance_count, 0, p.vertex_offset, p.first_instance);
+	} else {
+		exec.draw(p.count, p.instance_count, p.first_vertex, p.first_instance);
+	}
+}
 } // namespace Detail
 
 template <typename Exec>
@@ -95,6 +259,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p    = reader.Get<BeginPacket>();
 			state.cb_digest  = 0;
 			state.cb_packets = 0;
+			state.record_shadow.Reset();
+			if (state.record_model.on) {
+				state.record_model.Begin();
+			}
 			if (verify != nullptr) check(VerifyHash::Begin(p.command, p.tick));
 			exec.Begin(p);
 			break;
@@ -205,6 +373,9 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 		case Op::BindPipeline: {
 			const auto& p = reader.Get<BindPipelinePacket>();
 			if (verify != nullptr) check(VerifyHash::BindPipeline(p.point, p.pipeline));
+			if (state.record_model.valid && p.point == vk::PipelineBindPoint::eGraphics) {
+				state.record_model.pipeline = p.pipeline;
+			}
 			exec.bindPipeline(p.point, p.pipeline);
 			break;
 		}
@@ -214,6 +385,12 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto* offsets = reader.GetArray<uint32_t>(p.dynamic_count);
 			if (verify != nullptr) check(VerifyHash::BindDescriptorSets(p.point, p.layout, p.first_set, p.set_count, sets,
 			                                     p.dynamic_count, offsets));
+			if (p.point == vk::PipelineBindPoint::eGraphics && p.first_set == 0) {
+				state.record_shadow.desc_valid = false;
+				if (state.record_model.valid) {
+					state.record_model.UnsetDescriptors();
+				}
+			}
 			exec.bindDescriptorSets(p.point, p.layout, p.first_set, p.set_count, sets,
 			                        p.dynamic_count, offsets);
 			break;
@@ -226,6 +403,12 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			                                nullptr);
 			if (verify != nullptr) check(VerifyHash::PushDescriptorSet(p.point, p.layout, p.set, p.write_count,
 			                                    state.writes.data()));
+			if (p.point == vk::PipelineBindPoint::eGraphics) {
+				state.record_shadow.desc_valid = false;
+				if (state.record_model.valid && p.set == 0) {
+					state.record_model.Push(p.layout, p.write_count, state.writes.data());
+				}
+			}
 			exec.pushDescriptorSetKHR(p.point, p.layout, p.set, p.write_count, state.writes.data());
 			break;
 		}
@@ -243,6 +426,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p    = reader.Get<PushConstantsPacket>();
 			const auto* data = reader.GetArray<uint8_t>(p.size);
 			if (verify != nullptr) check(VerifyHash::PushConstants(p.layout, p.stages, p.offset, p.size, data));
+			state.record_shadow.const_valid = false;
+			if (state.record_model.valid) {
+				state.record_model.SetConstants(p.offset, p.size, data);
+			}
 			exec.pushConstants(p.layout, p.stages, p.offset, p.size, data);
 			break;
 		}
@@ -256,12 +443,29 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			    p.has_strides != 0 ? reader.GetArray<vk::DeviceSize>(p.count) : nullptr;
 			if (verify != nullptr) check(
 			    VerifyHash::BindVertexBuffers2(p.first, p.count, buffers, offsets, sizes, strides));
+			if (state.record_model.valid) {
+				auto& m = state.record_model;
+				if (p.first == 0 && sizes != nullptr && strides == nullptr) {
+					m.vb_buffers.assign(buffers, buffers + p.count);
+					m.vb_offsets.assign(offsets, offsets + p.count);
+					m.vb_sizes.assign(sizes, sizes + p.count);
+					m.vb_sizes_set = true;
+				} else {
+					m.vb_buffers.clear();
+					m.vb_sizes_set = false;
+				}
+			}
 			exec.bindVertexBuffers2(p.first, p.count, buffers, offsets, sizes, strides);
 			break;
 		}
 		case Op::BindIndexBuffer: {
 			const auto& p = reader.Get<BindIndexBufferPacket>();
 			if (verify != nullptr) check(VerifyHash::BindIndexBuffer(p.buffer, p.offset, p.type));
+			if (state.record_model.valid) {
+				state.record_model.ib_buffer = p.buffer;
+				state.record_model.ib_offset = p.offset;
+				state.record_model.ib_type   = static_cast<uint32_t>(p.type);
+			}
 			exec.bindIndexBuffer(p.buffer, p.offset, p.type);
 			break;
 		}
@@ -395,6 +599,12 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p = reader.Get<DrawPacket>();
 			if (verify != nullptr) check(VerifyHash::Value(op, p.vertex_count, p.instance_count, p.first_vertex,
 			                        p.first_instance));
+			if (state.record_model.valid) {
+				auto& m                = state.record_model;
+				m.draw_indexed         = false;
+				const uint32_t args[5] = {p.vertex_count, p.instance_count, p.first_vertex, 0u, p.first_instance};
+				std::memcpy(m.draw_args, args, sizeof(args));
+			}
 			exec.draw(p.vertex_count, p.instance_count, p.first_vertex, p.first_instance);
 			break;
 		}
@@ -402,6 +612,14 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p = reader.Get<DrawIndexedPacket>();
 			if (verify != nullptr) check(VerifyHash::Value(op, p.index_count, p.instance_count, p.first_index,
 			                        static_cast<uint32_t>(p.vertex_offset), p.first_instance));
+			if (state.record_model.valid) {
+				auto& m        = state.record_model;
+				m.draw_indexed = true;
+				// A resolved draw's first index is 0: another one cannot match.
+				const uint32_t args[5] = {p.index_count, p.instance_count, p.first_index,
+				                          static_cast<uint32_t>(p.vertex_offset), p.first_instance};
+				std::memcpy(m.draw_args, args, sizeof(args));
+			}
 			exec.drawIndexed(p.index_count, p.instance_count, p.first_index, p.vertex_offset,
 			                 p.first_instance);
 			break;
@@ -555,6 +773,27 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			std::memcpy(&color, p.value, sizeof(color));
 			if (verify != nullptr) check(VerifyHash::ClearColorImage(p.image, p.layout, color, p.count, ranges));
 			exec.clearColorImage(p.image, p.layout, &color, p.count, ranges);
+			break;
+		}
+		case Op::ResolvedDraw: {
+			const auto  start  = reader.Offset();
+			const auto& p      = reader.Get<ResolvedDrawPacket>();
+			const auto* vb     = reader.GetArray<vk::Buffer>(p.vertex_count);
+			const auto* vo     = reader.GetArray<vk::DeviceSize>(p.vertex_count);
+			const auto* vs     = reader.GetArray<vk::DeviceSize>(p.vertex_count);
+			const auto* writes = reader.GetArray<DescriptorWriteRecord>(p.write_count);
+			const auto* infos  = reader.GetArray<DescriptorInfo>(p.info_count);
+			const auto* push   = reader.GetArray<uint32_t>(
+                (p.flags & ResolvedDrawPacket::FlagPushData) != 0 ? ResolvedDrawPushDwords : 0u);
+			const auto* clip = reader.GetArray<uint32_t>(p.clip_bytes / 4u);
+			if (verify != nullptr) {
+				check(VerifyHash::ResolvedDraw(reinterpret_cast<const uint8_t*>(&header) + start, reader.Offset() - start));
+			}
+			if ((p.flags & ResolvedDrawPacket::FlagVerifyOnly) != 0) {
+				Detail::CheckResolvedDraw(state, p, vb, vo, vs, writes, infos, push, clip);
+			} else {
+				Detail::ExpandResolvedDraw(exec, state, p, vb, vo, vs, writes, infos, push, clip);
+			}
 			break;
 		}
 		case Op::ClearDepthStencilImage: {

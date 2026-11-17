@@ -28,6 +28,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -105,6 +106,9 @@ enum class Op : uint16_t {
 	// vkCmdInsertDebugUtilsLabelEXT (under --rd / KYTY_TRACE_VK_LABELS: pass and shader names for
 	// RenderDoc); the packet carries the label text.
 	InsertDebugLabel,
+	// KYTY_EMIT_SPLIT (ResolvedDrawPacket below): one resolved draw; the consumer expands it into
+	// the draw's state commands and the draw command, deduplicating against its own shadow.
+	ResolvedDraw,
 	Count,
 };
 
@@ -382,6 +386,81 @@ struct WriteBufferMarkerPacket {
 	uint32_t   stage  = 0; // VkPipelineStageFlagBits
 	uint32_t   marker = 0;
 };
+// KYTY_EMIT_SPLIT: a resolved draw. The commit thread resolved every buffer, image and pipeline; the
+// packet holds values and handles only (the same handles today's packets carry, so the same
+// lifetime rules: deferred deletion, KYTY_DEAD_VIEW_SCRUB). The consumer (Replay) expands it, in
+// this order, into:
+//   bindVertexBuffers2(0, vertex_count, buffers, offsets, sizes)            (FlagVertex)
+//   pushConstants(layout, push_stages, 0, 128, push)                        (FlagPushData, shadowed)
+//   pushDescriptorSetKHR(graphics, layout, 0, writes)                       (FlagPush, shadowed)
+//   bindDescriptorSets(graphics, layout, 1, {bindless_set})                 (FlagBindless)
+//   bindIndexBuffer(index_buffer, index_offset, index_type)                 (FlagIndex)
+//   bindPipeline(graphics, pipeline)                                        (FlagBind)
+//   pushConstants(layout, clip_stages, clip_offset, clip_bytes, clip)       (clip_bytes != 0)
+//   pushConstants(layout, objprim_stages, objprim_offset, 4, &object_id)    (FlagObjprim)
+//   drawIndexed(count, instance_count, 0, vertex_offset, first_instance)    (FlagIndexed)
+//   or draw(count, instance_count, first_vertex, first_instance)
+// Arrays after the fixed part, each 8-byte aligned: vk::Buffer[vertex_count],
+// vk::DeviceSize[vertex_count] offsets and sizes, DescriptorWriteRecord[write_count],
+// DescriptorInfo[info_count], uint32_t[ResolvedDrawPushDwords] (FlagPushData), uint32_t[clip_bytes/4].
+// The shadow comparisons the commit thread made for these commands happen on the consumer
+// (ResolvedDrawShadow): a push identical to the previous resolved draw's push of this command
+// buffer is not recorded. Any other packet that changes that state (a push descriptor update or a
+// set-0 bind at the graphics bind point, a push-constant update, Begin) forgets the shadow, and the
+// producer sets FlagShadowReset when commands were recorded natively since its last resolved draw
+// (a direct window). FlagVerifyOnly: nothing is recorded; the packet is compared with the state the
+// preceding packets left (ResolvedDrawModel, verify mode).
+inline constexpr uint32_t ResolvedDrawPushDwords = 32;
+struct ResolvedDrawPacket {
+	static constexpr uint32_t FlagVertex      = 1u << 0u;
+	static constexpr uint32_t FlagPushData    = 1u << 1u;
+	static constexpr uint32_t FlagPush        = 1u << 2u;
+	static constexpr uint32_t FlagKnownMiss   = 1u << 3u; // record the push without comparing or keeping it
+	static constexpr uint32_t FlagBindless    = 1u << 4u;
+	static constexpr uint32_t FlagIndex       = 1u << 5u;
+	static constexpr uint32_t FlagBind        = 1u << 6u;
+	static constexpr uint32_t FlagObjprim     = 1u << 7u;
+	static constexpr uint32_t FlagIndexed     = 1u << 8u;
+	static constexpr uint32_t FlagVerifyOnly  = 1u << 9u;
+	static constexpr uint32_t FlagShadowReset = 1u << 10u;
+	static constexpr uint32_t FlagPushDedup   = 1u << 11u; // DrawEncode::ShadowFlags::renderer_batch
+	static constexpr uint32_t FlagConstDedup  = 1u << 12u; // DrawEncode::ShadowFlags::push_constant_shadow
+
+	vk::PipelineLayout layout       = nullptr;
+	vk::Pipeline       pipeline     = nullptr;
+	vk::Buffer         index_buffer = nullptr;
+	uint64_t           index_offset = 0;
+	vk::DescriptorSet  bindless_set = nullptr;
+	uint32_t           flags        = 0;
+	uint32_t           index_type   = 0; // vk::IndexType
+	uint32_t           vertex_count = 0;
+	uint32_t           write_count  = 0;
+	uint32_t           info_count   = 0;
+	uint32_t           push_stages  = 0; // vk::ShaderStageFlags
+	uint32_t           clip_offset  = 0;
+	uint32_t           clip_bytes   = 0;
+	uint32_t           clip_stages  = 0;
+	uint32_t           objprim_stages = 0;
+	uint32_t           objprim_offset = 0;
+	uint32_t           object_id      = 0;
+	uint32_t           count          = 0; // indices or vertices
+	uint32_t           instance_count = 0;
+	int32_t            vertex_offset  = 0;
+	uint32_t           first_vertex   = 0;
+	uint32_t           first_instance = 0;
+	uint32_t           pad            = 0;
+};
+// The arrays of a resolved draw (producer side; null when the count is 0 or the flag is clear).
+struct ResolvedDrawArrays {
+	const vk::Buffer*            vertex_buffers = nullptr;
+	const vk::DeviceSize*        vertex_offsets = nullptr;
+	const vk::DeviceSize*        vertex_sizes   = nullptr;
+	const DescriptorWriteRecord* writes         = nullptr;
+	const DescriptorInfo*        infos          = nullptr;
+	const uint32_t*              push           = nullptr;
+	const uint32_t*              clip           = nullptr;
+};
+
 // ClearColorImage: value = the vk::ClearColorValue's 16 bytes. ClearDepthStencilImage: value[0] =
 // the depth's bits, value[1] = the stencil. vk::ImageSubresourceRange[count] follow.
 struct ClearImagePacket {
@@ -486,6 +565,8 @@ uint64_t Value(Op op, uint64_t a, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0
                uint64_t f = 0);
 uint64_t Floats(Op op, const float* values, uint32_t count);
 uint64_t DebugLabel(const char* name, uint32_t size);
+// The payload bytes of a ResolvedDraw packet (fixed part and arrays, as encoded).
+uint64_t ResolvedDraw(const void* payload, uint64_t size);
 uint64_t ColorWriteEnable(uint32_t count, const vk::Bool32* enables);
 uint64_t ClearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue& color,
                          uint32_t count, const vk::ImageSubresourceRange* ranges);
@@ -651,7 +732,8 @@ public:
 			case Op::DrawIndexedIndirectCount:
 			case Op::Dispatch:
 			case Op::DispatchIndirect:
-			case Op::DispatchBase: return true;
+			case Op::DispatchBase:
+			case Op::ResolvedDraw: return true;
 			default: return false;
 		}
 	}
@@ -772,6 +854,8 @@ public:
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query);
 	void hostCopy(void* destination, uint64_t source, uint64_t size);
 	void insertDebugLabel(const char* name);
+	// KYTY_EMIT_SPLIT: one resolved draw (ResolvedDrawPacket); kicks the consumer like a draw.
+	void resolvedDraw(const ResolvedDrawPacket& packet, const ResolvedDrawArrays& arrays);
 	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
 	                          uint32_t marker);
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
@@ -865,12 +949,178 @@ public:
 		m_offset += Align8(bytes);
 		return values;
 	}
+	[[nodiscard]] uint32_t Offset() const noexcept { return m_offset; }
 
 private:
 	const uint8_t* m_base   = nullptr;
 	uint32_t       m_size   = 0;
 	uint32_t       m_offset = 0;
 };
+
+// KYTY_EMIT_SPLIT consumer state (ResolvedDrawPacket). The shadow: what the last resolved draw of
+// this command buffer pushed (descriptors at the graphics bind point, set 0; push constants), while
+// no other packet changed that state since. The comparisons are DrawEncode::Shadow's (drawEncode.h):
+// descriptors equal in layout, write shapes and every info; push constants equal in layout, stages,
+// size and bytes.
+struct ResolvedDrawShadow {
+	bool                               desc_valid   = false;
+	vk::PipelineLayout                 desc_layout  = nullptr;
+	std::vector<DescriptorWriteRecord> desc_writes;
+	std::vector<DescriptorInfo>        desc_infos;
+	bool                               const_valid  = false;
+	vk::PipelineLayout                 const_layout = nullptr;
+	uint32_t                           const_stages = 0;
+	std::array<uint32_t, ResolvedDrawPushDwords> const_dwords {};
+
+	void Reset() noexcept {
+		desc_valid  = false;
+		const_valid = false;
+	}
+	// Whether a push of these writes/infos with `layout` would only repeat the state in effect.
+	[[nodiscard]] bool SameDescriptors(vk::PipelineLayout layout, uint32_t write_count, const DescriptorWriteRecord* writes,
+	                                   uint32_t info_count, const DescriptorInfo* infos) const noexcept {
+		return desc_valid && desc_layout == layout && desc_writes.size() == write_count &&
+		       desc_infos.size() == info_count &&
+		       (write_count == 0 || std::memcmp(desc_writes.data(), writes, sizeof(DescriptorWriteRecord) * write_count) == 0) &&
+		       (info_count == 0 || std::memcmp(desc_infos.data(), infos, sizeof(DescriptorInfo) * info_count) == 0);
+	}
+	void KeepDescriptors(vk::PipelineLayout layout, uint32_t write_count, const DescriptorWriteRecord* writes,
+	                     uint32_t info_count, const DescriptorInfo* infos) {
+		desc_valid  = true;
+		desc_layout = layout;
+		desc_writes.assign(writes, writes + write_count);
+		desc_infos.assign(infos, infos + info_count);
+	}
+	[[nodiscard]] bool SameConstants(vk::PipelineLayout layout, uint32_t stages, const uint32_t* dwords) const noexcept {
+		return const_valid && const_layout == layout && const_stages == stages &&
+		       std::memcmp(const_dwords.data(), dwords, sizeof(const_dwords)) == 0;
+	}
+	void KeepConstants(vk::PipelineLayout layout, uint32_t stages, const uint32_t* dwords) noexcept {
+		const_valid  = true;
+		const_layout = layout;
+		const_stages = stages;
+		std::memcpy(const_dwords.data(), dwords, sizeof(const_dwords));
+	}
+};
+
+// KYTY_EMIT_SPLIT=verify: the state the replayed packets left in the command buffer (graphics bind
+// point), kept while `on`, so a verify-only resolved draw placed right after the draw's own packets
+// can be compared with it field by field.
+struct ResolvedDrawModel {
+	enum Field : uint32_t { Pipeline, Vertex, Index, Layout, Writes, Infos, Constants, Draw, FieldCount };
+	static constexpr const char* FieldNames[FieldCount] = {"pipeline", "vertex", "index", "layout",
+	                                                       "writes",   "infos",  "constants", "draw"};
+	struct Descriptor {
+		uint32_t           binding = 0;
+		uint32_t           element = 0;
+		vk::DescriptorType type    = vk::DescriptorType::eSampler;
+		DescriptorInfo     info;
+	};
+	bool on    = false; // set by the first verify-only record
+	bool valid = false; // a Begin was replayed since `on`
+	vk::Pipeline              pipeline    = nullptr;
+	std::vector<vk::Buffer>   vb_buffers;
+	std::vector<vk::DeviceSize> vb_offsets;
+	std::vector<vk::DeviceSize> vb_sizes;
+	bool                      vb_sizes_set = false;
+	vk::Buffer                ib_buffer    = nullptr;
+	uint64_t                  ib_offset    = 0;
+	uint32_t                  ib_type      = 0;
+	vk::PipelineLayout        desc_layout  = nullptr;
+	std::vector<Descriptor>   descriptors;
+	std::array<uint32_t, 64>  constants {};
+	uint64_t                  constants_valid = 0; // one bit per dword
+	bool                      draw_indexed    = false;
+	uint32_t                  draw_args[5]    = {};
+
+	void Begin() {
+		valid    = on;
+		pipeline = nullptr;
+		vb_buffers.clear();
+		vb_offsets.clear();
+		vb_sizes.clear();
+		ib_buffer   = nullptr;
+		desc_layout = nullptr;
+		descriptors.clear();
+		constants_valid = 0;
+		draw_indexed    = false;
+		std::memset(draw_args, 0, sizeof(draw_args));
+	}
+	void Push(vk::PipelineLayout layout, uint32_t count, const vk::WriteDescriptorSet* writes) {
+		if (layout != desc_layout) {
+			descriptors.clear();
+			desc_layout = layout;
+		}
+		for (uint32_t w = 0; w < count; w++) {
+			const auto& write = writes[w];
+			for (uint32_t j = 0; j < write.descriptorCount; j++) {
+				DescriptorInfo info;
+				if (write.pImageInfo != nullptr) {
+					std::memcpy(&info, write.pImageInfo + j, sizeof(info));
+				} else if (write.pBufferInfo != nullptr) {
+					std::memcpy(&info, write.pBufferInfo + j, sizeof(info));
+				}
+				Set(write.dstBinding, write.dstArrayElement + j, write.descriptorType, info);
+			}
+		}
+	}
+	void Set(uint32_t binding, uint32_t element, vk::DescriptorType type, const DescriptorInfo& info) {
+		for (auto& d: descriptors) {
+			if (d.binding == binding && d.element == element) {
+				d.type = type;
+				d.info = info;
+				return;
+			}
+		}
+		descriptors.push_back({binding, element, type, info});
+	}
+	[[nodiscard]] const Descriptor* Find(uint32_t binding, uint32_t element) const {
+		for (const auto& d: descriptors) {
+			if (d.binding == binding && d.element == element) {
+				return &d;
+			}
+		}
+		return nullptr;
+	}
+	void SetConstants(uint32_t offset, uint32_t size, const void* data) {
+		if ((offset & 3u) != 0 || (size & 3u) != 0 || offset + size > sizeof(constants)) {
+			constants_valid = 0;
+			return;
+		}
+		std::memcpy(reinterpret_cast<uint8_t*>(constants.data()) + offset, data, size);
+		for (uint32_t d = offset / 4u; d < (offset + size) / 4u; d++) {
+			constants_valid |= uint64_t {1} << d;
+		}
+	}
+	void UnsetDescriptors() {
+		desc_layout = nullptr;
+		descriptors.clear();
+	}
+};
+
+struct ResolvedDrawStats {
+	uint64_t records          = 0; // expanded (not verify-only)
+	uint64_t pushes           = 0;
+	uint64_t pushes_avoided   = 0;
+	uint64_t constants        = 0;
+	uint64_t constants_avoided = 0;
+	uint64_t shadow_resets    = 0;
+	uint64_t verify_records   = 0;
+	uint64_t verify_unmodeled = 0;
+	uint64_t verify_checks    = 0;
+	uint64_t mismatches[ResolvedDrawModel::FieldCount] = {};
+	uint64_t reported         = 0;
+};
+
+// The consumers' resolved-draw counters, summed over every replaying thread (published in
+// increments every 1024 records and at every verify mismatch; read by the reports and live lines).
+struct ResolvedDrawTotals {
+	uint64_t records = 0, pushes = 0, pushes_avoided = 0, constants = 0, constants_avoided = 0, shadow_resets = 0;
+	uint64_t verify_records = 0, verify_checks = 0, verify_unmodeled = 0;
+	uint64_t mismatches[ResolvedDrawModel::FieldCount] = {};
+};
+void                             PublishResolvedDraw(const ResolvedDrawStats& stats, ResolvedDrawStats& published) noexcept;
+[[nodiscard]] ResolvedDrawTotals ResolvedDrawPublished() noexcept;
 
 // Consumer-side verification state and argument scratch.
 struct ReplayState {
@@ -886,6 +1136,11 @@ struct ReplayState {
 	uint64_t                            mismatch_expected = 0;
 	uint64_t                            mismatch_actual   = 0;
 	std::vector<vk::WriteDescriptorSet> writes;
+	// KYTY_EMIT_SPLIT (ResolvedDrawPacket).
+	ResolvedDrawShadow record_shadow;
+	ResolvedDrawModel  record_model;
+	ResolvedDrawStats  record_stats;
+	ResolvedDrawStats  record_published; // the part of record_stats already in ResolvedDrawPublished
 };
 
 // Called on a verify mismatch: kind 0 = argument hash, 1 = sequence, 2 = command-buffer digest.

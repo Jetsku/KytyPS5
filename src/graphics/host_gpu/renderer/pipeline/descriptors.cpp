@@ -6916,4 +6916,368 @@ void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBind
 	buffer.BindDescriptorSet(point, pipeline.pipeline_layout, set);
 }
 
+// ------------------------------------------------------------------------------------------------
+// KYTY_EMIT_SPLIT (live, default 0; 1 on, 2 verify): a draw-run continuation that pushes only its
+// per-draw descriptors (KYTY_DRAW_RUN_PUSH) is committed as ONE resolved-draw packet
+// (CommandStream::ResolvedDrawPacket) instead of its vertex, push-constant, push-descriptor, index,
+// pipeline, clip/object-id and draw packets. The commit thread still resolves everything (buffers,
+// images, the pipeline, the run's certificate); what moves to the recorder thread is the expansion:
+// the descriptor writes rebuilt from the packet, the push-constant and push-descriptor shadow
+// comparisons, and the native calls. The packet travels through the same ring as every other
+// command, so its order against barriers, rendering begin/end, uploads and dispatches is the
+// inline order.
+// State the expansion reads, and why the commit thread's later changes cannot reach it:
+//  - buffer bindings, vertex/index buffers, the bindless set, the pipeline and its layout: copied
+//    into the packet as handles and values, exactly as the inline packets carry them (the same
+//    deferred-deletion rules apply);
+//  - the descriptor write shapes: copied from the run's template (below) into the packet;
+//  - push-descriptor and push-constant shadows: the recorder's own (ReplayState::record_shadow),
+//    updated only by resolved draws and forgotten by every other packet that changes that state,
+//    by Begin, and by FlagShadowReset after a direct window (CommandBuffer::TakeRecordReset). The
+//    commit thread's shadow forgets descriptors and push constants at every resolved draw (its
+//    descriptor epoch advances as for a recorded push, so KYTY_DRAW_RUN_PUSH's continuation test
+//    is unchanged); the pipeline shadow stays on the commit thread (it decides FlagBind).
+// The template: the partial write list of a run's continuations is a function of the stage
+// programs (their binding lists), KYTY_SRT_UNIFORM and the run's structure key (which hashes the
+// programs; a program at the same address under the same key is the same program), as KYTY_CONT_EMIT's
+// skeleton (Based on the claude/u59-contrun skeleton). The per-draw part is the buffer infos and
+// the push data.
+// Verify (2): every eligible draw is committed inline as before and followed by a verify-only
+// resolved draw; the recorder compares it field by field with the state the inline packets left
+// (ResolvedDrawModel) and counts mismatches per field ("EmitSplit" lines, live-line " es [..]").
+static Live::Switch g_emit_split("KYTY_EMIT_SPLIT", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0') {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 2;
+	}
+	return std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 2);
+});
+
+int64_t EmitSplitMode() {
+	return g_emit_split.Get();
+}
+
+struct RenderExecutor::EmitSplitTemplate {
+	enum class Src : uint8_t { Buffer, Uniform, Bda, Fault, Mip, Srt, ShaderData, Shared, Gds };
+	struct Source {
+		uint8_t  stage    = 0;
+		Src      kind     = Src::Buffer;
+		uint16_t resource = 0;
+	};
+	struct PushCopy {
+		uint32_t stage = 0;
+		uint32_t start = 0;
+	};
+	static constexpr uint32_t MaxStages = 4;
+	static constexpr uint32_t MaxInfos  = 96;
+	static constexpr uint32_t MaxWrites = 64;
+
+	bool                                 built   = false; // the key below is set
+	bool                                 valid   = false; // the build fit
+	uint64_t                             run_key = 0;
+	std::array<const void*, MaxStages>   programs {};
+	uint32_t                             stages      = 0;
+	bool                                 srt_uniform = false;
+	uint32_t                             write_count = 0;
+	uint32_t                             info_count  = 0;
+	std::array<CommandStream::DescriptorWriteRecord, MaxWrites> writes {};
+	std::array<Source, MaxInfos>         sources {};
+	std::array<PushCopy, MaxStages>      push {};
+	uint32_t                             push_count  = 0;
+	uint32_t                             push_stages = 0;
+	bool                                 env         = false; // BDA page table, fault buffer or mip statistics
+	vk::DeviceSize                       uniform_range = 0;
+};
+
+struct RenderExecutor::EmitSplitState {
+	EmitSplitTemplate tmpl;
+	std::array<CommandStream::DescriptorInfo, EmitSplitTemplate::MaxInfos> infos {};
+	std::array<uint32_t, CommandStream::ResolvedDrawPushDwords>             push {};
+	// Counters (commit thread).
+	enum Miss : uint32_t { NoStream, Sites, BatchOff, SetPath, RunVerify, Audit, Stages, Template, MissCount };
+	static constexpr const char* MissNames[MissCount] = {"no_stream", "sites", "batch_off", "set_path",
+	                                                     "drawrun_verify", "audit", "stages", "template"};
+	uint64_t prepared  = 0;
+	uint64_t records   = 0;
+	uint64_t verifies  = 0;
+	uint64_t templates = 0;
+	uint64_t native    = 0; // records expanded natively (no stream at write time)
+	std::array<uint64_t, MissCount> misses {};
+	uint64_t last_report_ns = 0;
+};
+
+RenderExecutor::EmitSplitState& RenderExecutor::EmitSplit() {
+	if (m_emit_split == nullptr) {
+		m_emit_split = new EmitSplitState();
+	}
+	return *m_emit_split;
+}
+
+// BuildDescriptors(partial = true)'s write list without the infos: the records the packet carries
+// and, per info, where it comes from. False when the commit does not fit (a mesh stage, too many
+// writes or infos, an image binding).
+static bool BuildEmitSplitTemplate(std::span<PreparedBindings* const> stages,
+                                   RenderExecutor::EmitSplitTemplate&    t) {
+	using T       = RenderExecutor::EmitSplitTemplate;
+	t.write_count = 0;
+	t.info_count  = 0;
+	t.push_count  = 0;
+	t.env         = false;
+	auto push_stages = vk::ShaderStageFlags(vk::ShaderStageFlagBits::eFragment);
+	for (uint32_t s = 0; s < stages.size(); s++) {
+		const auto& program = *stages[s]->runtime->program;
+		if (program.stage == ShaderType::Mesh) {
+			return false;
+		}
+		push_stages |= NativeShaderStage(program.stage);
+		for (const auto& binding: program.bindings.descriptors) {
+			if (binding.kind == BindingKind::Samplers ||
+			    ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
+			        ShaderRecompiler::IR::ImageResourceClass::None) {
+				continue; // partial: the run's image and sampler descriptors stay in effect
+			}
+			if (t.write_count >= T::MaxWrites) {
+				return false;
+			}
+			CommandStream::DescriptorWriteRecord record;
+			record.binding  = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
+			record.element  = 0;
+			record.count    = NativeDescriptorCount(binding);
+			record.type     = NativeDescriptorType(binding.kind);
+			record.is_image = 0;
+			const auto first = t.info_count;
+			const auto add   = [&](T::Src kind, uint32_t resource) {
+                if (t.info_count >= T::MaxInfos || resource > 0xffffu) {
+                    return false;
+                }
+                t.sources[t.info_count++] = {static_cast<uint8_t>(s), kind, static_cast<uint16_t>(resource)};
+                return true;
+			};
+			bool ok = true;
+			switch (binding.kind) {
+				case BindingKind::Buffers:
+				case BindingKind::UniformBuffers:
+					for (const auto resource: binding.resources) {
+						ok = ok && add(binding.kind == BindingKind::Buffers ? T::Src::Buffer : T::Src::Uniform, resource);
+					}
+					break;
+				case BindingKind::BdaPagetable: ok = add(T::Src::Bda, 0); t.env = true; break;
+				case BindingKind::FaultBuffer: ok = add(T::Src::Fault, 0); t.env = true; break;
+				case BindingKind::MipStats: ok = add(T::Src::Mip, 0); t.env = true; break;
+				case BindingKind::FlattenedSrt: ok = add(T::Src::Srt, 0); break;
+				case BindingKind::ShaderData: ok = add(T::Src::ShaderData, 0); break;
+				case BindingKind::SharedMemory: ok = add(T::Src::Shared, 0); break;
+				case BindingKind::Gds: ok = add(T::Src::Gds, 0); break;
+				default: return false;
+			}
+			if (!ok || t.info_count - first != record.count) {
+				return false;
+			}
+			t.writes[t.write_count++] = record;
+		}
+		if (program.bindings.UsesPushData()) {
+			t.push[t.push_count++] = {s, program.bindings.push_data_start_dword};
+		}
+	}
+	t.push_stages = static_cast<uint32_t>(static_cast<VkShaderStageFlags>(push_stages));
+	return true;
+}
+
+bool RenderExecutor::EmitSplitPrepare(const CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+                                      std::span<PreparedBindings* const> stages) {
+	auto& es = EmitSplit();
+	es.prepared++;
+	using S        = EmitSplitState;
+	auto  miss     = S::MissCount;
+	auto* encoder  = buffer.StreamEncoder();
+	if (encoder == nullptr) {
+		miss = S::NoStream;
+	} else if (encoder->GetOptions().all_sites) {
+		miss = S::Sites;
+	} else if (!BarrierBatchEnabled()) {
+		miss = S::BatchOff;
+	} else if (!pipeline.uses_push_descriptors || pipeline.descriptor_set_layout == nullptr) {
+		miss = S::SetPath;
+	} else if (DrawRun::GetMode() == DrawRun::Mode::Verify) {
+		miss = S::RunVerify;
+	} else if (DescriptorOffsetAuditEnabled()) {
+		miss = S::Audit;
+	} else if (stages.empty() || stages.size() > EmitSplitTemplate::MaxStages || m_run_key == 0) {
+		miss = S::Stages;
+	} else {
+		auto&      t           = es.tmpl;
+		const bool srt_uniform = ShaderRecompiler::Spirv::SrtUniformEnabled();
+		bool       same        = t.built && t.run_key == m_run_key && t.stages == stages.size() &&
+		                t.srt_uniform == srt_uniform;
+		for (uint32_t i = 0; same && i < stages.size(); i++) {
+			same = t.programs[i] == stages[i]->runtime->program;
+		}
+		if (!same) {
+			es.templates++;
+			t.valid       = BuildEmitSplitTemplate(stages, t);
+			t.built       = true;
+			t.run_key     = m_run_key;
+			t.stages      = static_cast<uint32_t>(stages.size());
+			t.srt_uniform = srt_uniform;
+			t.programs    = {};
+			for (uint32_t i = 0; i < stages.size(); i++) {
+				t.programs[i] = stages[i]->runtime->program;
+			}
+			t.uniform_range = std::min<vk::DeviceSize>(
+			    ShaderRecompiler::IR::UniformBufferBytes,
+			    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange);
+		}
+		if (!t.valid) {
+			miss = S::Template;
+		}
+	}
+	if (miss != S::MissCount) {
+		es.misses[miss]++;
+		return false;
+	}
+	return true;
+}
+
+void RenderExecutor::EmitSplitWrite(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+                                    std::span<PreparedBindings* const> stages, CommandStream::ResolvedDrawPacket& packet,
+                                    const CommandStream::ResolvedDrawArrays& arrays_in, bool verify_only) {
+	using P      = CommandStream::ResolvedDrawPacket;
+	using Src    = EmitSplitTemplate::Src;
+	auto&       es = EmitSplit();
+	const auto& t  = es.tmpl;
+	DrawEncode::DescriptorEnv env;
+	if (t.env) {
+		env = MakeDescriptorEnv(stages);
+	}
+	const auto uniform_range = t.uniform_range;
+	bool       fresh         = false;
+	for (const auto* prepared: stages) {
+		fresh |= prepared->fresh_upload;
+	}
+	auto* infos = reinterpret_cast<vk::DescriptorBufferInfo*>(es.infos.data());
+	for (uint32_t i = 0; i < t.info_count; i++) {
+		const auto& source      = t.sources[i];
+		const auto& descriptors = *stages[source.stage];
+		auto&       out         = infos[i];
+		switch (source.kind) {
+			case Src::Buffer:
+				out = descriptors.buffers.at(source.resource);
+				EXIT_IF(out.buffer == nullptr);
+				break;
+			case Src::Uniform:
+				out = descriptors.buffers.at(source.resource);
+				EXIT_IF(out.buffer == nullptr);
+				out.range = std::min(out.range, uniform_range);
+				break;
+			case Src::Bda: out = env.bda_page_table; break;
+			case Src::Fault: out = env.fault_buffer; break;
+			case Src::Mip: out = descriptors.mip_stats_canary ? env.mip_canary : env.mip_counters; break;
+			case Src::Srt:
+			case Src::ShaderData:
+				out = source.kind == Src::Srt ? descriptors.flattened_srt : descriptors.shader_data_buffer;
+				EXIT_IF(out.buffer == nullptr);
+				if (t.srt_uniform) {
+					// KYTY_SRT_UNIFORM: at most the uniform array the shader declares.
+					out.range = std::min<vk::DeviceSize>(out.range, uniform_range);
+				}
+				break;
+			case Src::Shared:
+				out = descriptors.shared_memory;
+				EXIT_IF(out.buffer == nullptr);
+				break;
+			case Src::Gds:
+				out = descriptors.gds;
+				EXIT_IF(out.buffer == nullptr);
+				break;
+		}
+	}
+	const bool has_push = t.push_count != 0;
+	if (has_push) {
+		es.push.fill(0);
+		for (uint32_t i = 0; i < t.push_count; i++) {
+			const auto& copy     = t.push[i];
+			const auto& prepared = *stages[copy.stage];
+			EXIT_IF(prepared.shader_data.size() != prepared.runtime->program->bindings.ShaderDataDwords() ||
+			        copy.start + prepared.shader_data.size() > es.push.size());
+			std::copy(prepared.shader_data.begin(), prepared.shader_data.end(), es.push.begin() + copy.start);
+		}
+	}
+	const auto flags = CommandBuffer::EncodeFlags();
+	packet.layout      = pipeline.pipeline_layout;
+	packet.pipeline    = pipeline.pipeline;
+	packet.write_count = t.write_count;
+	packet.info_count  = t.info_count;
+	packet.push_stages = t.push_stages;
+	packet.flags |= (has_push ? P::FlagPushData : 0u) | (t.write_count != 0 ? P::FlagPush : 0u) |
+	                (PushShadowFreshSkipEnabled() && fresh ? P::FlagKnownMiss : 0u) |
+	                (flags.renderer_batch ? P::FlagPushDedup : 0u) | (flags.push_constant_shadow ? P::FlagConstDedup : 0u);
+	if (pipeline.uses_bindless) {
+		packet.flags |= P::FlagBindless;
+		packet.bindless_set = m_context.GetBindlessTable().Set();
+	}
+	if (verify_only) {
+		packet.flags |= P::FlagVerifyOnly;
+		es.verifies++;
+	} else {
+		auto& shadow = buffer.EncodeShadowUnsettled();
+		if (shadow.TakePipelineBind(flags, vk::PipelineBindPoint::eGraphics, pipeline.pipeline)) {
+			packet.flags |= P::FlagBind;
+		}
+		// The recorder's shadow holds what this packet pushes; the commit thread's forgets it (its
+		// descriptor epoch advances as for a recorded push).
+		if (t.write_count != 0) {
+			buffer.InvalidateDescriptors(vk::PipelineBindPoint::eGraphics);
+		}
+		if (has_push || (packet.flags & P::FlagObjprim) != 0) {
+			buffer.InvalidatePushConstants();
+		}
+		if (buffer.TakeRecordReset()) {
+			packet.flags |= P::FlagShadowReset;
+		}
+		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
+		CommitStats::AddItems(CommitStats::Item::DescWrites, t.write_count);
+		es.records++;
+	}
+	auto arrays   = arrays_in;
+	arrays.writes = t.writes.data();
+	arrays.infos  = es.infos.data();
+	arrays.push   = has_push ? es.push.data() : nullptr;
+	if (auto* encoder = buffer.StreamEncoder(); encoder != nullptr) [[likely]] {
+		encoder->resolvedDraw(packet, arrays);
+	} else if (!verify_only) {
+		// A direct window opened after EmitSplitPrepare (none is known to): the same commands, natively,
+		// without a shadow (FlagShadowReset is pending for the next record: the window set it).
+		CommandStream::ReplayState native;
+		auto                       sink = buffer.StateSink();
+		CommandStream::Detail::ExpandResolvedDraw(sink, native, packet, arrays.vertex_buffers, arrays.vertex_offsets,
+		                                          arrays.vertex_sizes, arrays.writes, arrays.infos, arrays.push,
+		                                          arrays.clip);
+		es.native++;
+	}
+	if ((es.prepared & 0xffffu) == 1) {
+		EmitSplitReport();
+	}
+}
+
+void RenderExecutor::EmitSplitReport() {
+	auto&       es = EmitSplit();
+	std::string misses;
+	for (uint32_t i = 0; i < EmitSplitState::MissCount; i++) {
+		misses += fmt::format(" {}={}", EmitSplitState::MissNames[i], es.misses[i]);
+	}
+	const auto r = CommandStream::ResolvedDrawPublished();
+	std::printf("EmitSplit (mode %d): commit eligible %" PRIu64 " records %" PRIu64 " verify-only %" PRIu64
+	            " templates %" PRIu64 " native %" PRIu64 "; misses%s | recorder records %" PRIu64 " pushes %" PRIu64 " avoided %" PRIu64
+	            " constants %" PRIu64 " avoided %" PRIu64 " resets %" PRIu64 " | verify %" PRIu64 " records %" PRIu64
+	            " checked %" PRIu64 " unmodeled, mismatches pipeline=%" PRIu64 " vertex=%" PRIu64 " index=%" PRIu64
+	            " layout=%" PRIu64 " writes=%" PRIu64 " infos=%" PRIu64 " constants=%" PRIu64 " draw=%" PRIu64 "\n",
+	            static_cast<int>(g_emit_split.Get()), es.prepared, es.records, es.verifies, es.templates, es.native, misses.c_str(),
+	            r.records, r.pushes, r.pushes_avoided, r.constants, r.constants_avoided, r.shadow_resets, r.verify_records,
+	            r.verify_checks, r.verify_unmodeled, r.mismatches[0], r.mismatches[1], r.mismatches[2], r.mismatches[3],
+	            r.mismatches[4], r.mismatches[5], r.mismatches[6], r.mismatches[7]);
+	std::fflush(stdout);
+}
+
 } // namespace Libs::Graphics

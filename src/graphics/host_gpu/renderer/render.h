@@ -693,6 +693,18 @@ private:
 	CommandRecorder*        m_recorder      = nullptr;
 	CommandStream::Encoder* m_encoder       = nullptr;
 	mutable bool            m_direct_window = false;
+	// KYTY_EMIT_SPLIT: commands were recorded natively (a direct window) or the buffer began since
+	// the last resolved draw took this flag: the recorder's shadow may be stale.
+	mutable bool m_record_reset = true;
+
+public:
+	[[nodiscard]] bool TakeRecordReset() const noexcept {
+		const bool reset = m_record_reset;
+		m_record_reset   = false;
+		return reset;
+	}
+
+private:
 	[[nodiscard]] bool      Encoding() const noexcept {
 		return m_encoder != nullptr && !m_direct_window;
 	}
@@ -1591,6 +1603,25 @@ private:
 	// The descriptor writes the last CommitBindings built (drawEncode.h).
 	DrawEncode::DescriptorScratch m_descriptor_scratch;
 	DrawEncode::BuiltDescriptors  m_built_descriptors;
+	// KYTY_EMIT_SPLIT (renderDraw.cpp, descriptors.cpp): the partial write list of the current run's
+	// continuations (a function of the programs, as KYTY_CONT_EMIT's skeleton), and the counters.
+public:
+	struct EmitSplitTemplate;
+	struct EmitSplitState;
+
+private:
+	EmitSplitState* m_emit_split = nullptr;
+	[[nodiscard]] EmitSplitState& EmitSplit();
+	// Whether this continuation can be committed as one resolved draw (fills the template for it);
+	// counts the reason when not.
+	[[nodiscard]] bool EmitSplitPrepare(const CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                                    std::span<PreparedBindings* const> stages);
+	// The resolved draw of the draw being committed: descriptors from the template, push data, and
+	// the caller's vertex/index/draw fields; written to the buffer's stream encoder.
+	void EmitSplitWrite(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                    std::span<PreparedBindings* const> stages, CommandStream::ResolvedDrawPacket& packet,
+	                    const CommandStream::ResolvedDrawArrays& arrays_in, bool verify_only);
+	void EmitSplitReport();
 	// KYTY_ENC_OFFLOAD (renderDraw.cpp, encodeOffload.h).
 	struct OffloadJob;
 	struct OffloadState;

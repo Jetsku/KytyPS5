@@ -101,6 +101,7 @@ std::array<std::atomic<CommandRecorder*>, MaxRecorders> g_recorders {};
 std::array<std::atomic<VkCommandBuffer>, MaxRecorders> g_recording {};
 thread_local bool                                      t_replaying = false;
 std::atomic<uint64_t>                                  g_ownership_faults {0};
+std::atomic<uint64_t>                                  g_recorders_busy_ns {0};
 
 size_t RegisterRecorder(CommandRecorder* recorder) {
 	for (size_t i = 0; i < MaxRecorders; i++) {
@@ -832,9 +833,15 @@ void CommandRecorder::Run(std::stop_token stop) {
 		}
 		const auto start = NowNs();
 		ConsumeAvailable();
-		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_release);
+		const auto busy = NowNs() - start;
+		m_busy_ns.fetch_add(busy, std::memory_order_release);
+		g_recorders_busy_ns.fetch_add(busy, std::memory_order_relaxed);
 	}
 	ConsumeAvailable();
+}
+
+uint64_t CommandRecorder::TotalBusyNs() noexcept {
+	return g_recorders_busy_ns.load(std::memory_order_relaxed);
 }
 
 uint64_t CommandRecorder::OwnershipFaults() noexcept {

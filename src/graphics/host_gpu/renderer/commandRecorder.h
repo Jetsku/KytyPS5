@@ -101,6 +101,9 @@ public:
 	// ---- Diagnostics and tests ----
 	// Ownership faults reported by the verify hooks (process-wide).
 	[[nodiscard]] static uint64_t OwnershipFaults() noexcept;
+	// emitsplit measurement: the busy time (packet replay, outside the idle wait) of every recorder
+	// thread since start, summed (live lines).
+	[[nodiscard]] static uint64_t TotalBusyNs() noexcept;
 	// Tests: holds the recorder thread before its next batch (packets stay in the ring).
 	void SetTestStall(bool stall) noexcept { m_test_stall.store(stall, std::memory_order_release); }
 	[[nodiscard]] const CommandStream::WaitStats& ProducerStats() const noexcept {
