@@ -198,8 +198,26 @@ static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
 	    !RemapTrackerProtectionEnabled()) {
 		return;
 	}
+	// How often the host protection of GPU memory was replaced (a writable guest mprotect, a remap)
+	// before this resync re-protected the tracker's pages: a CPU write in between is not seen by the
+	// tracker (Senaxx/KytyPS5 c453d3fd5 closes that window for mprotect with one protect of
+	// min(guest, tracker) mode). Counted on the console to size the window.
+	static std::atomic<uint64_t> resyncs {0};
+	if (const auto n = resyncs.fetch_add(1, std::memory_order_relaxed) + 1; n <= 4 || (n & (n - 1)) == 0) {
+		std::printf("TrackerResync: host protection of GPU memory 0x%016" PRIx64 " +0x%" PRIx64
+		            " replaced and resynced (%" PRIu64 " so far)\n",
+		            vaddr, size, n);
+		std::fflush(stdout);
+	}
 	GetGpuResources().ResyncHostProtection(vaddr, size);
 }
+
+// KYTY_MPROTECT_TRACKED_ONCE=1 (live, default off; based on Senaxx/KytyPS5 c453d3fd5): a guest
+// mprotect that allows writes over GPU memory gives the tracker's watched pages their protection in
+// the same host call (PageManager::ProtectGuestWritable) instead of opening them with the guest's
+// mode and re-protecting them afterwards (ResyncGpuRangeProtection), a window in which a CPU write
+// to a watched page was not seen.
+static Live::Switch g_mprotect_tracked_once("KYTY_MPROTECT_TRACKED_ONCE", Live::ParseDefaultOff);
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -5616,7 +5634,15 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 			continue;
 		}
 		NoteGuestProtection(range.start, range.size, mode);
-		if (!g_guest_address_space->Protect(range.start, range.size, mode)) {
+		// KYTY_MPROTECT_TRACKED_ONCE: a writable protection of GPU memory in one step with the
+		// tracker's (PageManager::ProtectGuestWritable), not protect-then-resync below.
+		const bool tracked_once = (prot & PROT_CPU_WRITE) != 0 && g_mprotect_tracked_once.On() &&
+		                          g_gpu_resources != nullptr && IsGpuAddressRange(range.start, range.size) &&
+		                          RemapTrackerProtectionEnabled() && range.start % 0x1000u == 0 &&
+		                          range.size % 0x1000u == 0;
+		if (tracked_once) {
+			GetGpuResources().ProtectGuestWritable(range.start, range.size, mode);
+		} else if (!g_guest_address_space->Protect(range.start, range.size, mode)) {
 			EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
 			     " prot=0x%08x\n",
 			     range.start, range.size, prot);
@@ -5629,7 +5655,7 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 		g_virtual_ranges->Protect(range.start, range.size, prot);
 		// A writable guest protection replaced the tracker's on watched pages: their CPU writes
 		// would stop faulting.
-		if ((prot & PROT_CPU_WRITE) != 0) {
+		if ((prot & PROT_CPU_WRITE) != 0 && !tracked_once) {
 			ResyncGpuRangeProtection(range.start, range.size);
 		}
 	}

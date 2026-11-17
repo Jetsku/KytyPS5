@@ -5435,6 +5435,28 @@ void StreamCopyDefer::NoteGuestWriteStream(uint64_t address, uint64_t size) {
 	cache->m_deferred_hi   = 0;
 }
 
+// KYTY_STREAM_COPY_REUSE=1 (live, default off; based on Senaxx/KytyPS5 8bdb5b43f, adapted to the
+// op stream: CommandProcessor::Process and ExecuteOp end the epoch): streamCopyMemo.h.
+static Live::Switch g_stream_copy_reuse("KYTY_STREAM_COPY_REUSE", Live::ParseDefaultOff);
+
+// Copies made and reused while the switch is on (command-processor thread), printed at every
+// power of two of the copies made.
+static void NoteStreamCopyReuse(bool reused, uint64_t size) {
+	static uint64_t made = 0, reuses = 0, reused_bytes = 0;
+	if (reused) {
+		reuses++;
+		reused_bytes += size;
+		return;
+	}
+	if (++made >= 4096 && (made & (made - 1)) == 0) {
+		std::printf("StreamCopyReuse: %" PRIu64 " copies made, %" PRIu64 " reused (%.1f%% of bindings, %.1f MB "
+		            "not copied) (KYTY_STREAM_COPY_REUSE)\n",
+		            made, reuses, 100.0 * static_cast<double>(reuses) / static_cast<double>(made + reuses),
+		            static_cast<double>(reused_bytes) / 1.0e6);
+		std::fflush(stdout);
+	}
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64_t size,
                                                           bool is_written, bool is_texel_buffer,
                                                           BufferId id, BufferId* obtained) {
@@ -5503,6 +5525,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 		} else {
 			stream = decide();
 		}
+		// KYTY_STREAM_COPY_REUSE: the same range copied earlier in this tick and epoch.
+		const bool     reuse      = stream && g_stream_copy_reuse.On();
+		const uint64_t reuse_tick = reuse ? m_scheduler.CurrentTick() : 0;
+		if (reuse) {
+			if (uint64_t offset = 0; m_stream_copy_memo.Find(vaddr, size, reuse_tick, offset)) {
+				NoteStreamCopyReuse(true, size);
+				return {&m_stream_buffer, offset};
+			}
+		}
 		if (stream) {
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
@@ -5527,6 +5558,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 			if (read) {
 				InplaceStats::NoteStream(vaddr, size);
 				m_stream_buffer.Commit();
+				if (reuse) {
+					m_stream_copy_memo.Note(vaddr, size, reuse_tick, offset);
+					NoteStreamCopyReuse(false, size);
+				}
 				return {&m_stream_buffer, offset};
 			}
 		}

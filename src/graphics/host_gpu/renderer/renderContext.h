@@ -175,6 +175,10 @@ public:
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
+	// KYTY_MPROTECT_TRACKED_ONCE (PageManager::ProtectGuestWritable).
+	void ProtectGuestWritable(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode) {
+		m_page_manager.ProtectGuestWritable(vaddr, size, guest_mode);
+	}
 	void               PrepareBda();
 	// KYTY_BDA_REACH=1|verify (default off, live; renderContextReach.cpp; based on TheCruZ/KytyPS5-GTA
 	// SynchronizeDmaFootprint): the stages of one draw or dispatch. When every stage that reads

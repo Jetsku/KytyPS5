@@ -11,6 +11,7 @@
 #include "common/liveSwitch.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
@@ -226,8 +227,22 @@ void FaultManager::ProcessFaultBuffer(const std::vector<std::pair<uint64_t, uint
 	} else {
 		command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	}
-	dependency.pBufferMemoryBarriers = &post_barrier;
+	// The host reads the parser's page list after the tick (the deferred operation below): only a
+	// device-to-host dependency makes the shader's writes visible to host reads (Vulkan spec, host
+	// access); waiting for the tick alone does not. Based on Senaxx/KytyPS5 1e7597c01.
+	vk::BufferMemoryBarrier2 host_barrier {};
+	host_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	host_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	host_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	host_barrier.buffer        = m_download_buffer.Handle();
+	host_barrier.offset        = offset;
+	host_barrier.size          = PageFaultAreaSize;
+	const std::array post_barriers {post_barrier, host_barrier};
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(post_barriers.size());
+	dependency.pBufferMemoryBarriers    = post_barriers.data();
 	command.pipelineBarrier2(dependency);
+	dependency.bufferMemoryBarrierCount = 1;
 	// KYTY_BDA_TAGS_GPU_COUNT (diagnostic): a copy of the get_bda_pointer counters per area.
 	const bool gpu_count = ShaderRecompiler::GetCodegenOptions().bda_tags_gpu_count;
 	if (gpu_count) {

@@ -16776,6 +16776,7 @@ public:
     constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t stencil_offset = 0x100000;
     constexpr uint64_t off_offset = 0x40000; // second target, switch off
+    constexpr uint64_t extent_offset = 0x80000; // third target, KYTY_DEPTH_EXTENT_RECREATE
     constexpr uint32_t pitch = 64;
     constexpr uint32_t max_height = 24;
     constexpr uint32_t cleared_depth = 0x3f400000u; // 0.75f
@@ -16806,7 +16807,7 @@ public:
     const auto guest_stencil = [](uint32_t x, uint32_t y) {
       return (0x80u + x * 3u + y * 5u) & 0xffu;
     };
-    for (const uint64_t offset : {uint64_t{0}, off_offset}) {
+    for (const uint64_t offset : {uint64_t{0}, off_offset, extent_offset}) {
       for (uint32_t y = 0; y < max_height; y++) {
         for (uint32_t x = 0; x < pitch; x++) {
           const uint32_t depth = guest_depth(x, y);
@@ -16935,6 +16936,38 @@ public:
               off_wide_id == off_small_id &&
                   cache.GetImage(off_wide_id).info.extent.width == 40,
               "with KYTY_DEPTH_GROW_RECREATE off the wider target changed images");
+
+      // KYTY_DEPTH_EXTENT_RECREATE (live; based on Senaxx/KytyPS5 4b7fb3274 and its test
+      // c7e1075d6): with the grow rule off, the depth overlap rule itself re-creates a target asked
+      // for wider than the cached image (same address, pitch and height), with the old contents;
+      // a later narrower request reuses the wider image.
+      Live::Testing::StageText("KYTY_DEPTH_EXTENT_RECREATE=1\n");
+      Live::OnCpFlip();
+      auto extent_small = make_desc(extent_offset, 40, 16);
+      const auto extent_small_id = bind(extent_small);
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), extent_small_id,
+          {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+          clear);
+      cache.MarkGpuWritten(extent_small_id);
+      auto extent_wide = make_desc(extent_offset, 56, 16);
+      const auto extent_wide_id = bind(extent_wide);
+      Require(name, "extent rule re-creates the wider target",
+              extent_wide_id != extent_small_id &&
+                  !TextureCacheTestAccess::Contains(cache, extent_small_id) &&
+                  cache.GetImage(extent_wide_id).backing.extent.width == 56,
+              "with KYTY_DEPTH_EXTENT_RECREATE on the wider target kept the narrower image");
+      Require(name, "extent rule keeps the old contents",
+              depth_at(extent_wide_id, 39, 15) == cleared_depth &&
+                  stencil_at(extent_wide_id, 39, 15) == cleared_stencil &&
+                  depth_at(extent_wide_id, 55, 15) == guest_depth(55, 15),
+              "the re-created depth target lost the narrower image's depth or stencil");
+      auto extent_again = make_desc(extent_offset, 40, 16);
+      Require(name, "extent rule: a narrower request reuses the wider image",
+              bind(extent_again) == extent_wide_id,
+              "a narrower depth-target request re-created the wider image");
+      Live::Testing::StageText("KYTY_DEPTH_EXTENT_RECREATE=\n");
+      Live::OnCpFlip();
 
       // The rule itself.
       const auto rule = [&](const TextureCache::ImageDesc &requested,

@@ -670,6 +670,40 @@ struct PageManager::Impl {
 		return calls;
 	}
 
+	// KYTY_MPROTECT_TRACKED_ONCE (PageManager::ProtectGuestWritable): pages [first, last) get, in
+	// one host call per run under host_lock, the tracker's protection where its counts watch the page
+	// and the guest's (writable) mode elsewhere; `applied` records the tracker's level, as
+	// ResyncHostProtection leaves it. Takes both locks itself. Returns the host calls made.
+	uint32_t ApplyGuestSpan(Region& region, uint64_t base_addr, size_t first, size_t last,
+	                        Common::VirtualMemory::Mode guest_mode) noexcept {
+		SpinGuard host(region.host_lock, FaultCost::Split::HostLock);
+		std::array<Run, REGION_PAGES> runs {};
+		size_t                        count = 0;
+		{
+			SpinGuard counts(region.lock);
+			for (size_t page = first; page < last; page++) {
+				const auto level = ToLevel(region.pages[page].Perms());
+				if (count != 0 && runs[count - 1].level == level) {
+					runs[count - 1].last = static_cast<uint16_t>(page + 1);
+				} else {
+					runs[count++] = {static_cast<uint16_t>(page), static_cast<uint16_t>(page + 1), level};
+				}
+			}
+		}
+		// Only a deferred release can change the counts meanwhile, and it only loosens them: a page
+		// may end up stricter than its counts, never looser (as in ApplySpan).
+		for (size_t index = 0; index < count; index++) {
+			const auto& run = runs[index];
+			Protect(base_addr + size_t {run.first} * PAGE_SIZE, static_cast<size_t>(run.last - run.first) * PAGE_SIZE,
+			        run.level == Level::ReadWrite ? guest_mode : ToMode(run.level));
+		}
+		SpinGuard counts(region.lock);
+		for (size_t index = 0; index < count; index++) {
+			SetApplied(region, runs[index].first, runs[index].last, runs[index].level);
+		}
+		return static_cast<uint32_t>(count);
+	}
+
 	// Caller holds region.lock (not host_lock), inside a DeferUnprotectScope: releases one write
 	// watcher of the selected pages and records the pages this makes looser for the scope's end.
 	// Returns false, with the span in [lo, hi), when the thread's batch is full: the caller
@@ -1212,6 +1246,28 @@ void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 			          Impl::Level::ReadWrite);
 		}
 		Impl::CountApplied(m_impl->ApplySpan(*region, region_base, first, last));
+	}
+}
+
+void PageManager::ProtectGuestWritable(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE || vaddr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0) {
+		return;
+	}
+	const auto end = std::min(vaddr + size, ADDRESS_SIZE);
+	for (auto chunk_begin = vaddr; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		if (region == nullptr) {
+			// Never watched: the guest's mode, as the guest protect did.
+			m_impl->Protect(chunk_begin, chunk_end - chunk_begin, guest_mode);
+		} else {
+			Impl::CountApplied(m_impl->ApplyGuestSpan(*region, region_base,
+			                                          static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE),
+			                                          static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE),
+			                                          guest_mode));
+		}
+		chunk_begin = chunk_end;
 	}
 }
 

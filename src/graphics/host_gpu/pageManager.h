@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PAGEMANAGER_H_
 
 #include "common/common.h"
+#include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
@@ -69,6 +70,13 @@ public:
 	// the GPU) once more. Unwatched pages keep the protection they were given. Any thread, outside
 	// the guest address-space lock.
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size);
+	// KYTY_MPROTECT_TRACKED_ONCE (based on Senaxx/KytyPS5 c453d3fd5): a guest mprotect that allows
+	// writes over [vaddr, vaddr + size) (page-aligned) in one step instead of a protect with the
+	// guest's mode followed by ResyncHostProtection, between which a watched page was writable and a
+	// CPU write there went unseen: under each watched region's host lock every run of pages gets the
+	// tracker's protection where it watches them and guest_mode elsewhere; unwatched regions get
+	// guest_mode. Any thread, outside the guest address-space lock.
+	void ProtectGuestWritable(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode);
 
 	// Deferred write protections (KYTY_DEFER_PROTECTS, default off; the idea of peepostarexx's
 	// DEFER_PROTECTS, re-implemented on the watcher counts). While a DeferProtectsScope is active on

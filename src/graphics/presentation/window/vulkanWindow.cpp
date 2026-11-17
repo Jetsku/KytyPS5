@@ -334,6 +334,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
 		check_feature(device_features2.features.fragmentStoresAndAtomics,
 		              "fragmentStoresAndAtomics");
+		// Device creation requires these too (EXIT_NOT_IMPLEMENTED there): a device without them is
+		// skipped here instead of chosen and then exited on. Based on Senaxx/KytyPS5 7ef27c254.
+		check_feature(device_features2.features.shaderInt64, "shaderInt64");
+		check_feature(device_features2.features.vertexPipelineStoresAndAtomics,
+		              "vertexPipelineStoresAndAtomics");
+		check_feature(device_features2.features.dualSrcBlend, "dualSrcBlend");
 
 		check_feature(device_features2.features.samplerAnisotropy, "samplerAnisotropy");
 		check_feature(device_features2.features.robustBufferAccess, "robustBufferAccess");
@@ -1365,8 +1371,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                     supported_features13, robustness2_ext_enabled ? &supported_robustness2 : nullptr,
 	                     workgroup_layout_extension &&
 	                         supported_workgroup_layout.workgroupMemoryExplicitLayout == VK_TRUE);
-	// VulkanFindPhysicalDevice already checked the required creation features. These
-	// requirements are specific to this creation path and are not part of device selection.
+	// VulkanFindPhysicalDevice already checked the required creation features, the three below
+	// included (a device without them is not chosen); shaderDrawParameters is checked here only.
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
