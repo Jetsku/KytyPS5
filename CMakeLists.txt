@@ -204,6 +204,15 @@ if(KYTY_MARCH)
 	endif()
 	message(STATUS "Host code for -march=${KYTY_MARCH}")
 endif()
+# The x86-64 level the host code needs (common/cpuCheck.h): kyty_emulator and kyty_launcher check
+# the CPU for it at start-up. 0 (no check) for the baseline and for -march values that name no level
+# (native, znver4: such builds run on the PC that built them).
+set(KYTY_CPU_CHECK_LEVEL 0)
+if(KYTY_MARCH MATCHES "^x86-64-v([234])$")
+	set(KYTY_CPU_CHECK_LEVEL ${CMAKE_MATCH_1})
+elseif(KYTY_X86_64_V3 AND NOT KYTY_MARCH)
+	set(KYTY_CPU_CHECK_LEVEL 3)
+endif()
 
 # zstd enables ASM. The first configure detects clang-cl's ASM as MSVC-like, but CMake does not save that
 # (CMakeASMCompiler.cmake.in). On every later CMake run in the same directory the Ninja generator then
@@ -978,6 +987,38 @@ if(WIN32)
 	target_include_directories(kyty_shaderlist_export PRIVATE ${inc_headers})
 endif()
 
+# The start-up CPU check (common/cpuCheck.h), linked into kyty_emulator and kyty_launcher. Compiled for
+# the x86-64 baseline whatever KYTY_MARCH is (this option comes after the global -march on the
+# command line, so it wins): the check must run on the CPUs it rejects.
+add_library(kyty_cpu_check OBJECT "${KYTY_SOURCE_DIR}/common/cpuCheck.cpp")
+target_include_directories(kyty_cpu_check PRIVATE ${KYTY_SOURCE_DIR})
+target_compile_definitions(kyty_cpu_check PRIVATE KYTY_CPU_CHECK_LEVEL=${KYTY_CPU_CHECK_LEVEL})
+if(KYTY_CLANG_CL)
+	target_compile_options(kyty_cpu_check PRIVATE "/clang:-march=x86-64" "/clang:-mtune=generic")
+elseif((CLANG OR GCC) AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+	target_compile_options(kyty_cpu_check PRIVATE "-march=x86-64" "-mtune=generic")
+endif()
+if(KYTY_CPU_CHECK_LEVEL GREATER 0)
+	message(STATUS "Start-up CPU check for x86-64-v${KYTY_CPU_CHECK_LEVEL}")
+endif()
+add_executable(cpu_check_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CpuCheckTests.cpp" $<TARGET_OBJECTS:kyty_cpu_check>)
+target_include_directories(cpu_check_tests PRIVATE ${KYTY_SOURCE_DIR})
+if(WIN32)
+	# The check itself, for x86-64-v3 in every build: it must end the program before a static
+	# initializer of another translation unit runs.
+	add_library(kyty_cpu_check_v3 OBJECT "${KYTY_SOURCE_DIR}/common/cpuCheck.cpp")
+	target_include_directories(kyty_cpu_check_v3 PRIVATE ${KYTY_SOURCE_DIR})
+	target_compile_definitions(kyty_cpu_check_v3 PRIVATE KYTY_CPU_CHECK_LEVEL=3)
+	if(KYTY_CLANG_CL)
+		target_compile_options(kyty_cpu_check_v3 PRIVATE "/clang:-march=x86-64" "/clang:-mtune=generic")
+	elseif(CLANG OR GCC)
+		target_compile_options(kyty_cpu_check_v3 PRIVATE "-march=x86-64" "-mtune=generic")
+	endif()
+	add_executable(cpu_check_startup_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CpuCheckStartupTests.cpp"
+		$<TARGET_OBJECTS:kyty_cpu_check_v3>)
+	target_link_libraries(cpu_check_startup_tests user32)
+endif()
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
@@ -1687,6 +1728,18 @@ if(BUILD_TESTING)
 	set_tests_properties(pipeline_list PROPERTIES TIMEOUT 60)
 	add_test(NAME pipeline_list_game_files COMMAND $<TARGET_FILE:pipeline_list_game_files_tests>)
 	set_tests_properties(pipeline_list_game_files PROPERTIES TIMEOUT 60)
+	add_test(NAME cpu_check COMMAND $<TARGET_FILE:cpu_check_tests>)
+	if(WIN32)
+		# Runs on a CPU with x86-64-v3 (every PC that runs the emulator's guest code natively).
+		add_test(NAME cpu_check_startup_pass COMMAND $<TARGET_FILE:cpu_check_startup_tests>)
+		set_tests_properties(cpu_check_startup_pass PROPERTIES TIMEOUT 30
+			ENVIRONMENT "KYTY_TEST_CPU_CHECK=" PASS_REGULAR_EXPRESSION "static initializer ran[\r\n]+main ran")
+		# The failure path: the message on standard error (a pipe here, so no message box), exit
+		# code 3, and neither the static initializer nor main has run.
+		add_test(NAME cpu_check_startup_fail COMMAND ${CMAKE_COMMAND} -DPROGRAM=$<TARGET_FILE:cpu_check_startup_tests>
+			-P "${KYTY_TESTS_DIR}/CpuCheckStartupFail.cmake")
+		set_tests_properties(cpu_check_startup_fail PROPERTIES TIMEOUT 30)
+	endif()
 	add_test(NAME pipeline_snapshot COMMAND $<TARGET_FILE:pipeline_snapshot_tests>)
 	set_tests_properties(pipeline_snapshot PROPERTIES TIMEOUT 30)
 	# KYTY_PIPELINE_JOURNAL: a recording run, then a run that rebuilds the journaled pipelines at
@@ -2978,7 +3031,11 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
+		cpu_check_tests
 	)
+	if(WIN32)
+		add_dependencies(kyty_tests cpu_check_startup_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
@@ -3017,6 +3074,8 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+# The start-up CPU check (common/cpuCheck.h), linked as an object file so that it is never dropped.
+target_sources(kyty_emulator PRIVATE $<TARGET_OBJECTS:kyty_cpu_check>)
 
 # Windows: the process heap (and so malloc/new) as the Segment Heap, through the executable's
 # manifest (based on chenxiao07/KytyPS5 d36975759, where the Segment Heap manifest measured level
@@ -3053,6 +3112,11 @@ install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 # applied. To use one, copy it to _Patches/<title id>.json next to the launcher (the plan the launcher
 # passes); the loader checks the title, version, process and each write's original bytes first.
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/patches/" DESTINATION patches FILES_MATCHING PATTERN "*.json")
+# Shader lists shipped with the release (KYTY_PIPELINE_LIST, docs/EXPERIMENTAL.md): the
+# emulator and the launcher's Precompile button look for PipelineLists/<title>.kyplst next to the
+# emulator. Keys and hashes only, no game code (kyty_pipeline_list verify).
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tools/PipelineLists/" DESTINATION PipelineLists
+	FILES_MATCHING PATTERN "*.kyplst")
 
 add_custom_target(kyty_touch_cursors
 	COMMAND ${CMAKE_COMMAND} -E copy_directory

@@ -13,6 +13,7 @@
 #include "mainDialog.h"
 #include "patchesDialog.h"
 #include "precompileDialog.h"
+#include "shaderListExport.h"
 #include "trophyViewerDialog.h"
 #include "wheelMappingDialog.h"
 
@@ -329,11 +330,15 @@ void ConfigurationListWidget::UpdatePrecompileButtons() {
 			running_titles.insert(item->GetInfo().title_id);
 		}
 	}
+	// The Export list buttons need kyty_pipeline_list next to the launcher (or one folder up).
+	const bool can_export =
+	    !m_runtime_directory.isEmpty() && !ShaderListExport::FindTool(QCoreApplication::applicationDirPath()).isEmpty();
 	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
 		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
 		item->SetPrecompileState(m_runtime_directory,
 		                         m_precompile_running ||
-		                             running_titles.contains(item->GetInfo().title_id));
+		                             running_titles.contains(item->GetInfo().title_id),
+		                         can_export);
 	}
 }
 
@@ -347,6 +352,29 @@ bool ConfigurationListWidget::PressPrecompile(const QString& game) {
 		}
 	}
 	return false;
+}
+
+bool ConfigurationListWidget::IsTitleRunning(const QString& title_id) const {
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		const auto* item = static_cast<const ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item->IsRunning() && item->GetInfo().title_id == title_id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+ConfigurationItem* ConfigurationListWidget::SelectGame(const QString& game) {
+	const auto key = PathKey(game);
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (!key.isEmpty() && PathKey(item->GetInfo().game_path) == key) {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			return item;
+		}
+	}
+	return nullptr;
 }
 
 bool ConfigurationListWidget::OpenContextMenu(const QString& game) {
@@ -788,6 +816,11 @@ void ConfigurationListWidget::ScanGameDirectory() {
 			m_ui->cfgs_list->setCurrentItem(item);
 			SelectItem(item);
 			emit PrecompileShaders();
+		});
+		connect(item->GetExportListButton(), &QPushButton::clicked, item, [this, item]() {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			emit ExportShaderList();
 		});
 		connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
 		        [this, item](int /*index*/) {
@@ -1372,6 +1405,9 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    menu.addAction(tr("Precompile shaders"), this, SIGNAL(PrecompileShaders()));
 	QAction* action_shader_list =
 	    menu.addAction(tr("Choose shader list..."), this, SLOT(choose_shader_list()));
+	QAction* action_export_list =
+	    menu.addAction(tr("Export shader list..."), this, SIGNAL(ExportShaderList()));
+	action_export_list->setVisible(item != nullptr && !item->GetExportListButton()->isHidden());
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));
@@ -1435,6 +1471,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		// As the row's button: not while the game or a precompile runs.
 		action_precompile->setEnabled(item->GetPrecompileButton()->isEnabled());
 		action_shader_list->setEnabled(item->GetPrecompileButton()->isEnabled());
+		action_export_list->setEnabled(item->GetExportListButton()->isEnabled());
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
@@ -1446,6 +1483,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		action_run->setDisabled(true);
 		action_precompile->setDisabled(true);
 		action_shader_list->setDisabled(true);
+		action_export_list->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
 		action_compress->setDisabled(true);

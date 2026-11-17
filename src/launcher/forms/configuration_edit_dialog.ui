@@ -351,6 +351,12 @@
               <property name="text"><string>Relaxed shader float math</string></property>
              </widget>
             </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_fast_gpu_sync">
+              <property name="toolTip"><string>Trims redundant GPU barriers (synchronisation between GPU work): KYTY_GPU_HAZARD=3, KYTY_INDIRECT_ARGS_RANGES=1, KYTY_GUEST_BARRIER_SCOPE=rel=drop, KYTY_DMA_BARRIER_BATCH=1. Gave about 1 fps in heavy Astro Bot scenes. Turn it off if graphics glitch. A value set for one of these in u59-preset.json or a title preset is kept.</string></property>
+              <property name="text"><string>Faster GPU synchronisation (experimental)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

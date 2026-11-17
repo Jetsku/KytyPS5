@@ -8,8 +8,11 @@
 #include <QColor>
 #include <QJsonObject>
 #include <QMetaEnum>
+#include <QList>
 #include <QMetaType>
 #include <QObject>
+#include <QPair>
+#include <QProcessEnvironment>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
@@ -182,6 +185,9 @@ public:
 	// A game config saved before it was per game inherits the global value when read.
 	bool                   gpu_occlusion_accurate      = false;
 	bool                   relaxed_shader_float        = false;
+	// "Faster GPU synchronisation (experimental)", per game (key fast_gpu_sync): the game starts
+	// with FastGpuSyncVariables() (ApplyFastGpuSync).
+	bool                   fast_gpu_sync               = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
@@ -235,6 +241,7 @@ public:
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		gpu_occlusion_accurate      = other.gpu_occlusion_accurate;
 		relaxed_shader_float        = other.relaxed_shader_float;
+		fast_gpu_sync               = other.fast_gpu_sync;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
@@ -283,6 +290,14 @@ public:
 	void ReadSettings(QSettings* s);
 
 	[[nodiscard]] QVariantMap GameSettings() const;
+
+	// The emulator switches of fast_gpu_sync: precise GPU hazards, ranged indirect arguments, guest
+	// release barriers dropped where nothing waits on them, batched DMA barriers.
+	[[nodiscard]] static const QList<QPair<QString, QString>>& FastGpuSyncVariables();
+	// With fast_gpu_sync, adds each of FastGpuSyncVariables() that environment does not set yet:
+	// a value from u59-preset.json, a title preset or the user's environment wins. Without it,
+	// nothing changes.
+	void ApplyFastGpuSync(QProcessEnvironment& environment) const;
 	// Call on a temporary configuration: validation can fail after loading values.
 	bool SetGameSettings(const QJsonObject& settings, QString& error);
 

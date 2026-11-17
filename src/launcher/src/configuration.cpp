@@ -50,6 +50,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(gpu_occlusion_accurate);
 	KYTY_CFG_SET(relaxed_shader_float);
+	KYTY_CFG_SET(fast_gpu_sync);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -80,6 +81,27 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(elf);
 #undef KYTY_CFG_SET
 	return values;
+}
+
+const QList<QPair<QString, QString>>& Configuration::FastGpuSyncVariables() {
+	static const QList<QPair<QString, QString>> variables {
+	    {QStringLiteral("KYTY_GPU_HAZARD"), QStringLiteral("3")},
+	    {QStringLiteral("KYTY_INDIRECT_ARGS_RANGES"), QStringLiteral("1")},
+	    {QStringLiteral("KYTY_GUEST_BARRIER_SCOPE"), QStringLiteral("rel=drop")},
+	    {QStringLiteral("KYTY_DMA_BARRIER_BATCH"), QStringLiteral("1")},
+	};
+	return variables;
+}
+
+void Configuration::ApplyFastGpuSync(QProcessEnvironment& environment) const {
+	if (!fast_gpu_sync) {
+		return;
+	}
+	for (const auto& [name, value]: FastGpuSyncVariables()) {
+		if (!environment.contains(name)) {
+			environment.insert(name, value);
+		}
+	}
 }
 
 template <class Settings>
@@ -114,6 +136,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	// Missing in configs saved while the setting was global: keep the value set before reading.
 	gpu_occlusion_accurate = s.value("gpu_occlusion_accurate", gpu_occlusion_accurate).toBool();
 	KYTY_CFG_GET(relaxed_shader_float);
+	fast_gpu_sync        = s.value("fast_gpu_sync", false).toBool();
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);

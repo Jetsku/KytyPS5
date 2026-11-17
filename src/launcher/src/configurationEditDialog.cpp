@@ -360,6 +360,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->spinBox_flush_draws->setValue(info.flush_draws);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
+	m_ui->checkBox_fast_gpu_sync->setChecked(info.fast_gpu_sync);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
@@ -616,6 +617,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.gpu_occlusion_accurate    = ui.checkBox_gpu_occlusion->isChecked();
 	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
+	info.fast_gpu_sync             = ui.checkBox_fast_gpu_sync->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();

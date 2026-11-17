@@ -8,6 +8,7 @@
 #include "gameContent.h"
 #include "precompile.h"
 #include "precompileDialog.h"
+#include "shaderListExport.h"
 #include "titleSound.h"
 #include "updateChecker.h"
 
@@ -17,8 +18,10 @@
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QLabel>
@@ -27,6 +30,9 @@
 #include <QPointer>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QProgressDialog>
+#include <QPushButton>
+#include <QUrl>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -81,6 +87,7 @@ public:
 	void FindInterpreter();
 	void Run();
 	void PrecompileShaders();
+	void ExportShaderList();
 	void SetPresetWarning(const QString& text);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
@@ -117,6 +124,8 @@ private:
 	QPointer<PrecompileDialog> m_precompile;
 	bool                       m_precompiling = false;
 	QString                    m_precompile_title; // its game: no row of it runs meanwhile
+	bool                       m_exporting = false;
+	QString                    m_export_out; // --export-list-out: the list's file instead of the default
 
 	// Running games and a running precompile.
 	int m_running_games = 0;
@@ -172,6 +181,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
 	connect(m_ui->widget, &ConfigurationListWidget::PrecompileShaders, this,
 	        &MainDialogPrivate::PrecompileShaders);
+	connect(m_ui->widget, &ConfigurationListWidget::ExportShaderList, this,
+	        &MainDialogPrivate::ExportShaderList);
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
@@ -285,6 +296,27 @@ void MainDialogPrivate::FindInterpreter() {
 			    if (!m_ui->widget->PressPrecompile(game)) {
 				    qWarning().noquote() << "--precompile: no game in the list at" << game;
 			    }
+		    },
+		    Qt::QueuedConnection);
+	}
+	// --export-list <game folder or archive> [--export-list-out <file>] (scripts, tests): as the
+	// game's Export list button, also when the button is off (the export then says why it cannot
+	// run); the result goes to the log as "export-list: ok: ..." or "export-list: failed: ...".
+	// After --precompile when both are given.
+	if (const auto at = arguments.indexOf(QStringLiteral("--export-list-out"));
+	    at >= 0 && at + 1 < arguments.size()) {
+		m_export_out = QFileInfo(arguments.at(at + 1)).absoluteFilePath();
+	}
+	if (const auto at = arguments.indexOf(QStringLiteral("--export-list"));
+	    at >= 0 && at + 1 < arguments.size()) {
+		QMetaObject::invokeMethod(
+		    this,
+		    [this, game = arguments.at(at + 1)]() {
+			    if (m_ui->widget->SelectGame(game) == nullptr) {
+				    qWarning().noquote() << "--export-list: no game in the list at" << game;
+				    return;
+			    }
+			    ExportShaderList();
 		    },
 		    Qt::QueuedConnection);
 	}
@@ -564,6 +596,13 @@ static QStringList SetupEmulatorProcess(QProcess* process, const QString& interp
 	}
 
 	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+	// The per-game "faster GPU synchronisation" checkbox: its switches go where the bundled preset,
+	// the title preset (above) or the user's environment has not set them.
+	{
+		auto environment = process->processEnvironment();
+		info.ApplyFastGpuSync(environment);
+		process->setProcessEnvironment(environment);
+	}
 	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
 	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
 	// or the user's environment still applies (the emulator default is off). It goes over the
@@ -774,6 +813,192 @@ void MainDialogPrivate::PrecompileShaders() {
 	m_precompile->show();
 
 	Update();
+}
+
+// Runs kyty_pipeline_list with a modal window that says what it does and can cancel it. The exit
+// code, or -1 when it could not be started or was cancelled; its output in `output`.
+static int RunListTool(QWidget* parent, const QString& tool, const QStringList& args, const QString& label,
+                       QString* output, bool* cancelled) {
+	QProcess process;
+	process.setProgram(tool);
+	process.setArguments(args);
+	process.setProcessChannelMode(QProcess::MergedChannels);
+	process.start(QIODevice::ReadOnly);
+	if (!process.waitForStarted(10000)) {
+		*output = process.errorString();
+		return -1;
+	}
+	QProgressDialog progress(label, QObject::tr("Cancel"), 0, 0, parent);
+	progress.setWindowTitle(QObject::tr("Export shader list"));
+	progress.setWindowModality(Qt::WindowModal);
+	progress.setMinimumDuration(0);
+	progress.setAutoClose(false);
+	progress.setAutoReset(false);
+	QEventLoop loop;
+	QObject::connect(&process, &QProcess::finished, &loop, &QEventLoop::quit);
+	QObject::connect(&progress, &QProgressDialog::canceled, &loop, [&process, cancelled]() {
+		*cancelled = true;
+		process.kill();
+	});
+	if (process.state() != QProcess::NotRunning) {
+		progress.show();
+		loop.exec();
+	}
+	process.waitForFinished(5000);
+	*output += QString::fromUtf8(process.readAll());
+	if (*cancelled || process.exitStatus() != QProcess::NormalExit) {
+		return -1;
+	}
+	return process.exitCode();
+}
+
+// The game list's Export list button: a shader list of what this player's sessions of the selected
+// game recorded (shaderListExport.h), checked for shader code before it is kept, then where it is.
+void MainDialogPrivate::ExportShaderList() {
+	if (m_update_checker->IsInstalling() || m_exporting) {
+		return;
+	}
+	QPointer<ConfigurationItem> item = m_ui->widget->GetSelectedItem();
+	if (item == nullptr) {
+		return;
+	}
+	const auto  info         = m_ui->widget->CreateConfiguration(*item);
+	const auto  emulator_dir = QFileInfo(m_interpreter).absolutePath();
+	const auto  window_title = tr("Export shader list");
+	const auto& game_name    = info->name;
+	const auto  fail         = [this, &window_title](const QString& text, QMessageBox::Icon icon = QMessageBox::Warning) {
+		qInfo().noquote() << "export-list: failed:" << text;
+		QMessageBox box(icon, window_title, text, QMessageBox::Ok, m_main_dialog);
+		box.setTextFormat(Qt::PlainText);
+		box.exec();
+	};
+
+	const auto tool = ShaderListExport::FindTool(QApplication::applicationDirPath());
+	if (tool.isEmpty()) {
+		fail(tr("kyty_pipeline_list is missing: it belongs next to the launcher. Unpack the whole release "
+		        "archive again."));
+		return;
+	}
+	if (!Precompile::IsValidGame(info->title_id, info->gameVersion)) {
+		fail(tr("%1 has no title ID, so it cannot have a shader list.").arg(game_name));
+		return;
+	}
+	if (info->basedir.isEmpty() || !QFileInfo::exists(info->basedir)) {
+		fail(tr("The game files of %1 are not found at %2.")
+		         .arg(game_name, QDir::toNativeSeparators(info->basedir)));
+		return;
+	}
+	// A running session (or a precompile) of this game still writes what it records.
+	if (item->IsRunning() || (m_precompiling && m_precompile_title == info->title_id) ||
+	    m_ui->widget->IsTitleRunning(info->title_id)) {
+		fail(tr("%1 is running, or its shaders are being precompiled. Close it first: the game is still "
+		        "writing what it records.")
+		         .arg(game_name),
+		     QMessageBox::Information);
+		return;
+	}
+	const auto journals = ShaderListExport::FindJournals(emulator_dir, info->title_id);
+	const auto nothing_recorded =
+	    tr("Nothing has been recorded for %1 yet.\n\nKyty records the shaders and pipelines a game uses while "
+	       "you play it with this launcher. Play the game for a while, close it, then export the list.")
+	        .arg(game_name);
+	if (journals.IsEmpty()) {
+		fail(nothing_recorded, QMessageBox::Information);
+		return;
+	}
+	const auto out = m_export_out.isEmpty()
+	                     ? ShaderListExport::DefaultOutput(emulator_dir, info->title_id, info->gameVersion)
+	                     : m_export_out;
+	if (!QDir().mkpath(QFileInfo(out).absolutePath())) {
+		fail(tr("Could not create the folder %1.").arg(QDir::toNativeSeparators(QFileInfo(out).absolutePath())));
+		return;
+	}
+	const auto partial = ShaderListExport::PartialPath(out);
+	QFile::remove(partial);
+	// A folder game started from another executable than eboot.bin: that one holds the shaders.
+	QString executable;
+	if (!GameContent::IsArchive(info->basedir) && !info->elf.isEmpty() && info->elf != QStringLiteral("eboot.bin")) {
+		executable = QDir(info->basedir).filePath(info->elf);
+	}
+
+	m_exporting = true;
+	struct Done {
+		bool* flag;
+		~Done() { *flag = false; }
+	} done {&m_exporting};
+	QString output;
+	bool    cancelled = false;
+	int     code      = RunListTool(m_main_dialog, tool,
+	                                ShaderListExport::ExportArguments(partial, info->basedir, executable, journals),
+	                                tr("Making the shader list of %1...").arg(game_name), &output, &cancelled);
+	ShaderListExport::Written written;
+	if (cancelled) {
+		QFile::remove(partial);
+		fail(tr("Cancelled."), QMessageBox::Information);
+		return;
+	}
+	if (code != 0 || !ShaderListExport::ParseWritten(output, &written)) {
+		QFile::remove(partial);
+		fail(tr("The export failed:\n\n%1").arg(ShaderListExport::Tail(output, 6)));
+		return;
+	}
+	if (written.shaders == 0) {
+		QFile::remove(partial);
+		fail(nothing_recorded, QMessageBox::Information);
+		return;
+	}
+	QString verify_output;
+	code = RunListTool(m_main_dialog, tool,
+	                   ShaderListExport::VerifyArguments(partial, info->basedir, executable, journals),
+	                   tr("Checking that the list holds no shader code..."), &verify_output, &cancelled);
+	if (cancelled) {
+		QFile::remove(partial);
+		fail(tr("Cancelled."), QMessageBox::Information);
+		return;
+	}
+	if (code != 0) {
+		QFile::remove(partial);
+		fail(code == 1 ? tr("The check found shader code in the list, so the list was not kept.")
+		               : tr("The list could not be checked, so it was not kept:\n\n%1")
+		                     .arg(ShaderListExport::Tail(verify_output, 6)));
+		return;
+	}
+	QString error;
+	if (!ShaderListExport::Keep(partial, out, &error)) {
+		fail(error);
+		return;
+	}
+	m_ui->widget->UpdatePrecompileButtons();
+
+	const auto native = QDir::toNativeSeparators(out);
+	qInfo().noquote() << "export-list: ok:" << native << written.shaders << "shaders" << written.permutations
+	                  << "permutations" << written.pipelines << "pipelines";
+	QMessageBox box(QMessageBox::Information, window_title,
+	                tr("The shader list of %1 is saved:\n%2\n\n%3 shaders, %4 permutations, %5 pipelines.\n\n"
+	                   "Send this one file to other players. It holds where each shader is in the game files and "
+	                   "its hashes, no game code. Do not send the _PipelineCache folder, the .journal files or any "
+	                   "game files.")
+	                    .arg(game_name, native)
+	                    .arg(written.shaders)
+	                    .arg(written.permutations)
+	                    .arg(written.pipelines),
+	                QMessageBox::Close, m_main_dialog);
+	box.setTextFormat(Qt::PlainText);
+	box.setTextInteractionFlags(Qt::TextSelectableByMouse);
+	auto* open = box.addButton(tr("Open folder"), QMessageBox::ActionRole);
+	box.setDefaultButton(open);
+	box.exec();
+	if (box.clickedButton() == open) {
+#if defined(_WIN32)
+		// explorer.exe wants the quotes after the comma: Qt would quote the whole argument.
+		QProcess explorer;
+		explorer.setProgram(QStringLiteral("explorer.exe"));
+		explorer.setNativeArguments(QStringLiteral("/select,\"%1\"").arg(native));
+		explorer.startDetached();
+#else
+		QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(out).absolutePath()));
+#endif
+	}
 }
 
 void MainDialogPrivate::Update() {

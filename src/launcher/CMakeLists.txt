@@ -18,6 +18,8 @@ add_executable(launcher WIN32
 	${launcher_src}
 	${launcher_forms}
 	resources.qrc
+	# The start-up CPU check (common/cpuCheck.h), before Qt's and the launcher's static initializers.
+	$<TARGET_OBJECTS:kyty_cpu_check>
 )
 
 
@@ -74,15 +76,29 @@ add_executable(launcher_precompile_item_tests EXCLUDE_FROM_ALL
 	src/configurationItem.cpp
 	src/gameContent.cpp
 	src/precompile.cpp
+	src/shaderListExport.cpp
 	resources.qrc
 )
 target_link_libraries(launcher_precompile_item_tests Qt6::Concurrent Qt6::Widgets common)
 target_include_directories(launcher_precompile_item_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_precompile_item_tests PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
 add_test(NAME launcher_precompile_item COMMAND $<TARGET_FILE:launcher_precompile_item_tests>)
+
+# The Export list button without its windows: tool, journals, file names, arguments, the export's
+# counts and keeping only a checked list.
+add_executable(launcher_shader_list_export_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherShaderListExportTests.cpp"
+	include/shaderListExport.h
+	src/shaderListExport.cpp
+	src/precompile.cpp
+)
+target_link_libraries(launcher_shader_list_export_tests Qt6::Core)
+target_include_directories(launcher_shader_list_export_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME launcher_shader_list_export COMMAND $<TARGET_FILE:launcher_shader_list_export_tests>)
 if(WIN32)
 	# Qt's DLLs are deployed beside the launcher only.
 	set_tests_properties(launcher_configuration launcher_precompile launcher_precompile_item
+		launcher_shader_list_export
 		PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
 endif()
 
@@ -100,6 +116,12 @@ add_custom_target(stage_updater
 	DEPENDS kyty_updater
 	VERBATIM)
 add_dependencies(launcher kyty_emulator stage_updater)
+if(WIN32)
+	# The Export list button runs kyty_pipeline_list (shaderListExport.h): built and installed with
+	# the launcher. Without it (other systems for now) the button is hidden.
+	add_dependencies(launcher kyty_pipeline_list)
+	install(TARGETS kyty_pipeline_list RUNTIME DESTINATION . OPTIONAL)
+endif()
 
 if(KYTY_CLANG_CL)
 	add_custom_command(TARGET launcher POST_BUILD

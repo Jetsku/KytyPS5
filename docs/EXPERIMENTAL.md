@@ -4,6 +4,38 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
+### int22: launcher and package
+
+- **Shader lists in the package.** `PipelineLists/PPSA21567.kyplst` (Astro Bot) and `PipelineLists/PPSA01325.kyplst`
+  (Astro's Playroom) sit next to the emulator, where the game list's **Precompile** button and the emulator look for a
+  game's list: Precompile builds the listed shaders and pipelines before the first start instead of while you play.
+  Thanks to the players on Discord who sent shader lists. The Astro Bot list is stamped for version 01.018.000 and
+  holds the lists received for 01.018 and 01.019 (the 01.019 list was matched to the 01.018 executable by shader hash);
+  the Astro Bot title preset sets `KYTY_PIPELINE_LIST_CROSS=1`, so other versions use it as well, each shader still
+  matched to the game's own executable by its hash. Astro Bot: 1,203 shaders, 1,377 permutations, 5,922 pipelines;
+  Astro's Playroom (01.905.000): 324 shaders, 373 permutations, 732 pipelines. Both pass `kyty_pipeline_list check`
+  against the game and `verify` (no shader code in the file). A list you install yourself with "Choose shader
+  list..." (`PipelineLists/<title>_<version>.kyplst`) is used before the shipped one.
+- **Export list** (below Precompile in the game list, and "Export shader list..." in the row's menu): makes a shader
+  list of what your own sessions of that game recorded (`_PipelineCache/<title>.shaders.journal` and
+  `.pipelines.journal`), checks that it holds no shader code, and saves it as
+  `ShaderListExports/<title>-<version>-shaderlist.kyplst` next to the emulator; the window names the file and opens
+  its folder. Send that one file, never the `_PipelineCache` folder, journals or game files. It runs
+  `kyty_pipeline_list.exe` (now in the package) export and verify, like the separate `kyty_shaderlist_export` window;
+  nothing is kept when either step fails. It is off while the game runs or is being precompiled, and says so when
+  nothing has been recorded yet. Scripts: `kyty_launcher --export-list <game folder or .zar> [--export-list-out
+  <file>]`. Windows only for now (the button is hidden when `kyty_pipeline_list` is not next to the launcher).
+- **Faster GPU synchronisation (experimental)**, a per-game checkbox in the game configuration (Graphics), default
+  off: starts the game with `KYTY_GPU_HAZARD=3`, `KYTY_INDIRECT_ARGS_RANGES=1`, `KYTY_GUEST_BARRIER_SCOPE=rel=drop` and
+  `KYTY_DMA_BARRIER_BATCH=1`, which trim redundant GPU barriers (about 1 fps in heavy Astro Bot scenes). Turn it off
+  if graphics glitch. A variable that `u59-preset.json` or a title preset already sets keeps that value. Saved per
+  game (`fast_gpu_sync`) and in exported game configs.
+- **CPU check at start-up.** The release is compiled for x86-64-v3 (AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT, MOVBE).
+  On an older CPU `kyty_launcher` and `kyty_emulator` now say "This build needs a CPU with AVX2, BMI2 and FMA (Intel
+  Core 4th generation / AMD Ryzen or newer)", name what the CPU lacks and exit (exit code 3) instead of crashing with
+  an illegal instruction. The check is compiled for the x86-64 baseline and runs from the C run-time's C initializer
+  table, before any other code of the program. `KYTY_TEST_CPU_CHECK=fail` shows the message on any CPU.
+
 Pre-release int16.1: int16 plus one fix.
 
 - Reverted the upstream libFont commits "font: fix glyph metrics and raster sizes" (32e9fa30) and "font: add scaled
