@@ -25,6 +25,11 @@ This release builds on the U59 renderer of the previous U59 releases.
   nothing is kept when either step fails. It is off while the game runs or is being precompiled, and says so when
   nothing has been recorded yet. Scripts: `kyty_launcher --export-list <game folder or .zar> [--export-list-out
   <file>]`. Windows only for now (the button is hidden when `kyty_pipeline_list` is not next to the launcher).
+- **Faster GPU synchronisation (experimental)**, a per-game checkbox in the game configuration (Graphics), default
+  off: starts the game with `KYTY_GPU_HAZARD=3`, `KYTY_INDIRECT_ARGS_RANGES=1`, `KYTY_GUEST_BARRIER_SCOPE=rel=drop` and
+  `KYTY_DMA_BARRIER_BATCH=1`, which trim redundant GPU barriers (about 1 fps in heavy Astro Bot scenes). Turn it off
+  if graphics glitch. A variable that `u59-preset.json` or a title preset already sets keeps that value. Saved per
+  game (`fast_gpu_sync`) and in exported game configs.
 
 Pre-release int16.1: int16 plus one fix.
 

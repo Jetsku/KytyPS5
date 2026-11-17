@@ -596,6 +596,13 @@ static QStringList SetupEmulatorProcess(QProcess* process, const QString& interp
 	}
 
 	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+	// The per-game "faster GPU synchronisation" checkbox: its switches go where the bundled preset,
+	// the title preset (above) or the user's environment has not set them.
+	{
+		auto environment = process->processEnvironment();
+		info.ApplyFastGpuSync(environment);
+		process->setProcessEnvironment(environment);
+	}
 	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
 	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
 	// or the user's environment still applies (the emulator default is off). It goes over the
