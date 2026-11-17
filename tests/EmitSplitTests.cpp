@@ -9,6 +9,9 @@
 
 #include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/renderer/commandStreamLog.h"
+#include "common/liveSwitch.h"
+
+#include <cstdlib>
 
 #include <array>
 #include <cstdint>
@@ -402,6 +405,46 @@ void TestVerifyModel() {
 	expect_field(ResolvedDrawModel::Draw, [](Draw&, P& p) { p.flags &= ~P::FlagIndexed; });
 }
 
+// KYTY_EMIT_SPLIT_COPIES: held copies travel in the next record (executed first) or are written before any
+// other packet; the replayed order equals the unheld one.
+void TestHeldCopies(bool hold) {
+	Ring             ring(1u << 20u);
+	Encoder::Options options;
+	options.verify = true;
+	Encoder     encoder(ring, options);
+	ReplayState state;
+	state.verify = true;
+	CallLog log;
+	Draw    d;
+	uint8_t dst[64] {};
+	encoder.Begin(H<vk::CommandBuffer>(1), 1, 0);
+	encoder.hostCopy(dst, 0x1000, 16);
+	encoder.hostCopy(dst + 16, 0x2000, 16);
+	Check(encoder.HeldCopies() == (hold ? 2u : 0u), "copies: held only with the switch");
+	encoder.resolvedDraw(d.Packet(), d.Arrays());
+	Check(encoder.HeldCopies() == 0, "copies: the record takes the held copies");
+	encoder.hostCopy(dst + 32, 0x3000, 8);
+	encoder.endRendering(); // another packet writes the held copy first
+	encoder.hostCopy(dst + 40, 0x4000, 8);
+	encoder.FlushHostCopies(); // a drain
+	ring.Publish();            // (non-kicking packets are published in batches)
+	Consume(ring, log, state);
+	std::vector<Op> ops;
+	for (const auto& c: log.calls) {
+		ops.push_back(c.op);
+	}
+	const std::vector<Op> expect = {Op::Begin,       Op::HostCopy,        Op::HostCopy, Op::BindVertexBuffers2,
+	                                Op::PushConstants, Op::PushDescriptorSet, Op::BindIndexBuffer, Op::BindPipeline,
+	                                Op::DrawIndexed, Op::HostCopy,        Op::EndRendering, Op::HostCopy};
+	Check(ops == expect, hold ? "copies (held): order equals the unheld order" : "copies (unheld): order");
+	if (ops != expect) {
+		for (const auto op: ops) {
+			std::printf("  replayed %s\n", OpName(op));
+		}
+	}
+	Check(state.mismatches == 0, "copies: no recorder verify mismatch");
+}
+
 void TestPublished() {
 	ResolvedDrawStats stats;
 	ResolvedDrawStats published;
@@ -424,6 +467,10 @@ int main() {
 	TestShadow();
 	TestVerifyModel();
 	TestPublished();
+	TestHeldCopies(false);
+	_putenv("KYTY_EMIT_SPLIT_COPIES=1");
+	Check(Live::ReloadFromEnvironment("KYTY_EMIT_SPLIT_COPIES"), "copies: switch registered");
+	TestHeldCopies(true);
 	if (g_failures == 0) {
 		std::printf("emit_split_tests: all passed\n");
 	}

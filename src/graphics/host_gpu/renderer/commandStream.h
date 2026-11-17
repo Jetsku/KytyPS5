@@ -400,6 +400,8 @@ struct WriteBufferMarkerPacket {
 //   pushConstants(layout, objprim_stages, objprim_offset, 4, &object_id)    (FlagObjprim)
 //   drawIndexed(count, instance_count, 0, vertex_offset, first_instance)    (FlagIndexed)
 //   or draw(count, instance_count, first_vertex, first_instance)
+// KYTY_EMIT_SPLIT_COPIES: the deferred stream copies (HostCopy) the encoder held back since its last
+// packet travel in the record and run first, in their order (HostCopyPacket[copy_count] first).
 // Arrays after the fixed part, each 8-byte aligned: vk::Buffer[vertex_count],
 // vk::DeviceSize[vertex_count] offsets and sizes, DescriptorWriteRecord[write_count],
 // DescriptorInfo[info_count], uint32_t[ResolvedDrawPushDwords] (FlagPushData), uint32_t[clip_bytes/4].
@@ -448,7 +450,7 @@ struct ResolvedDrawPacket {
 	int32_t            vertex_offset  = 0;
 	uint32_t           first_vertex   = 0;
 	uint32_t           first_instance = 0;
-	uint32_t           pad            = 0;
+	uint32_t           copy_count     = 0; // HostCopyPacket[] first among the arrays (set by the encoder)
 };
 // The arrays of a resolved draw (producer side; null when the count is 0 or the flag is clear).
 struct ResolvedDrawArrays {
@@ -856,6 +858,22 @@ public:
 	void insertDebugLabel(const char* name);
 	// KYTY_EMIT_SPLIT: one resolved draw (ResolvedDrawPacket); kicks the consumer like a draw.
 	void resolvedDraw(const ResolvedDrawPacket& packet, const ResolvedDrawArrays& arrays);
+	// The same in two steps: open writes everything but the infos and the push data (arrays.infos and
+	// arrays.push are not read) and returns where they go; the caller fills them, then closes. Nothing
+	// else may be encoded in between.
+	struct ResolvedDrawSlots {
+		DescriptorInfo* infos = nullptr;
+		uint32_t*       push  = nullptr; // null without FlagPushData
+	};
+	[[nodiscard]] ResolvedDrawSlots openResolvedDraw(const ResolvedDrawPacket& packet, const ResolvedDrawArrays& arrays);
+	void                            closeResolvedDraw();
+	// KYTY_EMIT_SPLIT_COPIES (live, default 0): hostCopy holds its copy back (up to MaxHeldCopies); the
+	// next resolved draw carries the held copies, any other packet first writes them as HostCopy
+	// packets, so their order against every other packet is unchanged. Whoever waits for the consumer
+	// to have executed everything encoded (a drain) flushes first.
+	static constexpr uint32_t MaxHeldCopies = 16;
+	void                      FlushHostCopies();
+	[[nodiscard]] uint32_t    HeldCopies() const noexcept { return m_copy_count; }
 	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
 	                          uint32_t marker);
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
@@ -884,6 +902,14 @@ private:
 	uint64_t  m_cb_digest  = 0;
 	uint64_t  m_cb_packets = 0;
 	uint32_t  m_kick_skipped = 0; // KYTY_RING_KICK_EVERY
+	std::array<HostCopyPacket, MaxHeldCopies> m_copies {};
+	uint32_t                                  m_copy_count = 0;
+	bool                                      m_rd_open    = false;
+	uint8_t*                                  m_rd_base    = nullptr;
+	uint32_t                                  m_rd_size    = 0;
+	uint32_t                                  m_rd_start   = 0;
+	VerifyBlock*                              m_rd_verify  = nullptr;
+	void EmitHostCopy(const HostCopyPacket& copy);
 	void (*m_open_hook)(void* context) = nullptr;
 	void* m_open_hook_context          = nullptr;
 };

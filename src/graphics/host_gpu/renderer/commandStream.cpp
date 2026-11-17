@@ -929,7 +929,20 @@ static Live::Switch g_ring_kick_every("KYTY_RING_KICK_EVERY", [](const char* val
 	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 4096) : 0;
 });
 
+static Live::Switch g_emit_split_copies("KYTY_EMIT_SPLIT_COPIES", Live::ParseDefaultOff);
+
+void Encoder::FlushHostCopies() {
+	const auto count = m_copy_count;
+	m_copy_count     = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		EmitHostCopy(m_copies[i]);
+	}
+}
+
 Encoder::Writer Encoder::Open(Op op, uint64_t payload, bool barrier) {
+	if (m_copy_count != 0 && op != Op::ResolvedDraw) [[unlikely]] {
+		FlushHostCopies();
+	}
 	if (m_open_hook != nullptr) [[unlikely]] {
 		const auto hook = m_open_hook;
 		m_open_hook     = nullptr;
@@ -993,6 +1006,7 @@ void Encoder::Close(Writer& writer, uint64_t hash) {
 }
 
 uint64_t Encoder::Splice(Ring& source, uint64_t end) {
+	FlushHostCopies();
 	uint64_t appended = 0;
 	while (source.ReadPosition() < end) {
 		const auto* header = source.Peek();
@@ -1304,25 +1318,58 @@ void Encoder::bindVertexBuffers2(uint32_t first, uint32_t count, const vk::Buffe
 	             : 0);
 }
 
-void Encoder::resolvedDraw(const ResolvedDrawPacket& packet, const ResolvedDrawArrays& arrays) {
-	using P                 = ResolvedDrawPacket;
-	const uint64_t push     = (packet.flags & P::FlagPushData) != 0 ? ResolvedDrawPushDwords : 0u;
-	const uint64_t payload  = Sz<ResolvedDrawPacket>() + 3u * Arr<uint64_t>(packet.vertex_count) +
+void Encoder::resolvedDraw(const ResolvedDrawPacket& packet_in, const ResolvedDrawArrays& arrays) {
+	const auto slots = openResolvedDraw(packet_in, arrays);
+	if (packet_in.info_count != 0) {
+		std::memcpy(slots.infos, arrays.infos, sizeof(DescriptorInfo) * packet_in.info_count);
+	}
+	if (slots.push != nullptr) {
+		std::memcpy(slots.push, arrays.push, sizeof(uint32_t) * ResolvedDrawPushDwords);
+	}
+	closeResolvedDraw();
+}
+
+Encoder::ResolvedDrawSlots Encoder::openResolvedDraw(const ResolvedDrawPacket& packet_in, const ResolvedDrawArrays& arrays) {
+	using P = ResolvedDrawPacket;
+	EXIT_IF(m_rd_open);
+	if ((packet_in.flags & P::FlagVerifyOnly) != 0) {
+		FlushHostCopies(); // a verify-only record executes nothing
+	}
+	ResolvedDrawPacket packet = packet_in;
+	packet.copy_count         = m_copy_count;
+	m_copy_count              = 0;
+	const uint64_t push       = (packet.flags & P::FlagPushData) != 0 ? ResolvedDrawPushDwords : 0u;
+	const uint64_t payload    = Sz<ResolvedDrawPacket>() + Arr<HostCopyPacket>(packet.copy_count) +
+	                         3u * Arr<uint64_t>(packet.vertex_count) +
 	                         Arr<DescriptorWriteRecord>(packet.write_count) + Arr<DescriptorInfo>(packet.info_count) +
 	                         Arr<uint32_t>(push) + Arr<uint8_t>(packet.clip_bytes);
 	auto           w        = Open(Op::ResolvedDraw, payload, false);
 	const auto     start    = w.Offset();
 	w.Put(packet);
+	w.PutArray(m_copies.data(), packet.copy_count);
 	w.PutArray(arrays.vertex_buffers, packet.vertex_count);
 	w.PutArray(arrays.vertex_offsets, packet.vertex_count);
 	w.PutArray(arrays.vertex_sizes, packet.vertex_count);
 	w.PutArray(arrays.writes, packet.write_count);
-	w.PutArray(arrays.infos, packet.info_count);
-	w.PutArray(arrays.push, push);
+	ResolvedDrawSlots slots;
+	slots.infos = reinterpret_cast<DescriptorInfo*>(w.Cursor());
+	w.Skip(sizeof(DescriptorInfo) * packet.info_count);
+	slots.push = push != 0 ? reinterpret_cast<uint32_t*>(w.Cursor()) : nullptr;
+	w.Skip(sizeof(uint32_t) * push);
 	w.PutArray(reinterpret_cast<const uint8_t*>(arrays.clip), packet.clip_bytes);
-	Close(w, m_options.verify
-	             ? VerifyHash::ResolvedDraw(reinterpret_cast<const uint8_t*>(w.GetHeader()) + start, w.Offset() - start)
-	             : 0);
+	m_rd_open    = true;
+	m_rd_base    = reinterpret_cast<uint8_t*>(w.GetHeader());
+	m_rd_size    = w.Size();
+	m_rd_start   = start;
+	m_rd_verify  = w.Verify();
+	return slots;
+}
+
+void Encoder::closeResolvedDraw() {
+	EXIT_IF(!m_rd_open);
+	m_rd_open = false;
+	Writer w(m_rd_base, m_rd_size, m_rd_size, m_rd_verify);
+	Close(w, m_options.verify ? VerifyHash::ResolvedDraw(m_rd_base + m_rd_start, m_rd_size - m_rd_start) : 0);
 }
 
 void Encoder::bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) {
@@ -1571,10 +1618,18 @@ void Encoder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool,
 }
 
 void Encoder::hostCopy(void* destination, uint64_t source, uint64_t size) {
-	const auto destination_bits = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination));
-	auto       w                = Open(Op::HostCopy, Sz<HostCopyPacket>(), false);
-	w.Put(HostCopyPacket {destination_bits, source, size});
-	Close(w, m_options.verify ? VerifyHash::Value(Op::HostCopy, destination_bits, source, size) : 0);
+	const HostCopyPacket copy {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(destination)), source, size};
+	if (g_emit_split_copies.Get() != 0 && m_copy_count < MaxHeldCopies) {
+		m_copies[m_copy_count++] = copy;
+		return;
+	}
+	EmitHostCopy(copy);
+}
+
+void Encoder::EmitHostCopy(const HostCopyPacket& copy) {
+	auto w = Open(Op::HostCopy, Sz<HostCopyPacket>(), false);
+	w.Put(copy);
+	Close(w, m_options.verify ? VerifyHash::Value(Op::HostCopy, copy.destination, copy.source, copy.size) : 0);
 }
 
 void Encoder::insertDebugLabel(const char* name) {

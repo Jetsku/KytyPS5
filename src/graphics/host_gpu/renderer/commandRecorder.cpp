@@ -683,6 +683,8 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,
 	                         HangWatchdog::Enabled() ? m_ring.Consumed() : 0);
 	const auto start = NowNs();
+	// KYTY_EMIT_SPLIT_COPIES: copies held back by the encoder are part of what the drain waits for.
+	m_encoder.FlushHostCopies();
 	// Idle: the recorder released everything encoded (published or not), so it executed every
 	// packet and records nothing until the next one. The window opens without a marker and
 	// without waking a parked recorder (the consumer's seq_cst release of the position orders its

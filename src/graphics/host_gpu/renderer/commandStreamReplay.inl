@@ -778,6 +778,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 		case Op::ResolvedDraw: {
 			const auto  start  = reader.Offset();
 			const auto& p      = reader.Get<ResolvedDrawPacket>();
+			const auto* copies = reader.GetArray<HostCopyPacket>(p.copy_count);
 			const auto* vb     = reader.GetArray<vk::Buffer>(p.vertex_count);
 			const auto* vo     = reader.GetArray<vk::DeviceSize>(p.vertex_count);
 			const auto* vs     = reader.GetArray<vk::DeviceSize>(p.vertex_count);
@@ -792,6 +793,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			if ((p.flags & ResolvedDrawPacket::FlagVerifyOnly) != 0) {
 				Detail::CheckResolvedDraw(state, p, vb, vo, vs, writes, infos, push, clip);
 			} else {
+				for (uint32_t i = 0; i < p.copy_count; i++) {
+					exec.hostCopy(reinterpret_cast<void*>(static_cast<uintptr_t>(copies[i].destination)), copies[i].source,
+					              copies[i].size);
+				}
 				Detail::ExpandResolvedDraw(exec, state, p, vb, vo, vs, writes, infos, push, clip);
 			}
 			break;

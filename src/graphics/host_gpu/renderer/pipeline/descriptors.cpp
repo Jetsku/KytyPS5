@@ -7140,6 +7140,10 @@ bool RenderExecutor::EmitSplitPrepare(const CommandBuffer& buffer, const Pipelin
 	return true;
 }
 
+// KYTY_EMIT_SPLIT_DIRECT (live, default 0): the record's buffer infos and push data are written straight
+// into the ring packet (Encoder::openResolvedDraw) instead of into a staging copy first.
+static Live::Switch g_emit_split_direct("KYTY_EMIT_SPLIT_DIRECT", Live::ParseDefaultOff);
+
 void RenderExecutor::EmitSplitWrite(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
                                     std::span<PreparedBindings* const> stages, CommandStream::ResolvedDrawPacket& packet,
                                     const CommandStream::ResolvedDrawArrays& arrays_in, bool verify_only) {
@@ -7151,65 +7155,17 @@ void RenderExecutor::EmitSplitWrite(CommandBuffer& buffer, const PipelineCache::
 	if (t.env) {
 		env = MakeDescriptorEnv(stages);
 	}
-	const auto uniform_range = t.uniform_range;
-	bool       fresh         = false;
+	bool fresh = false;
 	for (const auto* prepared: stages) {
 		fresh |= prepared->fresh_upload;
 	}
-	auto* infos = reinterpret_cast<vk::DescriptorBufferInfo*>(es.infos.data());
-	for (uint32_t i = 0; i < t.info_count; i++) {
-		const auto& source      = t.sources[i];
-		const auto& descriptors = *stages[source.stage];
-		auto&       out         = infos[i];
-		switch (source.kind) {
-			case Src::Buffer:
-				out = descriptors.buffers.at(source.resource);
-				EXIT_IF(out.buffer == nullptr);
-				break;
-			case Src::Uniform:
-				out = descriptors.buffers.at(source.resource);
-				EXIT_IF(out.buffer == nullptr);
-				out.range = std::min(out.range, uniform_range);
-				break;
-			case Src::Bda: out = env.bda_page_table; break;
-			case Src::Fault: out = env.fault_buffer; break;
-			case Src::Mip: out = descriptors.mip_stats_canary ? env.mip_canary : env.mip_counters; break;
-			case Src::Srt:
-			case Src::ShaderData:
-				out = source.kind == Src::Srt ? descriptors.flattened_srt : descriptors.shader_data_buffer;
-				EXIT_IF(out.buffer == nullptr);
-				if (t.srt_uniform) {
-					// KYTY_SRT_UNIFORM: at most the uniform array the shader declares.
-					out.range = std::min<vk::DeviceSize>(out.range, uniform_range);
-				}
-				break;
-			case Src::Shared:
-				out = descriptors.shared_memory;
-				EXIT_IF(out.buffer == nullptr);
-				break;
-			case Src::Gds:
-				out = descriptors.gds;
-				EXIT_IF(out.buffer == nullptr);
-				break;
-		}
-	}
 	const bool has_push = t.push_count != 0;
-	if (has_push) {
-		es.push.fill(0);
-		for (uint32_t i = 0; i < t.push_count; i++) {
-			const auto& copy     = t.push[i];
-			const auto& prepared = *stages[copy.stage];
-			EXIT_IF(prepared.shader_data.size() != prepared.runtime->program->bindings.ShaderDataDwords() ||
-			        copy.start + prepared.shader_data.size() > es.push.size());
-			std::copy(prepared.shader_data.begin(), prepared.shader_data.end(), es.push.begin() + copy.start);
-		}
-	}
-	const auto flags = CommandBuffer::EncodeFlags();
-	packet.layout      = pipeline.pipeline_layout;
-	packet.pipeline    = pipeline.pipeline;
-	packet.write_count = t.write_count;
-	packet.info_count  = t.info_count;
-	packet.push_stages = t.push_stages;
+	const auto flags    = CommandBuffer::EncodeFlags();
+	packet.layout       = pipeline.pipeline_layout;
+	packet.pipeline     = pipeline.pipeline;
+	packet.write_count  = t.write_count;
+	packet.info_count   = t.info_count;
+	packet.push_stages  = t.push_stages;
 	packet.flags |= (has_push ? P::FlagPushData : 0u) | (t.write_count != 0 ? P::FlagPush : 0u) |
 	                (PushShadowFreshSkipEnabled() && fresh ? P::FlagKnownMiss : 0u) |
 	                (flags.renderer_batch ? P::FlagPushDedup : 0u) | (flags.push_constant_shadow ? P::FlagConstDedup : 0u);
@@ -7242,19 +7198,83 @@ void RenderExecutor::EmitSplitWrite(CommandBuffer& buffer, const PipelineCache::
 	}
 	auto arrays   = arrays_in;
 	arrays.writes = t.writes.data();
-	arrays.infos  = es.infos.data();
-	arrays.push   = has_push ? es.push.data() : nullptr;
-	if (auto* encoder = buffer.StreamEncoder(); encoder != nullptr) [[likely]] {
-		encoder->resolvedDraw(packet, arrays);
-	} else if (!verify_only) {
-		// A direct window opened after EmitSplitPrepare (none is known to): the same commands, natively,
-		// without a shadow (FlagShadowReset is pending for the next record: the window set it).
-		CommandStream::ReplayState native;
-		auto                       sink = buffer.StateSink();
-		CommandStream::Detail::ExpandResolvedDraw(sink, native, packet, arrays.vertex_buffers, arrays.vertex_offsets,
-		                                          arrays.vertex_sizes, arrays.writes, arrays.infos, arrays.push,
-		                                          arrays.clip);
-		es.native++;
+	auto* encoder = buffer.StreamEncoder();
+	// Where the infos and the push data go: the ring packet (direct) or the staging arrays.
+	const bool direct = encoder != nullptr && !verify_only && g_emit_split_direct.On();
+	CommandStream::Encoder::ResolvedDrawSlots slots;
+	if (direct) {
+		slots = encoder->openResolvedDraw(packet, arrays);
+	} else {
+		slots.infos = es.infos.data();
+		slots.push  = has_push ? es.push.data() : nullptr;
+	}
+	auto*      infos         = reinterpret_cast<vk::DescriptorBufferInfo*>(slots.infos);
+	const auto uniform_range = t.uniform_range;
+	for (uint32_t i = 0; i < t.info_count; i++) {
+		const auto&              source      = t.sources[i];
+		const auto&              descriptors = *stages[source.stage];
+		vk::DescriptorBufferInfo out;
+		switch (source.kind) {
+			case Src::Buffer:
+				out = descriptors.buffers.at(source.resource);
+				EXIT_IF(out.buffer == nullptr);
+				break;
+			case Src::Uniform:
+				out = descriptors.buffers.at(source.resource);
+				EXIT_IF(out.buffer == nullptr);
+				out.range = std::min(out.range, uniform_range);
+				break;
+			case Src::Bda: out = env.bda_page_table; break;
+			case Src::Fault: out = env.fault_buffer; break;
+			case Src::Mip: out = descriptors.mip_stats_canary ? env.mip_canary : env.mip_counters; break;
+			case Src::Srt:
+			case Src::ShaderData:
+				out = source.kind == Src::Srt ? descriptors.flattened_srt : descriptors.shader_data_buffer;
+				EXIT_IF(out.buffer == nullptr);
+				if (t.srt_uniform) {
+					// KYTY_SRT_UNIFORM: at most the uniform array the shader declares.
+					out.range = std::min<vk::DeviceSize>(out.range, uniform_range);
+				}
+				break;
+			case Src::Shared:
+				out = descriptors.shared_memory;
+				EXIT_IF(out.buffer == nullptr);
+				break;
+			case Src::Gds:
+				out = descriptors.gds;
+				EXIT_IF(out.buffer == nullptr);
+				break;
+		}
+		std::memcpy(infos + i, &out, sizeof(out));
+	}
+	if (has_push) {
+		uint32_t* push = slots.push;
+		std::memset(push, 0, sizeof(uint32_t) * CommandStream::ResolvedDrawPushDwords);
+		for (uint32_t i = 0; i < t.push_count; i++) {
+			const auto& copy     = t.push[i];
+			const auto& prepared = *stages[copy.stage];
+			EXIT_IF(prepared.shader_data.size() != prepared.runtime->program->bindings.ShaderDataDwords() ||
+			        copy.start + prepared.shader_data.size() > CommandStream::ResolvedDrawPushDwords);
+			std::memcpy(push + copy.start, prepared.shader_data.data(), sizeof(uint32_t) * prepared.shader_data.size());
+		}
+	}
+	if (direct) {
+		encoder->closeResolvedDraw();
+	} else {
+		arrays.infos = es.infos.data();
+		arrays.push  = has_push ? es.push.data() : nullptr;
+		if (encoder != nullptr) [[likely]] {
+			encoder->resolvedDraw(packet, arrays);
+		} else if (!verify_only) {
+			// A direct window opened after EmitSplitPrepare (none is known to): the same commands,
+			// natively, without a shadow (FlagShadowReset is pending for the next record: the window set it).
+			CommandStream::ReplayState native;
+			auto                       sink = buffer.StateSink();
+			CommandStream::Detail::ExpandResolvedDraw(sink, native, packet, arrays.vertex_buffers,
+			                                          arrays.vertex_offsets, arrays.vertex_sizes, arrays.writes,
+			                                          arrays.infos, arrays.push, arrays.clip);
+			es.native++;
+		}
 	}
 	if ((es.prepared & 0xffffu) == 1) {
 		EmitSplitReport();
