@@ -366,16 +366,26 @@ From int5 (`u59-windows-20261003-int5`):
 
 ## Measured
 
-Astro Bot (PPSA21567); RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a 120 Hz vblank; warm program caches; the
-bundled preset. This release was checked with single timed runs, not with an alternating comparison:
+Astro Bot (PPSA21567, 01.018) and Astro's Playroom (PPSA01325); RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a
+120 Hz vblank; warm caches; the release presets; int21 and this build booted in turn, one boot each per scene, with
+the desktop in use (a browser playing video costs 5-10 fps here), so read the pairs, not the absolute numbers:
 
-- Sky Garden start view: 35.2 fps with a local build of this release (int7: 33-35 fps in earlier runs).
-- Creamy Canyon start view: 21.3 fps with a local build before the last compatibility merge (int7: 21.7-22.2 fps).
-  The RTX 50 fix costs about 2% there (21.7 vs 22.2 fps when it was compared alone against int7, alternating
-  launches); that scene is limited by the command processor.
-- With the AMD CPU patch (`--amd-cpu`), Sky Garden: 31.6 fps (int7 with the patch: 18.9 fps).
-- Demon's Souls boots to its menu with the preset (Language Select at 60 fps).
-- With int5, batched occlusion queries took the Creamy Canyon start view from 8.3 to 22.0 fps.
+| Scene | int21 | int22 |
+|---|---|---|
+| Astro Bot, Sky Garden, no game patches | 50.5 fps | 55.2 fps (+9%) |
+| Astro Bot, pirate island, no game patches | 51.9 fps | 53.3 fps (+3%) |
+| Astro Bot, sponge, no game patches | 40.8 fps | 53.0 fps (+30%) |
+| Astro Bot, Sky Garden, three patch mods | 55.9 fps | 64.0 fps (+15%) |
+| Astro Bot, pirate island, three patch mods | 53.2 fps | 55.8 fps (+5%) |
+| Astro Bot, sponge, three patch mods | 42.7 fps | 57.4 fps (+34%) |
+| Astro's Playroom, CPU Plaza | 71.8 fps | 76.7 fps (+7%) |
+| Astro's Playroom, GPU Jungle | 71.9 fps | 71.0 fps (-1%) |
+
+The three patch mods are our own test patches (non-tiled renderer, GI probes off, fixed 1080p); no game patches are
+part of the release for Astro Bot or Astro's Playroom. Other games were only checked for starting: Gran Turismo 7
+reaches its title menu (44 fps), Spider-Man: Miles Morales the game (2-5 fps while its ray-tracing shaders compile),
+Demon's Souls its first screen (60 fps), Ratchet & Clank: Rift Apart its title screen (19-20 fps), Beyond Good & Evil
+20th Anniversary its main menu (60 fps), and Ghost of Yotei loads a save into the first village.
 
 ## Launching
 
