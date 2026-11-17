@@ -6,6 +6,16 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ### int22: launcher and package
 
+- **Shader lists in the package.** `PipelineLists/PPSA21567.kyplst` (Astro Bot) and `PipelineLists/PPSA01325.kyplst`
+  (Astro's Playroom) sit next to the emulator, where the game list's **Precompile** button and the emulator look for a
+  game's list: Precompile builds the listed shaders and pipelines before the first start instead of while you play.
+  Thanks to the players on Discord who sent shader lists. The Astro Bot list is stamped for version 01.018.000 and
+  holds the lists received for 01.018 and 01.019 (the 01.019 list was matched to the 01.018 executable by shader hash);
+  the Astro Bot title preset sets `KYTY_PIPELINE_LIST_CROSS=1`, so other versions use it as well, each shader still
+  matched to the game's own executable by its hash. Astro Bot: 1,203 shaders, 1,377 permutations, 5,922 pipelines;
+  Astro's Playroom (01.905.000): 324 shaders, 373 permutations, 732 pipelines. Both pass `kyty_pipeline_list check`
+  against the game and `verify` (no shader code in the file). A list you install yourself with "Choose shader
+  list..." (`PipelineLists/<title>_<version>.kyplst`) is used before the shipped one.
 - **Export list** (below Precompile in the game list, and "Export shader list..." in the row's menu): makes a shader
   list of what your own sessions of that game recorded (`_PipelineCache/<title>.shaders.journal` and
   `.pipelines.journal`), checks that it holds no shader code, and saves it as

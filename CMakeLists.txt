@@ -3053,6 +3053,11 @@ install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 # applied. To use one, copy it to _Patches/<title id>.json next to the launcher (the plan the launcher
 # passes); the loader checks the title, version, process and each write's original bytes first.
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/patches/" DESTINATION patches FILES_MATCHING PATTERN "*.json")
+# Shader lists shipped with the release (KYTY_PIPELINE_LIST, docs/EXPERIMENTAL.md): the
+# emulator and the launcher's Precompile button look for PipelineLists/<title>.kyplst next to the
+# emulator. Keys and hashes only, no game code (kyty_pipeline_list verify).
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tools/PipelineLists/" DESTINATION PipelineLists
+	FILES_MATCHING PATTERN "*.kyplst")
 
 add_custom_target(kyty_touch_cursors
 	COMMAND ${CMAKE_COMMAND} -E copy_directory

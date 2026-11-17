@@ -28,5 +28,6 @@
   "KYTY_SMALL_CPU_RULE": "1",
   "KYTY_F32_FLUSH_HOST": "nvidia",
   "KYTY_LDS_SLOTS": "nvidia",
-  "KYTY_VS_FULL_WAVE": "nvidia"
+  "KYTY_VS_FULL_WAVE": "nvidia",
+  "KYTY_PIPELINE_LIST_CROSS": "1"
 }

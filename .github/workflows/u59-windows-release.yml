@@ -162,8 +162,9 @@ jobs:
           Get-ChildItem -Path 'tools' -Filter 'u59-preset.*.json' | Copy-Item -Destination $release
           # Default game patch plans (_Patches\<TITLE_ID>.json next to the launcher), e.g. Ghost of Yotei's 1080p patch.
           Copy-Item -LiteralPath 'tools/_Patches' -Destination (Join-Path $release '_Patches') -Recurse
-          # The launcher's Export list button runs kyty_pipeline_list.exe (cmake --install puts it there).
-          foreach ($file in 'kyty_pipeline_list.exe') {
+          # The launcher's Export list button runs kyty_pipeline_list.exe; the shipped shader lists
+          # (tools/PipelineLists) are what its Precompile button finds. Both come from cmake --install.
+          foreach ($file in 'kyty_pipeline_list.exe', 'PipelineLists/PPSA21567.kyplst', 'PipelineLists/PPSA01325.kyplst') {
             if (-not (Test-Path -LiteralPath (Join-Path $release $file))) { throw "$file is missing from the package." }
           }
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
