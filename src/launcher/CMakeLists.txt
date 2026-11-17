@@ -18,6 +18,8 @@ add_executable(launcher WIN32
 	${launcher_src}
 	${launcher_forms}
 	resources.qrc
+	# The start-up CPU check (common/cpuCheck.h), before Qt's and the launcher's static initializers.
+	$<TARGET_OBJECTS:kyty_cpu_check>
 )
 
 

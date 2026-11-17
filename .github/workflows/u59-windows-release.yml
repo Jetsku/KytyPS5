@@ -93,6 +93,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
             -DKYTY_CP_DIAGNOSTICS=OFF ^
+            -DKYTY_MARCH=x86-64-v3 ^
             -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^

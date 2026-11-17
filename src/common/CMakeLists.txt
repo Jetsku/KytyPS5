@@ -3,6 +3,8 @@ file(GLOB common_src CONFIGURE_DEPENDS
 	"logging/*.cpp"
 	"platform/*.cpp"
 )
+# The start-up CPU check is its own baseline-compiled object (kyty_cpu_check, top-level CMakeLists.txt).
+list(FILTER common_src EXCLUDE REGEX "/cpuCheck\\.cpp$")
 
 file(GLOB_RECURSE common_headers CONFIGURE_DEPENDS "*.h")
 

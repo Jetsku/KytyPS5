@@ -30,6 +30,11 @@ This release builds on the U59 renderer of the previous U59 releases.
   `KYTY_DMA_BARRIER_BATCH=1`, which trim redundant GPU barriers (about 1 fps in heavy Astro Bot scenes). Turn it off
   if graphics glitch. A variable that `u59-preset.json` or a title preset already sets keeps that value. Saved per
   game (`fast_gpu_sync`) and in exported game configs.
+- **CPU check at start-up.** The release is compiled for x86-64-v3 (AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT, MOVBE).
+  On an older CPU `kyty_launcher` and `kyty_emulator` now say "This build needs a CPU with AVX2, BMI2 and FMA (Intel
+  Core 4th generation / AMD Ryzen or newer)", name what the CPU lacks and exit (exit code 3) instead of crashing with
+  an illegal instruction. The check is compiled for the x86-64 baseline and runs from the C run-time's C initializer
+  table, before any other code of the program. `KYTY_TEST_CPU_CHECK=fail` shows the message on any CPU.
 
 Pre-release int16.1: int16 plus one fix.
 
