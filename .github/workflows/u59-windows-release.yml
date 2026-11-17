@@ -87,7 +87,7 @@ jobs:
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
-          set PGO_PROFILE=C:/kyty-src19/tools/pgo/u59-int21-1.profdata
+          set PGO_PROFILE=C:/kyty-src19/tools/pgo/u59-int22-1.profdata
           cmake -S C:\kyty-src19 -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
