@@ -113,6 +113,33 @@ int main(int argc, char** argv) {
 	item->SetPrecompileState(emulator.path(), false);
 	Check(button->isEnabled(), "and its end turns it on again");
 
+	// The Export list button below Precompile: hidden without kyty_pipeline_list, on while the game
+	// does not run, its tooltip says whether anything was recorded.
+	auto* export_button = item->GetExportListButton();
+	Check(export_button != nullptr && export_button->text() == QStringLiteral("Export list") &&
+	          list->itemWidget(item, GAME_PRECOMPILE_COLUMN)->isAncestorOf(export_button),
+	      "the row has an Export list button in the Precompile column");
+	Check(export_button->isHidden(), "no tool: the button is hidden");
+	item->SetPrecompileState(emulator.path(), false, true);
+	Check(!export_button->isHidden() && export_button->isEnabled(), "with the tool the button is shown and on");
+	Check(export_button->toolTip().contains(QStringLiteral("Nothing has been recorded")), "nothing recorded yet");
+	const auto cache = QDir(emulator.path()).filePath(QStringLiteral("_PipelineCache"));
+	Check(QDir().mkpath(cache), "cannot create _PipelineCache");
+	for (const auto* name: {"PPSA00001.shaders.journal", "PPSA00001.pipelines.journal"}) {
+		QFile journal(QDir(cache).filePath(QLatin1String(name)));
+		Check(journal.open(QIODevice::WriteOnly) && journal.write("journal", 7) == 7, "cannot write a journal");
+	}
+	item->SetPrecompileState(emulator.path(), false, true);
+	Check(export_button->toolTip().contains(QStringLiteral("PPSA00001-01.000.000-shaderlist.kyplst")),
+	      "with journals the tooltip names the file the list goes to");
+	item->SetRunning(true);
+	Check(!export_button->isEnabled(), "off while the game runs");
+	item->SetRunning(false);
+	item->SetPrecompileState(emulator.path(), true, true);
+	Check(!export_button->isEnabled(), "off while a precompile runs");
+	item->SetPrecompileState(emulator.path(), false, true);
+	Check(export_button->isEnabled(), "on again");
+
 	auto* untitled = new ConfigurationItem(Game(game_folder.path(), {}, version), list);
 	untitled->SetPrecompileState(emulator.path(), false);
 	Check(!untitled->GetPrecompileButton()->isEnabled() &&

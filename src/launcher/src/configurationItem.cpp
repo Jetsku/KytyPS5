@@ -4,6 +4,7 @@
 #include "gameContent.h"
 #include "gameViews.h"
 #include "precompile.h"
+#include "shaderListExport.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -23,6 +24,7 @@
 #include <QStringList>
 #include <QStyle>
 #include <QTreeWidget>
+#include <QVBoxLayout>
 #include <QVersionNumber>
 #include <QWheelEvent>
 #include <QWidget>
@@ -127,15 +129,23 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
     : QTreeWidgetItem(parent), m_info(std::move(info)) {
 	setSizeHint(NameColumn, QSize(0, 72));
 
-	// A button of its natural height in the middle of the row.
+	// Buttons of their natural height in the middle of the row, one above the other.
 	m_precompile_widget = new QWidget(parent);
 	MakeTransparent(m_precompile_widget);
-	auto* precompile_layout = new QHBoxLayout(m_precompile_widget);
+	auto* precompile_layout = new QVBoxLayout(m_precompile_widget);
 	precompile_layout->setContentsMargins(6, 0, 6, 0);
+	precompile_layout->setSpacing(4);
+	precompile_layout->addStretch(1);
 	m_precompile_button = new QPushButton(QStringLiteral("Precompile"), m_precompile_widget);
 	m_precompile_button->setObjectName(QStringLiteral("game_precompile_button"));
 	m_precompile_button->setFocusPolicy(Qt::NoFocus);
-	precompile_layout->addWidget(m_precompile_button, 0, Qt::AlignVCenter);
+	precompile_layout->addWidget(m_precompile_button);
+	m_export_button = new QPushButton(QStringLiteral("Export list"), m_precompile_widget);
+	m_export_button->setObjectName(QStringLiteral("game_export_list_button"));
+	m_export_button->setFocusPolicy(Qt::NoFocus);
+	m_export_button->setVisible(false);
+	precompile_layout->addWidget(m_export_button);
+	precompile_layout->addStretch(1);
 	parent->setItemWidget(this, PrecompileColumn, m_precompile_widget);
 
 	m_status_widget = new QWidget(parent);
@@ -295,9 +305,10 @@ void ConfigurationItem::SetRunning(bool state) {
 	UpdatePrecompileButton();
 }
 
-void ConfigurationItem::SetPrecompileState(const QString& emulator_dir, bool blocked) {
+void ConfigurationItem::SetPrecompileState(const QString& emulator_dir, bool blocked, bool can_export) {
 	m_emulator_dir       = emulator_dir;
 	m_precompile_blocked = blocked;
+	m_can_export         = can_export;
 	UpdatePrecompileButton();
 }
 
@@ -327,6 +338,25 @@ void ConfigurationItem::UpdatePrecompileButton() {
 		              Precompile::InstallPath(m_emulator_dir, title, version)));
 	}
 	m_precompile_button->setToolTip(tip);
+
+	// Export list: off while this game runs or is precompiled (the journals are being written).
+	// Without recorded journals it stays on: a click says how to record them.
+	m_export_button->setVisible(m_can_export);
+	m_export_button->setEnabled(m_can_export && game && valid && !m_running && !m_precompile_blocked);
+	QString export_tip;
+	if (m_emulator_dir.isEmpty() || !m_can_export) {
+		// Not looked for yet, or no kyty_pipeline_list.
+	} else if (!Precompile::IsValidGame(title, version)) {
+		export_tip = QStringLiteral("This game has no title ID, so it cannot have a shader list.");
+	} else if (ShaderListExport::FindJournals(m_emulator_dir, title).IsEmpty()) {
+		export_tip = QStringLiteral("Nothing has been recorded for this game yet: play it first.\n"
+		                            "Kyty records the shaders a game uses while you play.");
+	} else {
+		export_tip = QStringLiteral("Makes a shader list of what your sessions of this game recorded,\n"
+		                            "to send to other players: %1")
+		                 .arg(QDir::toNativeSeparators(ShaderListExport::DefaultOutput(m_emulator_dir, title, version)));
+	}
+	m_export_button->setToolTip(export_tip);
 }
 
 void ConfigurationItem::SetCompatibilityEditable(bool editable) {

@@ -34,10 +34,13 @@ public:
 	QComboBox*         GetStatusCombo() { return m_status_combo; }
 	QLineEdit*         GetCommentEdit() { return m_comment_edit; }
 	QPushButton*       GetPrecompileButton() { return m_precompile_button; }
-	// The emulator's folder (its PipelineLists holds the shader lists) and whether a precompile of
-	// any game, or this game from another row, runs: the Precompile button's tooltip and whether it
-	// can be clicked.
-	void               SetPrecompileState(const QString& emulator_dir, bool blocked);
+	// Below it: exports the shader list of what this game's sessions recorded (shaderListExport.h).
+	QPushButton*       GetExportListButton() { return m_export_button; }
+	// The emulator's folder (its PipelineLists holds the shader lists, its _PipelineCache the
+	// journals) and whether a precompile of any game, or this game from another row, runs: the
+	// buttons' tooltips and whether they can be clicked. `can_export`: kyty_pipeline_list is there
+	// (without it the Export list button is hidden).
+	void               SetPrecompileState(const QString& emulator_dir, bool blocked, bool can_export = false);
 
 private:
 	void UpdateIcon();
@@ -51,6 +54,8 @@ private:
 	QString                        m_emulator_dir;
 	QWidget*                       m_precompile_widget = nullptr;
 	QPushButton*                   m_precompile_button = nullptr;
+	QPushButton*                   m_export_button     = nullptr;
+	bool                           m_can_export        = false;
 	QComboBox*                     m_status_combo      = nullptr;
 	QLabel*                        m_status_indicator  = nullptr;
 	QWidget*                       m_status_widget     = nullptr;

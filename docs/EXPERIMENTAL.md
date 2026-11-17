@@ -4,6 +4,18 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
+### int22: launcher and package
+
+- **Export list** (below Precompile in the game list, and "Export shader list..." in the row's menu): makes a shader
+  list of what your own sessions of that game recorded (`_PipelineCache/<title>.shaders.journal` and
+  `.pipelines.journal`), checks that it holds no shader code, and saves it as
+  `ShaderListExports/<title>-<version>-shaderlist.kyplst` next to the emulator; the window names the file and opens
+  its folder. Send that one file, never the `_PipelineCache` folder, journals or game files. It runs
+  `kyty_pipeline_list.exe` (now in the package) export and verify, like the separate `kyty_shaderlist_export` window;
+  nothing is kept when either step fails. It is off while the game runs or is being precompiled, and says so when
+  nothing has been recorded yet. Scripts: `kyty_launcher --export-list <game folder or .zar> [--export-list-out
+  <file>]`. Windows only for now (the button is hidden when `kyty_pipeline_list` is not next to the launcher).
+
 Pre-release int16.1: int16 plus one fix.
 
 - Reverted the upstream libFont commits "font: fix glyph metrics and raster sizes" (32e9fa30) and "font: add scaled

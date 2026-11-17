@@ -37,6 +37,11 @@ public:
 	// As a click on the Precompile button of the game in this folder or archive (the launcher's
 	// --precompile argument); false when the list has no such game.
 	bool PressPrecompile(const QString& game);
+	// Selects the row of the game in this folder or archive (the launcher's --export-list argument);
+	// null when the list has no such game.
+	ConfigurationItem* SelectGame(const QString& game);
+	// Whether a row of this title runs (its folder and its archive are two rows).
+	[[nodiscard]] bool IsTitleRunning(const QString& title_id) const;
 	// As a right click on the row of the game in this folder or archive (the launcher's
 	// --context-menu argument, for tests); false when the list has no such game.
 	bool OpenContextMenu(const QString& game);
@@ -62,6 +67,8 @@ signals:
 	void Run();
 	// The selected game's Precompile button (or menu entry) was used.
 	void PrecompileShaders();
+	// The selected game's Export list button (or menu entry) was used.
+	void ExportShaderList();
 	void Select();
 	void PreviewControllerColor(const QString& color);
 
