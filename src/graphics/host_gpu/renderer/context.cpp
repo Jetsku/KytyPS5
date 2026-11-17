@@ -15,6 +15,8 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -109,10 +111,21 @@ std::string Line() {
 		values[i] = g_values[i].load(std::memory_order_relaxed);
 		any |= values[i];
 	}
-	if (any == 0) {
-		return {};
+	// emitsplit measurement: the recorder thread's spin (TSC ticks; the cpidle tsc converts) and the
+	// KYTY_EMIT_SPLIT counters (resolved draws expanded, verify-only records checked, mismatches).
+	const auto r        = CommandStream::ResolvedDrawPublished();
+	uint64_t   mismatch = 0;
+	for (const auto m: r.mismatches) {
+		mismatch += m;
 	}
-	std::string text = " haz [";
+	std::string text = " rec [busy_us " + std::to_string(CommandRecorder::TotalBusyNs() / 1000u) + ", spin_tsc " +
+	                   std::to_string(DrawPrep::PrepStats::g_spin.recorder.load(std::memory_order_relaxed)) +
+	                   ", es " + std::to_string(r.records) + ", espush " + std::to_string(r.pushes) + ", esvchk " +
+	                   std::to_string(r.verify_checks) + ", esvmis " + std::to_string(mismatch) + "]";
+	if (any == 0) {
+		return text;
+	}
+	text += " haz [";
 	for (uint32_t i = 0; i < Count; i++) {
 		text += Names[i];
 		text += ' ';
@@ -504,6 +517,7 @@ void CommandBuffer::OpenDirectWindow(const void* caller) const {
 	}
 	m_recorder->Drain(site != nullptr ? site : caller, site != nullptr);
 	m_direct_window = true;
+	m_record_reset  = true; // KYTY_EMIT_SPLIT: native commands follow
 	m_recorder->SetWindowOpen(true);
 }
 
@@ -1158,6 +1172,7 @@ void CommandBuffer::Begin() {
 	// Nothing bound, every descriptor epoch advances, push constants are undefined.
 	SettleEncode();
 	m_shadow.Begin();
+	m_record_reset = true;
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
 	ResetBarrierState();
 	m_direct_window = false;

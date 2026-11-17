@@ -7952,6 +7952,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool run_verify_push =
 	    run_verify_images && m_run.verify_valid && DrawRunPartialPush(buffer, pipeline);
 	const bool keep_commit_images = m_run_active && !m_run_texdelta;
+	// KYTY_EMIT_SPLIT (descriptors.cpp): a continuation that pushes only its per-draw descriptors is
+	// committed as one resolved draw (1), or inline followed by a verify-only one (2).
+	const auto split_mode = EmitSplitMode();
+	bool       split      = false;
+	if (split_mode != 0) [[unlikely]] {
+		split = keep_commit_images && !mesh_active && !mesh_indirect && indirect == nullptr && !instance_record &&
+		        g_enc_offload.Get() == 0 && !run_verify_push && !PassCensus::LabelsEnabled() &&
+		        g_draw_skip_vs.Get() == 0 && g_draw_skip_ps.Get() == 0 && DrawStats::Path() == nullptr &&
+		        ucfg.GetPrimType() != Prospero::PrimitiveType::kQuadListLegacy && DrawRunPartialPush(buffer, pipeline) &&
+		        EmitSplitPrepare(buffer, pipeline, stages);
+	}
+	const bool split_on = split && split_mode == 1;
 	// KYTY_ENC_OFFLOAD: the draw's bindings part goes to the emit thread (its side effects ran in
 	// OffloadBindings either way); verify encodes inline as well and compares.
 	const bool  offload_tried = g_enc_offload.Get() != 0;
@@ -7960,7 +7972,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		offload_b = OffloadBindings(buffer, pipeline, stages, keep_commit_images, mesh_active, run_verify_push,
 		                            vertex_bindings, index_binding);
 	}
-	const bool  inline_b    = offload_b == nullptr || offload_b->verify;
+	const bool  inline_b    = (offload_b == nullptr || offload_b->verify) && !split_on;
 	const auto* verify_ring = offload_b != nullptr ? buffer.EncoderRing() : nullptr;
 	const auto  verify_from = verify_ring != nullptr ? verify_ring->WritePosition() : 0;
 	if (!mesh_active && inline_b) {
@@ -7979,6 +7991,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, keep_commit_images);
 		}
+	} else if (split_on) {
+		// KYTY_EMIT_SPLIT: the commit's cache and barrier work here; its encode is the resolved draw's.
+		CommitBindingsSideEffects(buffer, pipeline, stages, keep_commit_images);
 	}
 	if (run_verify_push) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);
@@ -8183,7 +8198,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			OffloadPost(offload_d, buffer);
 		}
 	}
-	const bool  inline_d      = offload_d == nullptr || offload_d->verify;
+	const bool  inline_d      = (offload_d == nullptr || offload_d->verify) && !split_on;
 	const auto* verify_ring_d = offload_d != nullptr ? buffer.EncoderRing() : nullptr;
 	const auto  verify_from_d = verify_ring_d != nullptr ? verify_ring_d->WritePosition() : 0;
 	if (inline_d) {
@@ -8349,6 +8364,79 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (offload_d != nullptr && offload_d->verify) {
 		OffloadVerifyPart(offload_d, buffer, verify_ring_d, verify_from_d);
+	}
+	if (split) [[unlikely]] {
+		// KYTY_EMIT_SPLIT: the resolved draw (on: the draw's commands; verify: after the inline ones).
+		using P = CommandStream::ResolvedDrawPacket;
+		P                                 packet;
+		CommandStream::ResolvedDrawArrays arrays;
+		if (vertex_bindings.count != 0) {
+			for (uint32_t i = 0; i < vertex_bindings.count; i++) {
+				EXIT_IF(vertex_bindings.buffers[i] == nullptr);
+			}
+			packet.flags |= P::FlagVertex;
+			packet.vertex_count   = vertex_bindings.count;
+			arrays.vertex_buffers = vertex_bindings.buffers.data();
+			arrays.vertex_offsets = vertex_bindings.offsets.data();
+			arrays.vertex_sizes   = vertex_bindings.sizes.data();
+		}
+		if (index_binding.buffer != nullptr) {
+			packet.flags |= P::FlagIndex;
+			packet.index_buffer = index_binding.buffer;
+			packet.index_offset = index_binding.offset;
+			packet.index_type   = static_cast<uint32_t>(index_binding.type);
+		}
+		if (const auto planes = state.vertex_info[0].user_clip_planes; planes != 0) {
+			uint32_t count = 0;
+			for (uint32_t mask = planes; mask != 0; mask >>= 1u) {
+				count++;
+			}
+			packet.clip_offset = ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t);
+			packet.clip_bytes  = count * 4u * sizeof(uint32_t);
+			packet.clip_stages = static_cast<uint32_t>(
+			    static_cast<VkShaderStageFlags>(vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex));
+			arrays.clip = reinterpret_cast<const uint32_t*>(buffer.GetRegisters().GetUserClipPlanes().data());
+		}
+		if (state.ps_active && state.ps_input_info.HasObjprimOutput()) {
+			vk::ShaderStageFlags objprim_stages = vk::ShaderStageFlagBits::eFragment;
+			for (const auto& stage: vertex_stages) {
+				objprim_stages |= NativeShaderStage(stage.logical_stage);
+			}
+			packet.flags |= P::FlagObjprim;
+			packet.objprim_stages = static_cast<uint32_t>(static_cast<VkShaderStageFlags>(objprim_stages));
+			packet.objprim_offset = uint32_t {state.ps_input_info.objprim_push_dword} * 4u;
+			packet.object_id      = buffer.GetUserConfig().GetObjectId();
+		}
+		DrawEncode::DirectDraw direct;
+		if (m_segment_splice != nullptr && draw.IsIndexed()) {
+			const auto& spliced   = *m_segment_splice;
+			direct.indexed        = true;
+			direct.count          = spliced.index_count;
+			direct.instance_count = spliced.instance_count;
+			direct.vertex_offset  = spliced.vertex_offset;
+			direct.first_instance = spliced.first_instance;
+			if (split_on) {
+				DrawPrep::SegmentCounters().spliced.fetch_add(1, std::memory_order_relaxed);
+			}
+		} else {
+			direct = MakeDirectDraw(ucfg, draw, emit);
+		}
+		EXIT_IF(direct.quad_list);
+		packet.flags |= direct.indexed ? P::FlagIndexed : 0u;
+		packet.count          = direct.count;
+		packet.instance_count = direct.instance_count;
+		packet.vertex_offset  = direct.vertex_offset;
+		packet.first_vertex   = direct.first_vertex;
+		packet.first_instance = direct.first_instance;
+		EmitSplitWrite(buffer, pipeline, stages, packet, arrays, !split_on);
+		if (split_on) {
+			// What the inline bind leaves behind (the commit thread owns these).
+			m_dynamic_state.command  = vk_buffer.Identity();
+			m_dynamic_state.pipeline = pipeline.pipeline;
+			if (state.color_count == 0) {
+				m_dynamic_state.color_write_valid = false;
+			}
+		}
 	}
 	// KYTY_DRAW_PEEK (above): the draw's per-draw block and indirect arguments, after it.
 	if (const auto peek_hash = DrawPeekRequest()[0];

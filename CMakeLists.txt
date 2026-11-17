@@ -1426,6 +1426,15 @@ add_executable(draw_encode_tests EXCLUDE_FROM_ALL
 target_link_libraries(draw_encode_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(draw_encode_tests PRIVATE ${inc_headers})
 
+# KYTY_EMIT_SPLIT resolved draws (renderer/commandStream.h ResolvedDrawPacket): encode/expand round
+# trip, the consumer's shadow and the verify model, without a device.
+add_executable(emit_split_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EmitSplitTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandStream.cpp"
+)
+target_link_libraries(emit_split_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(emit_split_tests PRIVATE ${inc_headers})
+
 # KYTY_ENC_OFFLOAD hand-over and command-stream splice (renderer/encodeOffload.h), without a device.
 add_executable(encode_offload_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EncodeOffloadTests.cpp"
@@ -1630,6 +1639,7 @@ if(BUILD_TESTING)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
 	add_test(NAME draw_encode COMMAND $<TARGET_FILE:draw_encode_tests>)
 	add_test(NAME encode_offload COMMAND $<TARGET_FILE:encode_offload_tests>)
+	add_test(NAME emit_split COMMAND $<TARGET_FILE:emit_split_tests>)
 	add_test(NAME cp_sequencer COMMAND $<TARGET_FILE:cp_sequencer_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)

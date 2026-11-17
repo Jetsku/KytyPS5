@@ -103,6 +103,8 @@ struct PreparedBindings {
 [[nodiscard]] uint32_t BufferOutOfBoundsCombination(const ShaderBufferResource& descriptor);
 // KYTY_BUFFER_RANGE_FIXES (descriptors.cpp).
 [[nodiscard]] bool BufferRangeFixesEnabled();
+// KYTY_EMIT_SPLIT (descriptors.cpp): 0 off, 1 resolved draws, 2 verify.
+[[nodiscard]] int64_t EmitSplitMode();
 // The final sampler dwords of a program's sampler binding (depth-compare bits cleared unless the
 // shader compares, point filtering forced where the shader needs it): the SamplerCache key.
 [[nodiscard]] ShaderSamplerResource
