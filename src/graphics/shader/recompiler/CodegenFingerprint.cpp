@@ -515,6 +515,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(Common::RendererBatchEnabled() ? 1u : 0u);
 	b.U64(BufferCache::CACHING_PAGEBITS);
 	b.U64(BufferCache::CACHING_PAGESIZE);
+	b.U64(BufferCache::BDA_STORE_LOG_ENTRIES); // LogBdaStore compares the log's count with it
 
 	b.U32(static_cast<uint32_t>(kSwitchCount));
 	for (size_t i = 0; i < kSwitchCount; ++i) {

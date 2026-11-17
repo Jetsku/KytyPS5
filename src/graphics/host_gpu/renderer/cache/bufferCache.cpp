@@ -7615,6 +7615,8 @@ void BufferCache::ProcessPendingBdaSettles(bool wait_oldest) {
 		auto pending = std::move(m_bda_pending.front());
 		m_bda_pending.pop_front();
 		auto writes = m_fault_manager.ParseBdaWrites(pending.slot);
+		// Later dispatches may have logged over the entries past the downloaded prefix: lost here.
+		writes.dropped += writes.log_tail;
 		if (!writes.stores.empty()) {
 			writes.dropped += ApplyBdaStoreLog(writes.stores, pending.hash);
 			m_bda_async_totals.stores += writes.stores.size();

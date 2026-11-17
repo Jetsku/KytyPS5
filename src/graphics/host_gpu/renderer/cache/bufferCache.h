@@ -126,8 +126,18 @@ public:
 	static constexpr uint64_t BDA_WRITE_BITMAP_WORD   = FAULT_BITMAP_WORDS;
 	static constexpr uint64_t BDA_DROPPED_WRITES_WORD = 2 * FAULT_BITMAP_WORDS;
 	static constexpr uint64_t BDA_STORE_LOG_WORD      = BDA_DROPPED_WRITES_WORD + 4;
-	static constexpr uint64_t BDA_STORE_LOG_ENTRIES   = 4096;
+	// The log's capacity, a constant of the generated shaders: one dispatch's stores past it are
+	// dropped. A settle downloads the first BDA_STORE_LOG_PREFIX entries with the written-page list;
+	// a synchronous settle fetches the rest with a second copy when the log holds more
+	// (FaultManager::FetchBdaStoreLogTail), so a settle without such a dispatch costs what it did
+	// with a 4096-entry log. That capacity lost 16639 of the 20735 stores of a first dispatch into an
+	// output array without a cache buffer (one dword per thread group; another title), and the
+	// array's consumer hung the GPU.
+	static constexpr uint64_t BDA_STORE_LOG_ENTRIES   = 262144;
+	static constexpr uint64_t BDA_STORE_LOG_PREFIX    = 4096;
 	static constexpr uint64_t BDA_STORE_LOG_BYTES     = (4 + 4 * BDA_STORE_LOG_ENTRIES) * sizeof(uint32_t);
+	static constexpr uint64_t BDA_STORE_LOG_PREFIX_BYTES =
+	    (4 + 4 * BDA_STORE_LOG_PREFIX) * sizeof(uint32_t);
 	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE =
 	    BDA_STORE_LOG_WORD * sizeof(uint32_t) + BDA_STORE_LOG_BYTES;
 	// KYTY_BDA_TAGS_GPU_COUNT: get_bda_pointer calls, zero-entry calls, untagged-entry calls (u32,

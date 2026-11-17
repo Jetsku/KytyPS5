@@ -8,7 +8,7 @@
 # The build fails when a file of the set includes a project header that is neither in the set nor
 # exempt below: the version would not see changes to it. Exempt headers cannot change what a
 # translation produces, or the fingerprint records the values they contribute (rendererBatch.h:
-# KYTY_RENDERER_BATCH; bufferCache.h: CACHING_PAGEBITS/CACHING_PAGESIZE).
+# KYTY_RENDERER_BATCH; bufferCache.h: CACHING_PAGEBITS/CACHING_PAGESIZE and BDA_STORE_LOG_ENTRIES).
 #
 # Inputs: SOURCE_ROOT (src), FILE_LIST (absolute paths, one per line), OUTPUT_FILE, COMPILER.
 

@@ -32,7 +32,7 @@ constexpr size_t MaxBdaWritePages = 65536;
 constexpr size_t BdaPagesAreaSize = MaxBdaWritePages * sizeof(uint64_t);
 // KYTY_BDA_STORE_LOG: the copy of the store log (its count, then its entries) follows the counter.
 constexpr size_t BdaStoreLogOffset = BdaPagesAreaSize + 16;
-constexpr size_t BdaDownloadSize   = BdaStoreLogOffset + BufferCache::BDA_STORE_LOG_BYTES;
+constexpr size_t BdaDownloadSize   = BdaStoreLogOffset + BufferCache::BDA_STORE_LOG_PREFIX_BYTES;
 
 bool StoreLogEnabled() {
 	return ShaderRecompiler::GetCodegenOptions().bda_store_log;
@@ -323,7 +323,69 @@ void FaultManager::PrepareBdaWrites() {
 FaultManager::BdaWrites FaultManager::CollectBdaWrites() {
 	const auto slot = RecordBdaWrites();
 	m_scheduler.Wait(m_scheduler.CurrentTick());
-	return ParseBdaWrites(slot);
+	auto writes = ParseBdaWrites(slot);
+	if (writes.log_tail != 0) {
+		FetchBdaStoreLogTail(writes);
+	}
+	return writes;
+}
+
+// The store log's entries past the prefix the settle downloaded, appended to writes.stores. Nothing
+// was recorded since the dispatch but the settle's own parse and copies, which clear the log's
+// count and leave its entries alone, so the device log still holds this dispatch's stores.
+void FaultManager::FetchBdaStoreLogTail(BdaWrites& writes) {
+	KYTY_GPU_OP_SITE("fault.bda-log-tail");
+	constexpr uint64_t tail_offset =
+	    (BufferCache::BDA_STORE_LOG_WORD + 4 + 4 * BufferCache::BDA_STORE_LOG_PREFIX) * sizeof(uint32_t);
+	constexpr uint64_t tail_capacity =
+	    (BufferCache::BDA_STORE_LOG_ENTRIES - BufferCache::BDA_STORE_LOG_PREFIX) * sizeof(BdaStore);
+	const uint64_t bytes = uint64_t {writes.log_tail} * sizeof(BdaStore);
+	EXIT_IF(bytes > tail_capacity);
+	if (m_bda_tail_download == nullptr) {
+		m_bda_tail_download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                               AllFlags, tail_capacity);
+	}
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().HelperSink();
+	vk::BufferMemoryBarrier2 before {};
+	before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	before.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	before.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	before.buffer        = m_fault_buffer.Handle();
+	before.offset        = tail_offset;
+	before.size          = bytes;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &before;
+	command.pipelineBarrier2(dependency);
+	const vk::BufferCopy copy {tail_offset, 0, bytes};
+	command.copyBuffer(m_fault_buffer.Handle(), m_bda_tail_download->Handle(), 1, &copy);
+	// The next BDA writer may log there again; the host sees the copy.
+	std::array<vk::BufferMemoryBarrier2, 2> after {};
+	after[0].srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	after[0].srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+	after[0].dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	after[0].dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	after[0].buffer        = m_fault_buffer.Handle();
+	after[0].offset        = tail_offset;
+	after[0].size          = bytes;
+	after[1].srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	after[1].srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	after[1].dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	after[1].dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	after[1].buffer        = m_bda_tail_download->Handle();
+	after[1].offset        = 0;
+	after[1].size          = bytes;
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(after.size());
+	dependency.pBufferMemoryBarriers    = after.data();
+	command.pipelineBarrier2(dependency);
+	m_scheduler.Wait(m_scheduler.CurrentTick());
+	m_bda_tail_download->Invalidate(0, bytes);
+	const auto first = writes.stores.size();
+	writes.stores.resize(first + writes.log_tail);
+	std::memcpy(writes.stores.data() + first, m_bda_tail_download->Mapped().data(), bytes);
+	writes.log_tail = 0;
 }
 
 uint32_t FaultManager::RecordBdaWrites() {
@@ -399,8 +461,9 @@ uint32_t FaultManager::RecordBdaWrites() {
 	const bool     store_log  = StoreLogEnabled();
 	constexpr auto log_offset = BufferCache::BDA_STORE_LOG_WORD * sizeof(uint32_t);
 	if (store_log) {
+		// The first BDA_STORE_LOG_PREFIX entries; CollectBdaWrites fetches the rest when there are more.
 		const vk::BufferCopy log_copy {log_offset, BdaStoreLogOffset,
-		                               BufferCache::BDA_STORE_LOG_BYTES};
+		                               BufferCache::BDA_STORE_LOG_PREFIX_BYTES};
 		command.copyBuffer(m_fault_buffer.Handle(), m_bda_download->Handle(), 1, &log_copy);
 	}
 	// The counter and the store log's count (the words between them are unused) are cleared.
@@ -464,8 +527,11 @@ FaultManager::BdaWrites FaultManager::ParseBdaWrites(uint32_t slot) {
 		m_bda_download->Invalidate(BdaStoreLogOffset, sizeof(uint32_t));
 		uint32_t logged = 0;
 		std::memcpy(&logged, mapped + BdaStoreLogOffset, sizeof(logged));
-		const auto entries = std::min<size_t>(logged, BufferCache::BDA_STORE_LOG_ENTRIES);
-		result.log_overflow = logged - static_cast<uint32_t>(entries);
+		// The device log kept `kept` entries (its capacity); the download holds the first `entries`.
+		const auto kept    = std::min<size_t>(logged, BufferCache::BDA_STORE_LOG_ENTRIES);
+		const auto entries = std::min<size_t>(kept, BufferCache::BDA_STORE_LOG_PREFIX);
+		result.log_overflow = logged - static_cast<uint32_t>(kept);
+		result.log_tail     = static_cast<uint32_t>(kept - entries);
 		if (entries != 0) {
 			constexpr size_t first = BdaStoreLogOffset + 4 * sizeof(uint32_t);
 			m_bda_download->Invalidate(first, entries * sizeof(BdaStore));
