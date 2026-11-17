@@ -301,6 +301,15 @@ public:
 	// Call on a temporary configuration: validation can fail after loading values.
 	bool SetGameSettings(const QJsonObject& settings, QString& error);
 
+	// The launcher settings a title was tested with (the table in configuration.cpp), as in a game
+	// config export: setting name -> text value. Empty for a title without an entry. A game without
+	// a config of its own runs with them over the global settings; Reset and the Recommended
+	// button of its dialog set them.
+	[[nodiscard]] static QJsonObject RecommendedGameSettings(const QString& title_id);
+	// Sets RecommendedGameSettings(title_id) over the current values and leaves every other
+	// setting as it is; false (nothing changed) for a title without an entry.
+	bool ApplyRecommendedGameSettings(const QString& title_id);
+
 private:
 	template <class Settings>
 	void ReadGameSettingsValues(const Settings& s);

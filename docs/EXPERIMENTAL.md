@@ -30,6 +30,15 @@ This release builds on the U59 renderer of the previous U59 releases.
   `KYTY_DMA_BARRIER_BATCH=1`, which trim redundant GPU barriers (about 1 fps in heavy Astro Bot scenes). Turn it off
   if graphics glitch. A variable that `u59-preset.json` or a title preset already sets keeps that value. Saved per
   game (`fast_gpu_sync`) and in exported game configs.
+- **Recommended settings per game.** The launcher holds the launcher settings each of the other games was tested
+  with: "Enable readback" and "Enable tessellation support" for Gran Turismo 7, Ghost of Yotei, Spider-Man: Miles
+  Morales, Ratchet & Clank: Rift Apart, Demon's Souls and Beyond Good & Evil 20th Anniversary; "Accurate occlusion
+  queries" on top for the Insomniac games; "Enable tiled readback" on top for Ratchet & Clank (players report the
+  game needs it; it was not part of the boot checks). A game that has no
+  config of its own starts with them over the global settings. In a game's configuration, **Reset** returns to
+  them and the new **Recommended** button sets them and keeps your other choices (its tooltip lists them); a config
+  you saved before this version keeps your values until you press one of the two. Astro Bot and Astro's Playroom
+  were measured with the default settings and have no entry.
 - **CPU check at start-up.** The release is compiled for x86-64-v3 (AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT, MOVBE).
   On an older CPU `kyty_launcher` and `kyty_emulator` now say "This build needs a CPU with AVX2, BMI2 and FMA (Intel
   Core 4th generation / AMD Ryzen or newer)", name what the CPU lacks and exit (exit code 3) instead of crashing with

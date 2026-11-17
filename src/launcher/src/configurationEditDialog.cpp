@@ -15,6 +15,8 @@
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHash>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
@@ -146,6 +148,36 @@ static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
 	}
 }
 
+static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings);
+
+// What the Recommended button sets, in the dialog's words: the checkbox texts of the settings
+// that are switched on, "name: value" for anything else.
+static QString RecommendedSettingsText(const Ui::ConfigurationEditDialog& ui,
+                                       const QJsonObject&                 recommended) {
+	const QHash<QString, const QCheckBox*> boxes {
+	    {QStringLiteral("readback_linear_images"), ui.checkBox_readback},
+	    {QStringLiteral("readback_tiled_images"), ui.checkBox_readback_tiled},
+	    {QStringLiteral("readback_storage_images"), ui.checkBox_readback_storage},
+	    {QStringLiteral("sync_raw_image_buffers"), ui.checkBox_sync_raw_image_buffers},
+	    {QStringLiteral("tessellation_enabled"), ui.checkBox_tessellation},
+	    {QStringLiteral("relaxed_shader_float"), ui.checkBox_relaxed_shader_float},
+	    {QStringLiteral("gpu_occlusion_accurate"), ui.checkBox_gpu_occlusion},
+	    {QStringLiteral("guest_tsc_enabled"), ui.checkBox_guest_tsc},
+	    {QStringLiteral("red_zone_protection_enabled"), ui.checkBox_red_zone_protection},
+	};
+	QStringList parts;
+	for (auto it = recommended.constBegin(); it != recommended.constEnd(); ++it) {
+		const auto* box   = boxes.value(it.key());
+		const auto  value = it.value().toString();
+		if (box != nullptr && value == QStringLiteral("true")) {
+			parts << box->text();
+		} else {
+			parts << QStringLiteral("%1: %2").arg(box != nullptr ? box->text() : it.key(), value);
+		}
+	}
+	return parts.join(QStringLiteral(", "));
+}
+
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
     : QDialog(parent, Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint),
       m_ui(new Ui::ConfigurationEditDialog), m_info(info) {
@@ -177,6 +209,30 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
+	// A game with tested settings (Configuration::RecommendedGameSettings) gets a button that sets
+	// them and keeps the rest of the dialog; the global dialog and other games have none.
+	auto recommended = Configuration::RecommendedGameSettings(info.title_id);
+	for (const auto& key: recommended.keys()) {
+		if (!info.GameSettings().contains(key)) {
+			recommended.remove(key); // not a setting on this platform
+		}
+	}
+	if (!recommended.isEmpty()) {
+		auto* button = new QPushButton(tr("Recommended"), this);
+		button->setObjectName(QStringLiteral("recommended_button"));
+		button->setMinimumSize(m_ui->clear_button->minimumSize());
+		button->setToolTip(tr("Set the settings this game was tested with and keep the others: %1")
+		                       .arg(RecommendedSettingsText(*m_ui, recommended)));
+		m_ui->buttonLayout->insertWidget(1, button);
+		connect(button, &QPushButton::clicked, this, [this]() {
+			Configuration current;
+			current.CopyEmulatorSettingsFrom(m_info);
+			current.CopyGlobalOnlySettingsFrom(m_info);
+			UpdateInfo(current, *m_ui, m_global_settings);
+			current.ApplyRecommendedGameSettings(m_info.title_id);
+			Init(current);
+		});
+	}
 	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
 		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
 		const auto initial =
@@ -698,6 +754,10 @@ void ConfigurationEditDialog::save() {
 
 void ConfigurationEditDialog::clear() {
 	Configuration default_info;
+	// A game's defaults are the built-in ones with the settings it was tested with on top.
+	if (!m_global_settings) {
+		default_info.ApplyRecommendedGameSettings(m_info.title_id);
+	}
 	Init(default_info);
 
 	if (m_global_settings) {

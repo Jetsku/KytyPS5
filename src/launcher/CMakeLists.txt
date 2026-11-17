@@ -95,10 +95,28 @@ add_executable(launcher_shader_list_export_tests EXCLUDE_FROM_ALL
 target_link_libraries(launcher_shader_list_export_tests Qt6::Core)
 target_include_directories(launcher_shader_list_export_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_test(NAME launcher_shader_list_export COMMAND $<TARGET_FILE:launcher_shader_list_export_tests>)
+
+# The game configuration dialog without showing it: Reset and the Recommended button.
+add_executable(launcher_edit_dialog_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherEditDialogTests.cpp"
+	include/configuration.h
+	include/configurationEditDialog.h
+	include/mandatoryLineEdit.h
+	src/configuration.cpp
+	src/configurationEditDialog.cpp
+	src/mandatoryLineEdit.cpp
+)
+target_link_libraries(launcher_edit_dialog_tests Qt6::Widgets Vulkan::Headers SDL3::SDL3-static common)
+if(WIN32)
+	target_link_libraries(launcher_edit_dialog_tests setupapi)
+endif()
+target_include_directories(launcher_edit_dialog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_edit_dialog_tests PROPERTIES AUTOMOC ON AUTOUIC ON)
+add_test(NAME launcher_edit_dialog COMMAND $<TARGET_FILE:launcher_edit_dialog_tests>)
 if(WIN32)
 	# Qt's DLLs are deployed beside the launcher only.
 	set_tests_properties(launcher_configuration launcher_precompile launcher_precompile_item
-		launcher_shader_list_export
+		launcher_shader_list_export launcher_edit_dialog
 		PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
 endif()
 

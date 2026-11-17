@@ -564,6 +564,11 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	const auto* custom = m_custom_infos.value(item.GetInfo().game_path);
 	info->CopyGameInfoFrom(item.GetInfo());
 	info->CopyEmulatorSettingsFrom(custom != nullptr ? *custom : m_global_info);
+	if (custom == nullptr) {
+		// No config of its own: the global settings, with the settings this title was tested with
+		// on top. Saving the game's dialog turns them into its own config.
+		info->ApplyRecommendedGameSettings(info->title_id);
+	}
 	info->CopyGlobalOnlySettingsFrom(m_global_info);
 	if (custom != nullptr && !custom->elf.isEmpty()) {
 		info->elf = custom->elf;

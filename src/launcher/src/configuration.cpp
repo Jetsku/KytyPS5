@@ -1,5 +1,7 @@
 #include "configuration.h"
 
+#include <QByteArray>
+#include <QJsonDocument>
 #include <QRegularExpression>
 
 QString Configuration::NormalizeResolution(const QString& text) {
@@ -257,5 +259,46 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 		return fail(tr("Enabled logging and command buffer dumps require an output path."));
 	}
 
+	return true;
+}
+
+// The launcher settings each title was tested with, in the texts of a game config export. The
+// boot checks of these titles ran with linear readback and tessellation on; the other entries
+// are what one title needs on top. A title that runs with the default settings (Astro Bot,
+// Astro's Playroom) has no entry.
+static const char RECOMMENDED_GAME_SETTINGS[] = R"json({
+	"PPSA01317": {"readback_linear_images": "true", "tessellation_enabled": "true"},
+	"PPSA01340": {"readback_linear_images": "true", "tessellation_enabled": "true"},
+	"PPSA01341": {"readback_linear_images": "true", "tessellation_enabled": "true"},
+	"PPSA01342": {"readback_linear_images": "true", "tessellation_enabled": "true"},
+	"PPSA01417": {"readback_linear_images": "true", "tessellation_enabled": "true",
+	              "gpu_occlusion_accurate": "true"},
+	"PPSA01474": {"readback_linear_images": "true", "tessellation_enabled": "true",
+	              "readback_tiled_images": "true", "gpu_occlusion_accurate": "true"},
+	"PPSA03671": {"readback_linear_images": "true", "tessellation_enabled": "true",
+	              "gpu_occlusion_accurate": "true", "red_zone_protection_enabled": "true"},
+	"PPSA08705": {"readback_linear_images": "true", "tessellation_enabled": "true"},
+	"PPSA26344": {"readback_linear_images": "true", "tessellation_enabled": "true"}
+})json";
+
+QJsonObject Configuration::RecommendedGameSettings(const QString& title_id) {
+	static const QJsonObject table =
+	    QJsonDocument::fromJson(QByteArray(RECOMMENDED_GAME_SETTINGS)).object();
+	return table.value(title_id.trimmed().toUpper()).toObject();
+}
+
+bool Configuration::ApplyRecommendedGameSettings(const QString& title_id) {
+	const auto recommended = RecommendedGameSettings(title_id);
+	if (recommended.isEmpty()) {
+		return false;
+	}
+	auto values = GameSettings();
+	for (auto it = recommended.constBegin(); it != recommended.constEnd(); ++it) {
+		// A setting this platform does not have (red zone protection outside Windows) is skipped.
+		if (values.contains(it.key())) {
+			values.insert(it.key(), it.value().toString());
+		}
+	}
+	ReadGameSettingsValues(values);
 	return true;
 }

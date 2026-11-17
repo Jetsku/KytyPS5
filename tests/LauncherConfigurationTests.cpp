@@ -184,6 +184,83 @@ int main() {
 	          Configuration::ShaderOptimizationType::Performance,
 	      "empty text not Performance");
 
+	// Recommended settings: the launcher settings a title was tested with.
+	{
+		const char* const listed[] = {"PPSA01317", "PPSA01340", "PPSA01341", "PPSA01342", "PPSA01417",
+		                              "PPSA01474", "PPSA03671", "PPSA08705", "PPSA26344"};
+		for (const char* title: listed) {
+			const auto recommended = Configuration::RecommendedGameSettings(QString::fromLatin1(title));
+			Check(!recommended.isEmpty(), "a listed title has recommended settings");
+			// Every entry is a setting of a game config export with a valid value (a setting this
+			// platform lacks is left out, as ApplyRecommendedGameSettings does).
+			Configuration probe;
+			QJsonObject   known;
+			for (auto it = recommended.constBegin(); it != recommended.constEnd(); ++it) {
+				Check(it.value().isString(), "recommended values are texts");
+				if (probe.GameSettings().contains(it.key())) {
+					known.insert(it.key(), it.value());
+				}
+			}
+			Check(probe.SetGameSettings(known, error), "recommended settings are valid game settings");
+			Check(probe.readback_linear_images && probe.tessellation_enabled,
+			      "the tested base: linear readback and tessellation");
+		}
+		// Astro Bot and Astro's Playroom were measured with the default settings: no entry.
+		const char* const unlisted[] = {"PPSA21567", "PPSA21564", "PPSA01325", "", "PPSA99999"};
+		for (const char* title: unlisted) {
+			Check(Configuration::RecommendedGameSettings(QString::fromLatin1(title)).isEmpty(),
+			      "no entry for a title that runs with the default settings");
+		}
+		Check(!Configuration::RecommendedGameSettings(QStringLiteral(" ppsa01474 ")).isEmpty(),
+		      "the title id is trimmed and upper-cased");
+
+		// Over a user's settings: the recommended ones are set, every other one keeps its value.
+		Configuration user;
+		user.screen_resolution        = QStringLiteral("2560x1440");
+		user.vblank_frequency         = 120;
+		user.user_id                  = 7;
+		user.present_mode             = Configuration::PresentMode::Fifo;
+		user.printf_direction         = Configuration::LogDirection::File;
+		user.fast_gpu_sync            = true;
+		user.amd_cpu_mode             = QStringLiteral("off");
+		user.shader_optimization_type = Configuration::ShaderOptimizationType::Size;
+		user.trophy_duration_seconds  = 9;
+		user.host_input_mapping       = QStringList {QStringLiteral("a=b")};
+		user.elf                      = QStringLiteral("other.bin");
+		const auto before = user.GameSettings();
+		Check(user.ApplyRecommendedGameSettings(QStringLiteral("PPSA01474")), "the title has an entry");
+		Check(user.readback_linear_images && user.readback_tiled_images && user.tessellation_enabled &&
+		          user.gpu_occlusion_accurate,
+		      "the title's settings are set");
+		Check(!user.readback_storage_images, "a setting outside the entry stays off");
+		auto after = user.GameSettings();
+		for (const auto& key: Configuration::RecommendedGameSettings(QStringLiteral("PPSA01474")).keys()) {
+			after.insert(key, before.value(key));
+		}
+		Check(after == before, "every other setting keeps its value");
+		Check(user.screen_resolution == QStringLiteral("2560x1440") && user.vblank_frequency == 120 &&
+		          user.user_id == 7 && user.present_mode == Configuration::PresentMode::Fifo &&
+		          user.elf == QStringLiteral("other.bin"),
+		      "the user's own values are kept");
+		Check(user.host_input_mapping == QStringList {QStringLiteral("a=b")}, "the input mapping is kept");
+
+		Configuration plain;
+		const auto    plain_before = plain.GameSettings();
+		Check(!plain.ApplyRecommendedGameSettings(QStringLiteral("PPSA21567")) &&
+		          plain.GameSettings() == plain_before,
+		      "a title without an entry changes nothing");
+		Configuration other;
+		Check(other.ApplyRecommendedGameSettings(QStringLiteral("PPSA01317")) &&
+		          !other.readback_tiled_images && !other.gpu_occlusion_accurate,
+		      "a title gets its own entry only");
+#if defined(_WIN32)
+		Configuration zone;
+		Check(zone.ApplyRecommendedGameSettings(QStringLiteral("PPSA03671")) &&
+		          zone.red_zone_protection_enabled,
+		      "red zone protection is part of the entry on Windows");
+#endif
+	}
+
 	std::puts("LauncherConfigurationTests: OK");
 	return 0;
 }
