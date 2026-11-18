@@ -1,0 +1,35 @@
+name: Build KytyPS5 Windows
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 拉取源码（包含子模块）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装CMake & Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: 安装Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.1.0
+
+      - name: CMake编译构建
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j6
+
+      - name: 打包为ZIP
+        run: |
+          Compress-Archive -Path build\bin\Release\* -DestinationPath KytyPS5-Windows.zip
+
+      - name: 上传成品压缩包
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows
+          path: KytyPS5-Windows.zip
+          retention-days: 30
