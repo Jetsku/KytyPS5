@@ -2810,7 +2810,7 @@ uint64_t BindlessMipChainBytes(const ShaderTextureResource& descriptor, uint32_t
 // resource), and the entries enabling mip statistics; then the write watch's totals.
 void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 	// KYTY_BINDLESS_HEAP_STATS=<n>: every n frames (1 or a non-number: 300).
-	static const uint64_t interval = [] {
+	static const uint64_t interval = []() -> uint64_t {
 		const char* value = std::getenv("KYTY_BINDLESS_HEAP_STATS");
 		if (value == nullptr) return uint64_t {0};
 		const auto n = std::strtoull(value, nullptr, 10);
