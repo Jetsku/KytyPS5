@@ -39,10 +39,13 @@
 #include <fmt/format.h>
 #include <fstream>
 #include <iterator>
-#include <malloc.h>
 #include <span>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 
 namespace Libs::Graphics {
 namespace {
@@ -81,7 +84,13 @@ std::vector<char> ReadFile(const std::filesystem::path& path) {
 
 // Kept alive for the whole run: the shader map and the hash cache hold these addresses.
 void* CopyAligned(const std::vector<char>& bytes, size_t alignment) {
-	void* memory = _aligned_malloc(std::max<size_t>(bytes.size(), 1), alignment);
+	const size_t size = std::max<size_t>(bytes.size(), 1);
+#if defined(_WIN32)
+	void* memory = _aligned_malloc(size, alignment);
+#else
+	// aligned_alloc wants a size that is a multiple of the alignment (a power of two here).
+	void* memory = std::aligned_alloc(alignment, (size + alignment - 1) & ~(alignment - 1));
+#endif
 	std::memcpy(memory, bytes.data(), bytes.size());
 	return memory;
 }
