@@ -1004,8 +1004,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (!graphics.mesh_shader_enabled) {
 		// Not a reason to reject the device: games without mesh (NGG) shaders still run.
 		Log::WriteToConsoleAndLog(fmt::format(
-		    "WARNING: the GPU \"{}\" has no mesh shaders ({}). Games that draw with mesh (NGG) "
-		    "shaders stop at their first such draw; other games are not affected.\n",
+		    "WARNING: the GPU \"{}\" has no mesh shaders ({}). Mesh (NGG) draws in games that use "
+		    "them are skipped; other games are not affected.\n",
 		    graphics.GetPhysicalDeviceProperties().deviceName.data(),
 		    mesh_extension ? "VK_EXT_mesh_shader without the meshShader feature"
 		                   : "no VK_EXT_mesh_shader"));
