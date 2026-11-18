@@ -49,6 +49,7 @@ target_link_libraries(common
 		spdlog::spdlog
 		ZArchive::zarchive
 		nlohmann_json::nlohmann_json
+		libzstd_static
 )
 if(APPLE)
 	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.

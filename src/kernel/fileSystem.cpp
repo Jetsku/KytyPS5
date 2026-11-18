@@ -1,5 +1,6 @@
 #include "kernel/fileSystem.h"
 
+#include "common/amprPack.h"
 #include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -49,6 +50,7 @@ public:
 		std::filesystem::path dir;
 		std::string           point;
 		std::shared_ptr<Common::ArchiveReader> archive;
+		std::shared_ptr<Common::AmprPack>      ampr;
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -104,6 +106,8 @@ private:
 
 static MountPoints*     g_mount_points = nullptr;
 static FileDescriptors* g_files        = nullptr;
+
+static std::atomic<uint64_t> g_resolvePathIgnoringCaseCount{0};
 
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
@@ -288,6 +292,18 @@ void MountPoints::Mount(const std::filesystem::path& folder, const std::string& 
 	p.point = point_str;
 	p.archive = Common::OpenArchive(folder);
 
+	// Load the AMPR index once per mount so guest reads can reach packed files. A .zar
+	// mount (an archive path) has no index beside it and stays on the existing path.
+	if (!Common::IsArchivePath(folder)) {
+		std::error_code ec;
+		if (std::filesystem::is_regular_file(folder / "ampr_zstd.index", ec)) {
+			auto ampr = std::make_shared<Common::AmprPack>();
+			if (ampr->Init(folder)) {
+				p.ampr = std::move(ampr);
+			}
+		}
+	}
+
 	m_mount_pairs.push_back(std::move(p));
 }
 
@@ -325,6 +341,7 @@ bool MountPoints::IsMountPoint(const std::string& point) {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Resolve guest paths case-insensitively on case-sensitive hosts.
 static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
+	++g_resolvePathIgnoringCaseCount;
 	std::error_code ec;
 	if (std::filesystem::exists(path, ec)) {
 		return path;
@@ -401,7 +418,19 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 		return p.dir / native_rel_path;
 #else
-		return ResolvePathIgnoringCase(p.dir / native_rel_path);
+		const auto host_candidate = p.dir / native_rel_path;
+		// Packed files are host-missing: check the in-memory index against the raw candidate
+		// before paying for a component-by-component case-insensitive directory walk.
+		if (p.ampr) {
+			std::error_code ec;
+			if (!std::filesystem::exists(host_candidate, ec)) {
+				Common::AmprPack::FileInfo info;
+				if (p.ampr->Lookup(rel_path, info) || p.ampr->IsDirectory(rel_path)) {
+					return Common::MakeArchivePath(p.dir / "__ampr__.amprz", native_rel_path);
+				}
+			}
+		}
+		return ResolvePathIgnoringCase(host_candidate);
 #endif
 	}
 
@@ -441,6 +470,14 @@ void Umount(const std::string& folder_or_point) {
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 
 	return g_mount_points->ResolvePath(mounted_file_name);
+}
+
+uint64_t ResolvePathIgnoringCaseCount() {
+	return g_resolvePathIgnoringCaseCount.load();
+}
+
+void ResetResolvePathIgnoringCaseCount() {
+	g_resolvePathIgnoringCaseCount.store(0);
 }
 
 bool IsOpenDescriptor(int d) {
