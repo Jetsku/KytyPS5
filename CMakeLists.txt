@@ -762,6 +762,11 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 
+# Task 3 exercises the mount-time AMPR hook through LibKernel::FileSystem, so this test
+# links the full emulator (same recipe as kernel_file_system_tests), not just `common`.
+add_kyty_full_emulator_test(ampr_pack_tests
+	"${KYTY_TESTS_DIR}/AmprPackTests.cpp")
+
 add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
 )

@@ -1,5 +1,6 @@
 #include "common/archive.h"
 
+#include "common/amprPack.h"
 #include "common/cpuPlacement.h"
 #include "common/stringUtils.h"
 
@@ -88,12 +89,81 @@ std::shared_ptr<ArchiveReader> OpenZArchive(const std::filesystem::path& path) {
 	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader)) : nullptr;
 }
 
+// Keep one AmprPack per game root alive for the whole process. OpenArchive's reader cache is
+// weak_ptr-only; without a strong owner, every transient stat/open re-parses the 22 MB index.
+// Holding the mutex across Init also collapses concurrent guest threads into a single parse.
+std::mutex                                                  g_amprPacksMutex;
+std::unordered_map<std::filesystem::path, std::shared_ptr<AmprPack>> g_amprPacks;
+
+std::shared_ptr<AmprPack> GetAmprPack(const std::filesystem::path& root) {
+	std::lock_guard lock(g_amprPacksMutex);
+	if (auto it = g_amprPacks.find(root); it != g_amprPacks.end()) {
+		return it->second;
+	}
+	auto pack = std::make_shared<AmprPack>();
+	if (!pack->Init(root)) {
+		return nullptr;
+	}
+	g_amprPacks.emplace(root, pack);
+	return pack;
+}
+
+// Read-only view of an AMPR zstd index. The synthetic "__ampr__.amprz" file never exists on disk;
+// its parent directory is the game root that holds ampr_zstd.index and the pak volumes.
+class AmprPackReaderBackend final: public ArchiveReader {
+public:
+	explicit AmprPackReaderBackend(std::shared_ptr<AmprPack> pack): m_pack(std::move(pack)) {}
+
+	std::optional<Entry> Find(std::string_view member) override {
+		AmprPack::FileInfo info {};
+		if (m_pack->Lookup(member, info)) {
+			std::lock_guard lock(m_mutex);
+			m_files[info.firstChunk] = info;
+			return Entry {info.firstChunk, info.size, true};
+		}
+		if (m_pack->IsDirectory(member)) {
+			return Entry {0, 0, false};
+		}
+		return {};
+	}
+
+	std::vector<File::DirEntry> List(std::string_view member) override {
+		std::vector<File::DirEntry> result;
+		for (const auto& entry: m_pack->ListDirectory(member)) {
+			result.push_back({entry.name, entry.is_file});
+		}
+		return result;
+	}
+
+	uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) override {
+		std::lock_guard lock(m_mutex);
+		const auto found = m_files.find(id);
+		if (found == m_files.end()) {
+			return 0;
+		}
+		const auto& info      = found->second;
+		const auto  available = offset < info.size ? info.size - offset : 0;
+		const auto  want      = static_cast<uint32_t>(std::min<uint64_t>(size, available));
+		return want != 0 && m_pack->Read(info, offset, want, data) ? want : 0;
+	}
+
+private:
+	std::shared_ptr<AmprPack>                         m_pack;
+	std::mutex                                        m_mutex;
+	std::unordered_map<uint64_t, AmprPack::FileInfo> m_files;
+};
+
+std::shared_ptr<ArchiveReader> OpenAmprPack(const std::filesystem::path& path) {
+	auto pack = GetAmprPack(path.parent_path());
+	return pack ? std::make_shared<AmprPackReaderBackend>(std::move(pack)) : nullptr;
+}
+
 struct ArchiveFormat {
 	std::string_view extension;
 	std::shared_ptr<ArchiveReader> (*open)(const std::filesystem::path&);
 };
 
-constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}};
+constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}, {".amprz", OpenAmprPack}};
 using NativeView                  = std::basic_string_view<std::filesystem::path::value_type>;
 
 const ArchiveFormat* FindFormat(NativeView path) {
