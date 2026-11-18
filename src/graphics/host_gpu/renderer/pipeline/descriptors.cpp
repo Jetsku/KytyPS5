@@ -2813,7 +2813,7 @@ void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 	static const uint64_t interval = [] {
 		const char* value = std::getenv("KYTY_BINDLESS_HEAP_STATS");
 		if (value == nullptr) return uint64_t {0};
-		const auto n = std::strtoull(value, nullptr, 10);
+		const auto n = static_cast<uint64_t>(std::strtoull(value, nullptr, 10));
 		return n > 1 ? n : uint64_t {300};
 	}();
 	const bool enabled = interval != 0;
