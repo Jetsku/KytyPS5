@@ -16,6 +16,11 @@ This release builds on the U59 renderer of the previous U59 releases.
   Astro's Playroom (01.905.000): 324 shaders, 373 permutations, 732 pipelines. Both pass `kyty_pipeline_list check`
   against the game and `verify` (no shader code in the file). A list you install yourself with "Choose shader
   list..." (`PipelineLists/<title>_<version>.kyplst`) is used before the shipped one.
+- **Shader lists for six other games** are in `PipelineLists` as well, one per title id. Each was recorded with this
+  build in one play session on one PC: it covers what that session reached, and it is used only with the game
+  version it was recorded on (`kyty_pipeline_list info <file>` shows the version). A first Precompile compiles in
+  the GPU driver, which takes time and memory: in the runs measured here from a few seconds up to 24 minutes and
+  35 GB of memory for the largest game with an empty driver cache.
 - **Export list** (below Precompile in the game list, and "Export shader list..." in the row's menu): makes a shader
   list of what your own sessions of that game recorded (`_PipelineCache/<title>.shaders.journal` and
   `.pipelines.journal`), checks that it holds no shader code, and saves it as
