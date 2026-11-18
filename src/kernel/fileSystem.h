@@ -58,6 +58,9 @@ void                  Umount(const std::string& folder_or_point);
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 // Stats a resolved host path; a directory's size is its packed dirent size.
 int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb);
+// Test-only: number of case-insensitive host walks performed by ResolvePath.
+uint64_t ResolvePathIgnoringCaseCount();
+void     ResetResolvePathIgnoringCaseCount();
 // Returns whether d is an open file, directory or device descriptor.
 bool                  IsOpenDescriptor(int d);
 

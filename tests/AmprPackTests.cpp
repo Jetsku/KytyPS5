@@ -307,14 +307,20 @@ int main() {
     // Real dump: the loose font is absent, so the guest path must resolve into the
     // synthetic .amprz archive and still stat as the 28,280-byte font.
     FS::Mount(root, "/app0");
+    FS::ResetResolvePathIgnoringCaseCount();
     const auto packedResolved = FS::GetRealFilename(kFontGuest);
+    Check(FS::ResolvePathIgnoringCaseCount() == 0,
+          "packed file resolves without a case-insensitive host walk");
     const auto packedStr = Common::PathToGenericString(packedResolved);
     Check(packedStr.find("!/") != std::string::npos, "packed guest path resolves to an archive path");
     Check(packedStr.find("__ampr__.amprz") != std::string::npos, "resolved path uses the amprz backend");
     Check(Common::File::Size(packedResolved) == 28280, "resolved virtual font size is 28280");
 
     // Case-folded guest paths must resolve to a readable virtual path too.
+    FS::ResetResolvePathIgnoringCaseCount();
     const auto packedFolded = FS::GetRealFilename("/app0/DATA/COMMON/FONT/FUTURASTD-BOLD.OTF");
+    Check(FS::ResolvePathIgnoringCaseCount() == 0,
+          "mixed-case packed file resolves without a case-insensitive host walk");
     const auto packedFoldedStr = Common::PathToGenericString(packedFolded);
     Check(packedFoldedStr.find("!/") != std::string::npos, "mixed-case guest path resolves to a virtual path");
     Check(Common::File::Size(packedFolded) == 28280, "mixed-case guest path resolves to a readable 28280-byte font");
@@ -362,7 +368,10 @@ int main() {
       out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
     FS::Mount(loose.Path(), "/app0");
+    FS::ResetResolvePathIgnoringCaseCount();
     const auto looseResolved = FS::GetRealFilename(kFontGuest);
+    Check(FS::ResolvePathIgnoringCaseCount() >= 1,
+          "loose file still uses the case-insensitive host walk (counter is live)");
     const auto looseStr = Common::PathToGenericString(looseResolved);
     Check(looseStr.find("!/") == std::string::npos, "loose folder resolves to a normal path");
     Check(looseResolved == looseFont, "loose font resolves to the real host file");
