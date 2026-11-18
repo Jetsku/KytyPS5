@@ -358,6 +358,10 @@ int AmprPack::VolumeFd(uint32_t volume) {
 	char name[32];
 	std::snprintf(name, sizeof(name), "ampr_zstd-%03u.pak", volume);
 	fd = ::open((m_root / name).c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		// Chunks are scattered across volumes; readahead on a 41 KiB chunk wastes disk I/O.
+		::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	}
 	return fd;
 }
 
