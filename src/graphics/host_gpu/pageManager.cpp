@@ -300,8 +300,10 @@ struct PageManager::Impl {
 	}
 
 	struct PageState {
-		uint8_t write_watchers  = 0;
-		uint8_t access_watchers = 0;
+		// Many images can legitimately watch one page (e.g. a 135 MiB shadow-map array with 127+
+		// overlapping slots); a 16-bit count keeps normal overlap from tripping the overflow check.
+		uint16_t write_watchers  = 0;
+		uint8_t  access_watchers = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -332,7 +334,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == UINT8_MAX) {
+					if (write_watchers == 0xffff) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -347,7 +349,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 2);
+	static_assert(sizeof(PageState) == 4);
 
 	// Locks, always taken in this order: host_lock, then lock.
 	//  - lock guards the watcher counts and `applied`. With deferral on it is never held across a
