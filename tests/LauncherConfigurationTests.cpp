@@ -184,6 +184,20 @@ int main() {
 	          Configuration::ShaderOptimizationType::Performance,
 	      "empty text not Performance");
 
+	// The default window size, also for a saved value that cannot be read; a saved size is kept.
+	{
+		Check(Configuration().screen_resolution == QStringLiteral("1920x1080"), "the default window is 1920x1080");
+		QSettings out(dir.filePath(QStringLiteral("res.ini")), QSettings::IniFormat);
+		out.setValue(QStringLiteral("screen_resolution"), QStringLiteral("not a size"));
+		Configuration broken;
+		broken.ReadSettings(&out);
+		Check(broken.screen_resolution == QStringLiteral("1920x1080"), "an unreadable size becomes the default");
+		out.setValue(QStringLiteral("screen_resolution"), QStringLiteral("1280x720"));
+		Configuration saved;
+		saved.ReadSettings(&out);
+		Check(saved.screen_resolution == QStringLiteral("1280x720"), "a saved size is kept");
+	}
+
 	// Recommended settings: the launcher settings a title was tested with.
 	{
 		const char* const listed[] = {"PPSA01317", "PPSA01340", "PPSA01341", "PPSA01342", "PPSA01417",

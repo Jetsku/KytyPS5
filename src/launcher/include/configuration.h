@@ -119,6 +119,8 @@ public:
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
 	static QString NormalizeResolution(const QString& text);
+	// The window size of a new configuration, of Reset, and of a saved value that cannot be read.
+	static QString DefaultScreenResolution() { return QStringLiteral("1920x1080"); }
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
@@ -162,7 +164,7 @@ public:
 		audio_mix  = other.audio_mix;
 	}
 
-	QString                screen_resolution           = QStringLiteral("1280x720");
+	QString                screen_resolution           = DefaultScreenResolution();
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;

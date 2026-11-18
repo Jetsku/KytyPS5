@@ -39,6 +39,8 @@ This release builds on the U59 renderer of the previous U59 releases.
   them and the new **Recommended** button sets them and keeps your other choices (its tooltip lists them); a config
   you saved before this version keeps your values until you press one of the two. Astro Bot and Astro's Playroom
   were measured with the default settings and have no entry.
+- **Default window size 1920x1080** (was 1280x720) for a new settings file and for **Reset**. A settings file from
+  an earlier version keeps the size saved in it (Global settings, Screen resolution).
 - **CPU check at start-up.** The release is compiled for x86-64-v3 (AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT, MOVBE).
   On an older CPU `kyty_launcher` and `kyty_emulator` now say "This build needs a CPU with AVX2, BMI2 and FMA (Intel
   Core 4th generation / AMD Ryzen or newer)", name what the CPU lacks and exit (exit code 3) instead of crashing with

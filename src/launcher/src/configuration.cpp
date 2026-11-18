@@ -110,7 +110,7 @@ template <class Settings>
 void Configuration::ReadGameSettingsValues(const Settings& s) {
 #define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
 	const auto resolution = NormalizeResolution(s.value("screen_resolution").toString());
-	screen_resolution     = resolution.isEmpty() ? QStringLiteral("1280x720") : resolution;
+	screen_resolution     = resolution.isEmpty() ? DefaultScreenResolution() : resolution;
 	user_name          = s.value("user_name", user_name).toString();
 	bool user_id_ok    = false;
 	auto saved_user_id = s.value("user_id", user_id).toInt(&user_id_ok);
