@@ -2,6 +2,7 @@
 #define PRECOMPILE_H
 
 #include <QByteArray>
+#include <QProcessEnvironment>
 #include <QString>
 #include <QtGlobal>
 
@@ -13,6 +14,12 @@ namespace Precompile {
 
 inline constexpr char ENV_PREPARE[] = "KYTY_PIPELINE_LIST_PREPARE";
 inline constexpr char ENV_LIST[]    = "KYTY_PIPELINE_LIST";
+inline constexpr char ENV_REPLAY[]  = "KYTY_SHADER_PRECOMPILE_REPLAY";
+// The environment of a prepare run, over the game's own (bundled preset, title preset): the
+// prepare switch, and the shader replay on. A title preset may keep the replay off for play
+// (KYTY_SHADER_PRECOMPILE_REPLAY=0: the game then only records); with it off the prepare run
+// would load the list and build nothing.
+void PrepareEnvironment(QProcessEnvironment* environment);
 // The emulator's exit code when it found no usable list.
 inline constexpr int EXIT_NO_LIST = 2;
 

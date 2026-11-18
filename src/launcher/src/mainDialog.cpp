@@ -780,7 +780,7 @@ void MainDialogPrivate::PrecompileShaders() {
 		installed_now = true;
 	}
 
-	environment.insert(QLatin1String(Precompile::ENV_PREPARE), QStringLiteral("1"));
+	Precompile::PrepareEnvironment(&environment);
 	process->setProcessEnvironment(environment);
 	process->setProgram(m_interpreter);
 	process->setArguments(args);

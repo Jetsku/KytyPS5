@@ -87,6 +87,11 @@ QString InstallPath(const QString& emulator_dir, const QString& title_id, const 
 	                           .filePath(name + QLatin1String(LIST_SUFFIX)));
 }
 
+void PrepareEnvironment(QProcessEnvironment* environment) {
+	environment->insert(QLatin1String(ENV_PREPARE), QStringLiteral("1"));
+	environment->insert(QLatin1String(ENV_REPLAY), QStringLiteral("1"));
+}
+
 bool IsCustomList(const QString& setting) {
 	return !setting.isEmpty() && setting != QLatin1String("0") && setting != QLatin1String("1");
 }

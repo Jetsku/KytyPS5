@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QProcessEnvironment>
 #include <QTemporaryDir>
 
 #include <cstdio>
@@ -240,7 +241,24 @@ void DoneLines() {
 }
 } // namespace
 
+// The prepare run's environment: the prepare switch, and the replay on over a preset's 0.
+void PrepareRunEnvironment() {
+	QProcessEnvironment plain;
+	plain.insert(QStringLiteral("KYTY_OTHER"), QStringLiteral("x"));
+	Precompile::PrepareEnvironment(&plain);
+	Check(plain.value(QStringLiteral("KYTY_PIPELINE_LIST_PREPARE")) == QStringLiteral("1") &&
+	          plain.value(QStringLiteral("KYTY_SHADER_PRECOMPILE_REPLAY")) == QStringLiteral("1") &&
+	          plain.value(QStringLiteral("KYTY_OTHER")) == QStringLiteral("x"),
+	      "the prepare switch and the replay are set, other variables stay");
+	QProcessEnvironment preset;
+	preset.insert(QStringLiteral("KYTY_SHADER_PRECOMPILE_REPLAY"), QStringLiteral("0"));
+	Precompile::PrepareEnvironment(&preset);
+	Check(preset.value(QStringLiteral("KYTY_SHADER_PRECOMPILE_REPLAY")) == QStringLiteral("1"),
+	      "a preset that keeps the replay off for play does not switch it off for the prepare run");
+}
+
 int main() {
+	PrepareRunEnvironment();
 	ListPaths();
 	Install();
 	ProgressLines();
