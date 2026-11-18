@@ -815,7 +815,7 @@ void CheckSelectorReadCodec() {
     ShaderRecompiler::IR::ResourcePlan plan;
     auto &source = plan.descriptor_sources.emplace_back();
     source.dword_count = 8u;
-    auto &indirect = source.indirect_descriptor.emplace();
+    auto &indirect = source.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
     auto &selector = indirect.selector.emplace(
         DescriptorSource::IndirectDescriptor::SelectorRead{.source = 0u, .stride = 32u, .offset = 4u});
     selector.bitset = variant == 1u;

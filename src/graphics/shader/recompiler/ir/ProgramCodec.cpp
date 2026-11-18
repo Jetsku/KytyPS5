@@ -1099,7 +1099,7 @@ public:
 					selector.bitset = r.Bool();
 					if (r.Bool()) selector.excluded = r.U32();
 					if (r.Bool()) {
-						auto& ranks  = selector.ranks.emplace();
+						auto& ranks  = selector.ranks.emplace(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks {});
 						ranks.source = r.U32();
 						ranks.stride = r.U32();
 						ranks.offset = r.U32();

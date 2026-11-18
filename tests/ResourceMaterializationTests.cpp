@@ -1043,7 +1043,7 @@ void TestWorkgroupDividedImageKeys() {
   DescriptorSource image;
   image.dword_count = 8u;
   image.dwords.fill(Value(0u));
-  auto &indirect = image.indirect_descriptor.emplace();
+  auto &indirect = image.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
   indirect.table_source = 0u;
   indirect.table_offset = table_offset;
   indirect.table_stride = 32u;
