@@ -64,7 +64,8 @@ This release builds on the U59 renderer of the previous U59 releases.
 ### int22: Astro Bot and Astro's Playroom
 
 - **Title presets.** Beside `u59-preset.json` the package has one preset per game, `u59-preset.<title id>.json`
-  (`u59-preset.PPSA21567.json` for Astro Bot, `u59-preset.PPSA01325.json` for Astro's Playroom, and ten more). The
+  (`u59-preset.PPSA21567.json` for Astro Bot and the same content as `u59-preset.PPSA21564.json` for the game's
+  other title id, `u59-preset.PPSA01325.json` for Astro's Playroom, and nine more). The
   launcher applies a game's title preset over `u59-preset.json` when it starts that game; the emulator does it
   itself when it is started without the launcher. `u59-preset.json` is the same as in int21: everything new for a
   game is in its title preset, so keep all the preset files next to the launcher. A switch that only one game has
