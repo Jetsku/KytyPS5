@@ -1,6 +1,7 @@
 // kyty_pipeline_list / kyty_shaderlist_export game files (tools/pipeline-list/gameFiles.h): a game
 // folder and a .zar archive of it give the same param.json title and version, the same eboot.bin
 // and file bytes, and the same file list in the same order (the order --scan reads them in).
+#include "exportBase.h"
 #include "gameFiles.h"
 
 #include <cstdint>
@@ -133,6 +134,17 @@ void TestFolderAndArchive(const fs::path& temp) {
 		CHECK(ReadAll(game->OpenStream("eboot.bin"), 65536 + 7) == eboot);
 		CHECK(!game->Read("missing.bin", bytes));
 		CHECK(!game->OpenStream("missing.bin"));
+		// A range of a file, as a list resolve reads it: two files in turn, the end, past the end.
+		std::vector<uint8_t> part(1000), big;
+		CHECK(game->Read(fs::path("data") / "big.bin", big) && big.size() == 200000);
+		CHECK(game->ReadAt("eboot.bin", 250000, part) && std::equal(part.begin(), part.end(), eboot.begin() + 250000));
+		CHECK(game->ReadAt(fs::path("data") / "big.bin", 199000, part) && big.size() == 200000 &&
+		      std::equal(part.begin(), part.end(), big.begin() + 199000));
+		CHECK(game->ReadAt("eboot.bin", 0, part) && std::equal(part.begin(), part.end(), eboot.begin()));
+		CHECK(!game->ReadAt("eboot.bin", 299500, part));
+		CHECK(game->ReadAt("eboot.bin", 299000, part) && std::equal(part.begin(), part.end(), eboot.begin() + 299000));
+		CHECK(!game->ReadAt("missing.bin", 0, part));
+		CHECK(game->ReadAt("eboot.bin", 5, std::span<uint8_t>()));
 	}
 
 	const auto folder_files  = from_folder->Files();
@@ -174,6 +186,94 @@ void TestBadArchive(const fs::path& temp) {
 	}
 }
 
+// export --base: a resource specialization of the int21 release in this build's encoding (exportBase.h).
+void TestSpecializationUpgrade() {
+	using namespace PipelineListTool;
+	const auto word = [](std::vector<uint8_t>& out, uint32_t value) {
+		for (int i = 0; i < 4; i++) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
+	};
+	// Two buffers and two images as int21 stored them.
+	std::vector<uint8_t> int21;
+	word(int21, 2);
+	for (uint32_t b = 0; b < 2; b++) {
+		word(int21, 16 + b);
+		word(int21, 7);
+		word(int21, 0x688);
+		int21.push_back(static_cast<uint8_t>(b));
+	}
+	word(int21, 2);
+	for (uint32_t i = 0; i < 2; i++) {
+		for (uint32_t w = 0; w < 8; w++) word(int21, 100 * (i + 1) + w);
+		int21.push_back(1);
+		int21.push_back(static_cast<uint8_t>(i));
+	}
+	const size_t first = 4 + 2 * SpecializationBufferBytes + 4; // the first image record
+	CHECK(SpecializationBufferBytes == 13 && SpecializationImageInt21Bytes == 34 && SpecializationImageBytes == 41);
+	CHECK(int21.size() == first + 2 * SpecializationImageInt21Bytes);
+	size_t   at     = 0;
+	uint32_t images = 0;
+	CHECK(ReadsAsSpecialization(int21, true, &at, &images) && images == 2 && at == first);
+	CHECK(!ReadsAsSpecialization(int21, false, &at, &images));
+	auto now = int21;
+	CHECK(UpgradeInt21Specialization(now));
+	CHECK(now.size() == first + 2 * SpecializationImageBytes);
+	CHECK(ReadsAsSpecialization(now, false, &at, &images) && images == 2 && at == first);
+	if (now.size() == first + 2 * SpecializationImageBytes) {
+		// Each record: its old bytes, then bindless, runtime, fmask_fragments and clamp_half_float as zero.
+		const auto zero = [](uint8_t b) { return b == 0; };
+		CHECK(std::equal(int21.begin(), int21.begin() + first + 34, now.begin()));
+		CHECK(std::all_of(now.begin() + first + 34, now.begin() + first + 41, zero));
+		CHECK(std::equal(int21.begin() + first + 34, int21.end(), now.begin() + first + 41));
+		CHECK(std::all_of(now.end() - 7, now.end(), zero));
+	}
+	// Left as they are: bytes that are this build's already, a specialization without images (the same in
+	// both encodings), and bytes that are neither (a flag that is not 0 or 1, a cut record, a count
+	// beyond the bytes).
+	const auto unchanged = [](std::vector<uint8_t> bytes) {
+		const auto before = bytes;
+		return !UpgradeInt21Specialization(bytes) && bytes == before;
+	};
+	CHECK(unchanged(now));
+	std::vector<uint8_t> none;
+	word(none, 0);
+	word(none, 0);
+	CHECK(unchanged(none));
+	auto bad_flag       = int21;
+	bad_flag[first + 32] = 2;
+	CHECK(unchanged(bad_flag));
+	auto cut = int21;
+	cut.pop_back();
+	CHECK(unchanged(cut));
+	std::vector<uint8_t> beyond;
+	word(beyond, 0xffffffffu);
+	CHECK(unchanged(beyond));
+	CHECK(unchanged({}));
+}
+
+// export --base --scan: the base list's data files first, then their folders' other files, then the rest.
+void TestScanOrder() {
+	struct File {
+		uint64_t    size;
+		std::string path;
+	};
+	const std::vector<File> given {{1, "a/x.bin"},           {2, "shaders/new.bin"},      {3, "b/y.bin"}, {4, "shaders/known.bin"},
+	                               {5, "top.bin"},           {6, "shaders/sub/deep.bin"}, {7, "d/material"}};
+	const auto path  = [](const File& file) { return file.path; };
+	const auto order = [&](const std::vector<std::string>& base) {
+		auto files = given;
+		PipelineListTool::OrderForScan(files, base, path);
+		std::string names;
+		for (const auto& file: files) names += file.path + " ";
+		return names;
+	};
+	CHECK(order({}) == "a/x.bin shaders/new.bin b/y.bin shaders/known.bin top.bin shaders/sub/deep.bin d/material ");
+	CHECK(order({"shaders/known.bin", "d/material"}) ==
+	      "shaders/known.bin d/material shaders/new.bin a/x.bin b/y.bin top.bin shaders/sub/deep.bin ");
+	// A data file in the game folder itself: the other files there come next, not those of the folders below.
+	CHECK(order({"top.bin"}) == "top.bin a/x.bin shaders/new.bin b/y.bin shaders/known.bin shaders/sub/deep.bin d/material ");
+	CHECK(order({"not/there.bin"}) == order({}));
+}
+
 } // namespace
 
 int main() {
@@ -182,6 +282,8 @@ int main() {
 	TestZarPath();
 	TestFolderAndArchive(temp);
 	TestBadArchive(temp);
+	TestSpecializationUpgrade();
+	TestScanOrder();
 	std::error_code error;
 	fs::remove_all(temp, error);
 	if (g_failed != 0) {

@@ -12,6 +12,12 @@
 //       code, which is kept when the bytes before it have the code's size and hashes. The files that
 //       hold codes join the list's data files, so no --data names are needed (codes without the footer
 //       still need --exe/--data).
+//       --base <list>: the list the recording sessions ran with (the one the emulator loaded for the
+//       game). The emulator journals only what it compiled itself, so the journals of a session with
+//       a list lack the list's shaders, and a recorded pipeline with a stage from the list could not
+//       be kept. The base list is resolved against the game and its usable part joins the export; a
+//       list of the int21 release is upgraded as the emulator upgrades it and gives its shaders and
+//       permutations only. With --scan its data files and their folders are read first.
 //   merge --out <list> <list>...        Union of lists of the same title, version and input layout.
 //   info <list>                         Header, counts, levels, section sizes.
 //   check <list> --game <app0 dir or .zar> [--exe <executable>]
@@ -34,6 +40,7 @@
 // folder and of its archive writes the same list. SOURCE_DATE_EPOCH (seconds), when set, is the
 // creation time written into lists instead of the current time.
 #include "common/stringUtils.h"
+#include "exportBase.h"
 #include "gameFiles.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineListInt21.h"
@@ -73,6 +80,7 @@ struct Arguments {
 	std::string                                      out, game, exe, list, title, app_ver, producer = "kyty_pipeline_list";
 	std::vector<std::string>                         shaders, pipelines, inputs, data;
 	bool                                             scan = false;
+	std::string                                      base;
 };
 
 // --scan: the footer every PS5 shader binary ends with (48 bytes, starting with "barefoot").
@@ -214,6 +222,95 @@ int Write(const PipelineList::File& file, const std::string& out) {
 	return 0;
 }
 
+bool                   Load(const std::string& path, PipelineList::File& file);
+PipelineList::Resolved ResolveWith(GameFiles& game, const PipelineList::File& file, const std::vector<uint8_t>& image,
+                                   const std::array<uint32_t, 3>& sizes, PipelineList::ResolveStats& stats);
+
+// export --base: the list the recording sessions ran with (the launcher passes the one the emulator
+// loads for the game). The emulator journals what it compiles itself: a permutation it took from an
+// installed list is in no journal, while a recorded pipeline names its stages by their permutation
+// identities, so without that list every pipeline with such a stage would be dropped (a session with a
+// complete list would export nothing). The list is resolved against the game as the emulator resolves
+// it and, when it is of the int21 release, upgraded as the emulator upgrades it; its usable shaders and
+// permutations then join the export as if they had been journaled, which gives them the identities the
+// emulator gave them. Its pipelines join too, unless they were recorded with the int21 layout or
+// another pipeline state format (the emulator cannot replay most of those).
+struct BaseList {
+	bool               used = false;
+	PipelineList::File kept; // the part usable with this game, at the offsets found in it
+	// The kept shaders as journal sources (code filled) and the kept permutations as journal entries.
+	std::vector<ShaderJournal::Source> sources;
+	std::vector<ShaderJournal::Entry>  entries;
+	// Where a code (or a merged stage's back half) sits, by its hash: the data file's name (empty: the
+	// executable) and the offset.
+	std::map<std::pair<uint64_t, uint64_t>, std::pair<std::string, uint64_t>> where;
+};
+
+void LoadBase(const Arguments& args, GameFiles& game, const PipelineList::Info& info, const std::vector<uint8_t>& image,
+              BaseList& base) {
+	const auto unused = [&](const char* why) { std::printf("base list %s: not used, %s\n", args.base.c_str(), why); };
+	PipelineList::File file;
+	if (!Load(args.base, file)) return unused("it cannot be read");
+	if (file.info.title_id != info.title_id) return unused("it is for another title");
+	uint64_t upgraded_infos = 0, upgraded_specializations = 0;
+	bool     int21          = false;
+	if (file.info.input_info_sizes != info.input_info_sizes) {
+		const auto layout = Int21VertexLayout();
+		if (info.input_info_sizes[0] != ShaderStoredInputInfoSize<ShaderVertexInputInfo>() ||
+		    file.info.input_info_sizes[0] != layout.from_size || file.info.input_info_sizes[1] != info.input_info_sizes[1] ||
+		    file.info.input_info_sizes[2] != info.input_info_sizes[2]) {
+			return unused("its input layout is neither the journals' nor the int21 release's");
+		}
+		PipelineList::UpgradeStats upgrade;
+		PipelineList::UpgradeVertexInputInfos(file, layout, info.input_info_sizes[0], upgrade);
+		upgraded_infos = upgrade.upgraded;
+		for (auto& permutation: file.permutations) {
+			upgraded_specializations += PipelineListTool::UpgradeInt21Specialization(permutation.specialization) ? 1 : 0;
+		}
+		int21 = true;
+	}
+	const auto listed_shaders   = file.shaders.size();
+	const auto listed_pipelines = file.pipelines.size();
+	const bool other_state      = file.info.state_format != PipelineList::StateFormat;
+	if (int21 || other_state) file.pipelines.clear();
+	PipelineList::ResolveStats  resolve;
+	auto                        resolved = ResolveWith(game, file, image, info.input_info_sizes, resolve);
+	PipelineList::RetargetStats retarget;
+	base.kept       = PipelineList::Retarget(file, resolved, retarget);
+	base.kept.files = file.files; // Retarget keeps every shader's file number
+	const auto key = [](const std::vector<uint32_t>& code) {
+		const auto hash = PipelineList::CodeHash({reinterpret_cast<const uint8_t*>(code.data()), code.size() * 4});
+		return std::pair {hash.low, hash.high};
+	};
+	std::vector<uint32_t> source_of(file.shaders.size(), UINT32_MAX);
+	for (size_t i = 0; i < file.shaders.size(); i++) {
+		if (!resolved.usable[i]) continue;
+		const auto index  = static_cast<uint32_t>(file.shaders[i].file);
+		const auto name   = index == 0 ? std::string() : file.files[index - 1];
+		auto&      source = resolved.sources[i];
+		base.where.try_emplace(key(source.code), name, resolved.offsets[i]);
+		if (!source.back_code.empty()) base.where.try_emplace(key(source.back_code), name, resolved.back_offsets[i]);
+		source_of[i] = static_cast<uint32_t>(base.sources.size());
+		base.sources.push_back(std::move(source));
+	}
+	for (const auto& entry: resolved.entries) {
+		base.entries.push_back({source_of[entry.source], entry.push_data_cursor, entry.specialization});
+	}
+	base.used = !base.sources.empty();
+	std::printf("base list %s: %s %s by %s: %zu of %zu shaders found in this game, %zu permutations, %zu of %zu pipelines kept\n",
+	            args.base.c_str(), file.info.title_id.c_str(), file.info.app_version.c_str(), file.info.producer.c_str(),
+	            base.kept.shaders.size(), listed_shaders, base.kept.permutations.size(), base.kept.pipelines.size(), listed_pipelines);
+	if (int21) {
+		std::printf("  int21 layout: %llu vertex input infos and %llu specializations upgraded as the emulator upgrades them; its "
+		            "pipelines were recorded with that layout and are left out\n",
+		            static_cast<unsigned long long>(upgraded_infos), static_cast<unsigned long long>(upgraded_specializations));
+	} else if (other_state && listed_pipelines != 0) {
+		std::printf("  its pipelines have pipeline state format %u (this build: %u) and are left out\n", file.info.state_format,
+		            PipelineList::StateFormat);
+	}
+	if (!base.used) unused("none of its shaders is in this game");
+}
+
 int Export(const Arguments& args) {
 	if (args.out.empty() || args.game.empty() || args.shaders.empty() || args.shaders.size() != args.pipelines.size()) {
 		std::fprintf(stderr, "export needs --out, --game and pairs of --shaders/--pipelines\n");
@@ -247,14 +344,19 @@ int Export(const Arguments& args) {
 	for (size_t i = 0; i < args.shaders.size(); i++) {
 		std::vector<uint8_t> shader_identity, pipeline_identity;
 		// "--pipelines none": a shader journal without pipelines (its shaders still precompile).
+		// "--shaders none": pipelines without a shader journal (a session whose shaders all came from the
+		// base list writes none); the input layout is then this build's, which wrote the pipelines.
 		const bool no_pipelines = args.pipelines[i] == "none";
-		if (!ShaderJournal::ReadIdentity(args.shaders[i], shader_identity) ||
+		const bool no_shaders   = args.shaders[i] == "none";
+		if ((!no_shaders && !ShaderJournal::ReadIdentity(args.shaders[i], shader_identity)) ||
 		    (!no_pipelines && !PipelineJournal::ReadIdentity(args.pipelines[i], pipeline_identity))) {
 			std::fprintf(stderr, "%s or %s is not a journal\n", args.shaders[i].c_str(), args.pipelines[i].c_str());
 			return 2;
 		}
-		std::array<uint32_t, 3> sizes {};
-		if (!InputSizes(shader_identity, sizes)) {
+		std::array<uint32_t, 3> sizes {static_cast<uint32_t>(ShaderStoredInputInfoSize<ShaderVertexInputInfo>()),
+		                               static_cast<uint32_t>(ShaderStoredInputInfoSize<ShaderPixelInputInfo>()),
+		                               static_cast<uint32_t>(ShaderStoredInputInfoSize<ShaderComputeInputInfo>())};
+		if (!no_shaders && !InputSizes(shader_identity, sizes)) {
 			std::fprintf(stderr, "%s names no input info sizes\n", args.shaders[i].c_str());
 			return 2;
 		}
@@ -268,7 +370,7 @@ int Export(const Arguments& args) {
 		auto& shared = loaded_shaders[args.shaders[i]];
 		if (shared == nullptr) {
 			ShaderJournal::Settings shader_settings;
-			shader_settings.path              = U8(args.shaders[i]);
+			shader_settings.path              = no_shaders ? std::filesystem::path() : U8(args.shaders[i]);
 			shader_settings.identity          = shader_identity;
 			shader_settings.background_writer = false;
 			shared                            = std::make_shared<ShaderJournal>(std::move(shader_settings));
@@ -284,6 +386,9 @@ int Export(const Arguments& args) {
 		            run.shaders->Entries().size(), run.pipelines->Loaded().size());
 		runs.push_back(std::move(run));
 	}
+	PipelineList::Builder builder(info);
+	BaseList              base;
+	if (!args.base.empty()) LoadBase(args, *game, info, image, base);
 	std::vector<PipelineList::CodeQuery> queries;
 	std::map<std::pair<uint64_t, uint64_t>, size_t> query_of;
 	for (const auto& [path, journal]: loaded_shaders) {
@@ -293,6 +398,7 @@ int Export(const Arguments& args) {
 				if (code->empty()) continue;
 				const std::span bytes(reinterpret_cast<const uint8_t*>(code->data()), code->size() * 4);
 				const auto      query = PipelineList::QueryFor(bytes);
+				if (base.where.contains({query.hash.low, query.hash.high})) continue; // the base list says where it is
 				if (query_of.try_emplace({query.hash.low, query.hash.high}, queries.size()).second) queries.push_back(query);
 			}
 		}
@@ -308,7 +414,6 @@ int Export(const Arguments& args) {
 		located++;
 	}
 	std::printf("located %zu of %zu distinct shader codes in the executable\n", located, queries.size());
-	PipelineList::Builder builder(info);
 	// The rest in the data files, in the order given (the first file holding a code wins).
 	for (const auto& data: args.data) {
 		std::vector<size_t>                  rest;
@@ -338,7 +443,7 @@ int Export(const Arguments& args) {
 	if (args.scan) {
 		// Wanted: footer hash -> query; the largest code bounds the bytes kept before a footer.
 		std::unordered_multimap<uint64_t, size_t> wanted;
-		size_t                                    max_before = 0, no_footer = 0, rest = 0;
+		size_t                                    max_before = 0, no_footer = 0, rest = 0, min_code = SIZE_MAX;
 		std::vector<uint64_t>                     footer_of(queries.size(), 0);
 		for (const auto& [path, journal]: loaded_shaders) {
 			(void)path;
@@ -347,6 +452,7 @@ int Export(const Arguments& args) {
 					if (code->empty()) continue;
 					const std::span bytes(reinterpret_cast<const uint8_t*>(code->data()), code->size() * 4);
 					const auto      hash = PipelineList::CodeHash(bytes);
+					if (base.where.contains({hash.low, hash.high})) continue;
 					const auto      q    = query_of.at({hash.low, hash.high});
 					if (have[q] || footer_of[q] != 0) continue;
 					footer_of[q] = FooterHash(bytes);
@@ -357,22 +463,57 @@ int Export(const Arguments& args) {
 					}
 					wanted.emplace(footer_of[q], q);
 					max_before = std::max<size_t>(max_before, bytes.size() - FooterBytes);
+					min_code   = std::min<size_t>(min_code, bytes.size());
 					rest++;
 				}
 			}
 		}
 		std::printf("scan: %zu codes not found yet have a footer, %zu have none\n", rest, no_footer);
-		// eboot.bin was searched; the other files, smaller first, until every code is found.
-		auto files = game->Files();
+		// eboot.bin was searched; the other files until every code is found: a base list's data files and
+		// their folders first, then the rest, smaller first.
+		// (Listing a game's files takes a while on its own: not when there is nothing to look for.)
+		auto files = rest == 0 ? std::vector<GameFiles::Entry>() : game->Files();
 		std::erase_if(files, [](const GameFiles::Entry& file) { return file.relative.filename() == "eboot.bin"; });
-		size_t   found_total = 0;
+		if (base.used) {
+			PipelineListTool::OrderForScan(files, base.kept.files,
+			                               [](const GameFiles::Entry& file) { return Common::PathToGenericString(file.relative); });
+		}
+		uint64_t total_bytes = 0;
+		for (const auto& file: files) total_bytes += file.size;
+		size_t   found_total = 0, files_read = 0;
 		uint64_t read_bytes  = 0;
-		for (const auto& [size, path]: files) {
+		// A line about every two seconds while it reads (the launcher shows the last one).
+		auto       reported = std::chrono::steady_clock::now();
+		const auto report   = [&] {
+			const auto now = std::chrono::steady_clock::now();
+			if (now - reported < std::chrono::seconds(2)) return;
+			reported = now;
+			std::printf("scan: %zu of %zu files, %.1f of %.1f GB read, %zu of %zu codes located\n", files_read, files.size(),
+			            static_cast<double>(read_bytes) / 1e9, static_cast<double>(total_bytes) / 1e9, found_total, rest);
+			std::fflush(stdout);
+		};
+		std::fflush(stdout);
+		for (const auto& entry: files) {
 			if (found_total == rest) break;
-			const auto relative = Common::PathToGenericString(path);
-			size_t     in_file  = 0;
-			read_bytes += size;
-			ForEachFooter(game->OpenStream(path), max_before, [&](uint64_t end, std::span<const uint8_t> before) {
+			files_read++;
+			if (entry.size < min_code) { // too small to hold any of the codes (a game can have 200,000 such files)
+				report();
+				continue;
+			}
+			const auto& path     = entry.relative;
+			const auto  relative = Common::PathToGenericString(path);
+			size_t      in_file  = 0;
+			const auto        stream = game->OpenStream(path);
+			GameFiles::Stream counted;
+			if (stream) {
+				counted = [&](uint8_t* data, size_t bytes) {
+					const auto got = stream(data, bytes);
+					read_bytes += got;
+					report();
+					return got;
+				};
+			}
+			ForEachFooter(counted, max_before, [&](uint64_t end, std::span<const uint8_t> before) {
 				const auto footer = XXH3_64bits(before.data() + before.size() - FooterBytes, FooterBytes) | 1u;
 				const auto [first, last] = wanted.equal_range(footer);
 				for (auto it = first; it != last; ++it) {
@@ -389,22 +530,68 @@ int Export(const Arguments& args) {
 			});
 			if (in_file != 0) std::printf("scan: located %zu in %s\n", in_file, relative.c_str());
 		}
-		std::printf("scan: located %zu of %zu (%zu files, %.1f GB read)\n", found_total, rest, files.size(),
+		std::printf("scan: located %zu of %zu (%zu of %zu files, %.1f GB read)\n", found_total, rest, files_read, files.size(),
 		            static_cast<double>(read_bytes) / 1e9);
 	}
 	const PipelineList::Builder::LocateFn locate =
 	    [&](std::span<const uint32_t> code) -> std::optional<PipelineList::Builder::Location> {
 		const auto hash = PipelineList::CodeHash({reinterpret_cast<const uint8_t*>(code.data()), code.size_bytes()});
+		if (const auto known = base.where.find({hash.low, hash.high}); known != base.where.end()) {
+			const auto& [name, offset] = known->second;
+			return PipelineList::Builder::Location {name.empty() ? PipelineList::CodeFile::Executable : builder.AddFile(name), offset};
+		}
 		const auto it   = query_of.find({hash.low, hash.high});
 		if (it == query_of.end() || !have[it->second]) return std::nullopt;
 		return where[it->second];
 	};
-	PipelineList::ExportStats stats;
+	PipelineList::ExportStats base_stats, stats;
+	PipelineList::File        with_base;
+	if (base.used) {
+		builder.AddList(base.kept, base_stats);
+		with_base = builder.Finish();
+	}
 	for (const auto& run: runs) {
-		builder.AddJournals(run.shaders->Sources(), run.shaders->Entries(), run.pipelines->Loaded(), locate, stats);
+		if (!base.used) {
+			builder.AddJournals(run.shaders->Sources(), run.shaders->Entries(), run.pipelines->Loaded(), locate, stats);
+			continue;
+		}
+		// The base list's shaders and permutations go in once more as journal content, in the call that
+		// takes the run's pipelines: that call looks up the pipelines' stage identities.
+		auto       sources = base.sources;
+		auto       entries = base.entries;
+		const auto first   = static_cast<uint32_t>(sources.size());
+		sources.insert(sources.end(), run.shaders->Sources().begin(), run.shaders->Sources().end());
+		for (const auto& entry: run.shaders->Entries()) {
+			entries.push_back({entry.source + first, entry.push_data_cursor, entry.specialization});
+		}
+		builder.AddJournals(sources, entries, run.pipelines->Loaded(), locate, stats);
+		// They are the list's (known already), not the journals': out of the journals' counts.
+		stats.sources -= std::min<uint64_t>(stats.sources, base.sources.size());
+		stats.sources_duplicate -= std::min<uint64_t>(stats.sources_duplicate, base.sources.size());
+		stats.entries -= std::min<uint64_t>(stats.entries, base.entries.size());
 	}
 	PrintExport(stats);
-	return Write(builder.Finish(), args.out);
+	// A module without a permutation identity (an expanded call program, which is not journaled) cannot be
+	// named in a list: its pipelines are among those not kept.
+	size_t unidentified = 0;
+	for (const auto& run: runs) {
+		for (const auto& record: run.pipelines->Loaded()) {
+			PipelineJournalPayload payload;
+			if (!DecodePipelineJournalPayload(record.payload, payload)) continue;
+			unidentified += std::any_of(payload.identities.begin(), payload.identities.end(),
+			                            [](const auto& stage) { return stage.first == 0; })
+			                   ? 1
+			                   : 0;
+		}
+	}
+	if (unidentified != 0) std::printf("  %zu recorded pipelines name a module without an identity (they cannot be listed)\n", unidentified);
+	const auto file = builder.Finish();
+	if (base.used) {
+		std::printf("new since the base list: %zu shaders, %zu permutations, %zu pipelines\n",
+		            file.shaders.size() - with_base.shaders.size(), file.permutations.size() - with_base.permutations.size(),
+		            file.pipelines.size() - with_base.pipelines.size());
+	}
+	return Write(file, args.out);
 }
 
 bool Load(const std::string& path, PipelineList::File& file) {
@@ -547,31 +734,27 @@ int Info(const Arguments& args) {
 	return 0;
 }
 
+// A list resolved against a game copy as the emulator does at start-up: the executable from `image`, data
+// files read where the list names code (never a whole file: a data file can be many gigabytes).
+PipelineList::Resolved ResolveWith(GameFiles& game, const PipelineList::File& file, const std::vector<uint8_t>& image,
+                                   const std::array<uint32_t, 3>& sizes, PipelineList::ResolveStats& stats) {
+	const PipelineList::ReadCodeFn read = [&](PipelineList::CodeFile code_file, uint64_t offset, std::span<uint8_t> out) {
+		const auto index = static_cast<uint32_t>(code_file);
+		if (index != 0) return index <= file.files.size() && game.ReadAt(U8(file.files[index - 1]), offset, out);
+		if (offset > image.size() || out.size() > image.size() - offset) return false;
+		std::memcpy(out.data(), image.data() + offset, out.size());
+		return true;
+	};
+	return PipelineList::Resolve(file, sizes, read, [&](PipelineList::CodeFile) { return image; }, stats);
+}
+
 PipelineList::Resolved ResolveAgainst(const Arguments& args, GameFiles& game, const PipelineList::File& file,
                                       std::vector<uint8_t>& image, PipelineList::ResolveStats& stats) {
 	if (!ReadExecutable(args, game, image)) {
 		std::fprintf(stderr, "cannot read %s\n", ExecutableName(args).c_str());
 		image.clear();
 	}
-	// Data files: read once when first named.
-	auto data_images = std::make_shared<std::map<uint32_t, std::vector<uint8_t>>>();
-	const PipelineList::ReadCodeFn read = [&, data_images](PipelineList::CodeFile code_file, uint64_t offset,
-	                                                       std::span<uint8_t> out) {
-		const auto index = static_cast<uint32_t>(code_file);
-		const std::vector<uint8_t>* source = &image;
-		if (index != 0) {
-			auto [it, added] = data_images->try_emplace(index);
-			if (added && (index > file.files.size() ||
-			              !game.Read(U8(file.files[index - 1]), it->second))) {
-				it->second.clear();
-			}
-			source = &it->second;
-		}
-		if (offset > source->size() || out.size() > source->size() - offset) return false;
-		std::memcpy(out.data(), source->data() + offset, out.size());
-		return true;
-	};
-	return PipelineList::Resolve(file, file.info.input_info_sizes, read, [&](PipelineList::CodeFile) { return image; }, stats);
+	return ResolveWith(game, file, image, file.info.input_info_sizes, stats);
 }
 
 int Check(const Arguments& args) {
@@ -758,6 +941,8 @@ int main(int argc, char** argv) {
 			args.pipelines.push_back(value());
 		} else if (arg == "--data") {
 			args.data.push_back(value());
+		} else if (arg == "--base") {
+			args.base = value();
 		} else if (arg == "--scan") {
 			args.scan = true;
 		} else {

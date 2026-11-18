@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -86,6 +87,28 @@ public:
 		return size == 0 || m_archive->ReadFromFile(node, 0, size, bytes.data()) == size;
 	}
 
+	// `out.size()` bytes at `offset` of the file; false when the file does not hold them. For the many
+	// small reads of a list resolve (a data file can be many gigabytes): a folder's file stays open
+	// until another file is read.
+	bool ReadAt(const std::filesystem::path& relative, uint64_t offset, std::span<uint8_t> out) {
+		if (m_archive == nullptr) {
+			if (!m_at.is_open() || m_at_path != relative) {
+				m_at.close();
+				m_at.clear();
+				m_at.open(m_root / relative, std::ios::binary);
+				m_at_path = relative;
+			}
+			if (!m_at.is_open()) return false;
+			m_at.clear();
+			m_at.seekg(static_cast<std::streamoff>(offset));
+			return out.empty() ||
+			       static_cast<bool>(m_at.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size())));
+		}
+		const auto node = Node(relative);
+		if (node == ZARCHIVE_INVALID_NODE) return false;
+		return out.empty() || m_archive->ReadFromFile(node, offset, out.size(), out.data()) == out.size();
+	}
+
 	// The file read in order; an empty function when it cannot be opened.
 	Stream OpenStream(const std::filesystem::path& relative) {
 		if (m_archive == nullptr) {
@@ -156,6 +179,9 @@ private:
 
 	std::filesystem::path           m_root;
 	std::unique_ptr<ZArchiveReader> m_archive;
+	// ReadAt: the folder file it read last.
+	std::ifstream         m_at;
+	std::filesystem::path m_at_path;
 };
 
 // Title and version as the emulator reads them (loader/systemContent.cpp: titleId, contentVersion).

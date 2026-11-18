@@ -840,12 +840,36 @@ static int RunListTool(QWidget* parent, const QString& tool, const QStringList& 
 		*cancelled = true;
 		process.kill();
 	});
+	// The tool's lines as they come: while it searches the game's files it says how far it is.
+	QByteArray pending;
+	const auto take = [&]() {
+		pending += process.readAll();
+		const auto end = pending.lastIndexOf('\n');
+		if (end < 0) {
+			return;
+		}
+		const auto text = QString::fromUtf8(pending.left(end + 1));
+		pending.remove(0, end + 1);
+		*output += text;
+		const auto lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+		for (auto line = lines.crbegin(); line != lines.crend(); ++line) {
+			ShaderListExport::Scan scan;
+			if (ShaderListExport::ParseScan(*line, &scan)) {
+				progress.setLabelText(label + QStringLiteral("\n\n") + ShaderListExport::ScanText(scan));
+				progress.setRange(0, 1000);
+				progress.setValue(ShaderListExport::ScanPermille(scan));
+				break;
+			}
+		}
+	};
+	QObject::connect(&process, &QProcess::readyRead, &progress, take);
 	if (process.state() != QProcess::NotRunning) {
 		progress.show();
 		loop.exec();
 	}
 	process.waitForFinished(5000);
-	*output += QString::fromUtf8(process.readAll());
+	take();
+	*output += QString::fromUtf8(pending + process.readAll());
 	if (*cancelled || process.exitStatus() != QProcess::NormalExit) {
 		return -1;
 	}
@@ -921,6 +945,14 @@ void MainDialogPrivate::ExportShaderList() {
 		executable = QDir(info->basedir).filePath(info->elf);
 	}
 
+	// The list the game's sessions ran with (as Precompile finds it): the emulator records only what
+	// it did not get from that list, so the export takes it in.
+	QProcess probe;
+	(void)SetupEmulatorProcess(&probe, m_interpreter, *info);
+	const auto base_list =
+	    ShaderListExport::BaseList(emulator_dir, info->title_id, info->gameVersion,
+	                               probe.processEnvironment().value(QLatin1String(Precompile::ENV_LIST)));
+
 	m_exporting = true;
 	struct Done {
 		bool* flag;
@@ -929,7 +961,7 @@ void MainDialogPrivate::ExportShaderList() {
 	QString output;
 	bool    cancelled = false;
 	int     code      = RunListTool(m_main_dialog, tool,
-	                                ShaderListExport::ExportArguments(partial, info->basedir, executable, journals),
+	                                ShaderListExport::ExportArguments(partial, info->basedir, executable, journals, base_list),
 	                                tr("Making the shader list of %1...").arg(game_name), &output, &cancelled);
 	ShaderListExport::Written written;
 	if (cancelled) {
@@ -973,15 +1005,29 @@ void MainDialogPrivate::ExportShaderList() {
 	const auto native = QDir::toNativeSeparators(out);
 	qInfo().noquote() << "export-list: ok:" << native << written.shaders << "shaders" << written.permutations
 	                  << "permutations" << written.pipelines << "pipelines";
+	// With a list installed for the game: what the sessions added to it.
+	QString                   added_text;
+	ShaderListExport::Written added;
+	if (ShaderListExport::ParseAdded(output, &added)) {
+		added_text = added.shaders == 0 && added.permutations == 0 && added.pipelines == 0
+		                 ? tr("Your sessions added nothing to the shader list this game already has here: the file "
+		                      "holds that list.\n\n")
+		                 : tr("It holds the shader list this game already has here and what your sessions added to "
+		                      "it: %1 shaders, %2 permutations, %3 pipelines.\n\n")
+		                       .arg(added.shaders)
+		                       .arg(added.permutations)
+		                       .arg(added.pipelines);
+	}
 	QMessageBox box(QMessageBox::Information, window_title,
-	                tr("The shader list of %1 is saved:\n%2\n\n%3 shaders, %4 permutations, %5 pipelines.\n\n"
+	                tr("The shader list of %1 is saved:\n%2\n\n%3 shaders, %4 permutations, %5 pipelines.\n\n%6"
 	                   "Send this one file to other players. It holds where each shader is in the game files and "
 	                   "its hashes, no game code. Do not send the _PipelineCache folder, the .journal files or any "
 	                   "game files.")
 	                    .arg(game_name, native)
 	                    .arg(written.shaders)
 	                    .arg(written.permutations)
-	                    .arg(written.pipelines),
+	                    .arg(written.pipelines)
+	                    .arg(added_text),
 	                QMessageBox::Close, m_main_dialog);
 	box.setTextFormat(Qt::PlainText);
 	box.setTextInteractionFlags(Qt::TextSelectableByMouse);

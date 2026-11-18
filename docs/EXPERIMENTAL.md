@@ -30,6 +30,15 @@ This release builds on the U59 renderer of the previous U59 releases.
   nothing is kept when either step fails. It is off while the game runs or is being precompiled, and says so when
   nothing has been recorded yet. Scripts: `kyty_launcher --export-list <game folder or .zar> [--export-list-out
   <file>]`. Windows only for now (the button is hidden when `kyty_pipeline_list` is not next to the launcher).
+  The emulator records only what it did not get from an installed list, so the export takes in the list the game
+  ran with (`PipelineLists/<title>.kyplst`, or the file `KYTY_PIPELINE_LIST` names): the saved file holds that list
+  and what your sessions added, and the window says how much is new. A list of the int21 release (the two Astro
+  lists here) gives its shaders and permutations, converted the way the emulator converts them; its pipelines were
+  recorded with the older layout and are left out, the ones your sessions recorded go in. Pipelines whose first
+  stage's identity depends on the GPU cannot be listed yet (40 of 1,192 in one Astro Bot recording). Shaders that
+  are not in the game's executable are searched for in its data files, the installed list's files and their
+  folders first; for a large game that has no list yet this first search can take tens of minutes (the window shows
+  how far it is and can cancel).
 - **Faster GPU synchronisation (experimental)**, a per-game checkbox in the game configuration (Graphics), default
   off: starts the game with `KYTY_GPU_HAZARD=3`, `KYTY_INDIRECT_ARGS_RANGES=1`, `KYTY_GUEST_BARRIER_SCOPE=rel=drop` and
   `KYTY_DMA_BARRIER_BATCH=1`, which trim redundant GPU barriers (about 1 fps in heavy Astro Bot scenes). Turn it off

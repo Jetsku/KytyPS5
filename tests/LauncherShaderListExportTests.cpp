@@ -63,10 +63,17 @@ int main(int argc, char** argv) {
 	const auto shaders  = QDir(emulator).filePath(QStringLiteral("_PipelineCache/PPSA00001.shaders.journal"));
 	const auto pipes    = QDir(emulator).filePath(QStringLiteral("_PipelineCache/PPSA00001.pipelines.journal"));
 	Check(FindJournals(emulator, title).IsEmpty(), "no journals yet");
+	// A session whose shaders all came from an installed list writes pipelines only.
+	Write(pipes, "journal");
+	const auto pipelines_only = FindJournals(emulator, title);
+	Check(!pipelines_only.IsEmpty() && pipelines_only.shaders.isEmpty() && pipelines_only.pipelines == QDir::cleanPath(pipes),
+	      "a pipeline journal alone is found");
+	Check(QFile::remove(pipes), "cannot remove a file");
 	Write(shaders, "journal");
-	Check(FindJournals(emulator, title).IsEmpty(), "one journal is not enough");
 	Write(pipes, QByteArray());
-	Check(FindJournals(emulator, title).IsEmpty(), "an empty pipeline journal is nothing recorded");
+	const auto shaders_only = FindJournals(emulator, title);
+	Check(!shaders_only.IsEmpty() && shaders_only.shaders == QDir::cleanPath(shaders) && shaders_only.pipelines.isEmpty(),
+	      "an empty pipeline journal is not a journal");
 	Write(pipes, "journal");
 	const auto journals = FindJournals(emulator, title);
 	Check(!journals.IsEmpty() && journals.shaders == QDir::cleanPath(shaders) && journals.pipelines == QDir::cleanPath(pipes),
@@ -85,13 +92,41 @@ int main(int argc, char** argv) {
 	// Arguments: those of the export window, with native paths; --exe only when given.
 	const auto partial = PartialPath(out);
 	const auto game    = base.filePath(QStringLiteral("games/PPSA00001"));
-	const auto ea      = ExportArguments(partial, game, {}, journals);
+	const auto ea      = ExportArguments(partial, game, {}, journals, {});
 	Check(ea == QStringList({QStringLiteral("export"), QStringLiteral("--out"), QDir::toNativeSeparators(partial),
 	                         QStringLiteral("--game"), QDir::toNativeSeparators(game), QStringLiteral("--shaders"),
 	                         QDir::toNativeSeparators(journals.shaders), QStringLiteral("--pipelines"),
 	                         QDir::toNativeSeparators(journals.pipelines), QStringLiteral("--producer"),
-	                         QStringLiteral("kyty launcher export")}),
-	      "export arguments");
+	                         QStringLiteral("kyty launcher export"), QStringLiteral("--scan")}),
+	      "export arguments: the data files are searched");
+	// With the list the sessions ran with, and a session that wrote pipelines only.
+	const auto list = QDir(emulator).filePath(QStringLiteral("PipelineLists/PPSA00001.kyplst"));
+	const auto eb   = ExportArguments(partial, game, {}, pipelines_only, list);
+	Check(eb.mid(5) == QStringList({QStringLiteral("--shaders"), QStringLiteral("none"), QStringLiteral("--pipelines"),
+	                                QDir::toNativeSeparators(pipelines_only.pipelines), QStringLiteral("--producer"),
+	                                QStringLiteral("kyty launcher export"), QStringLiteral("--scan"), QStringLiteral("--base"),
+	                                QDir::toNativeSeparators(list)}),
+	      "export arguments with a base list and no shader journal");
+	Check(VerifyArguments(partial, game, {}, pipelines_only) ==
+	          QStringList({QStringLiteral("verify"), QDir::toNativeSeparators(partial), QStringLiteral("--game"),
+	                       QDir::toNativeSeparators(game)}),
+	      "verify arguments without a shader journal");
+
+	// The base list: the one the emulator loads for the game.
+	const auto version = QStringLiteral("01.018.000");
+	Check(BaseList(emulator, title, version, {}).isEmpty(), "no list installed");
+	Write(list, "list");
+	Check(BaseList(emulator, title, version, {}) == QDir::cleanPath(list), "the game's list");
+	Check(BaseList(emulator, title, version, QStringLiteral("1")) == QDir::cleanPath(list), "KYTY_PIPELINE_LIST=1 is that list too");
+	const auto versioned = QDir(emulator).filePath(QStringLiteral("PipelineLists/PPSA00001_01.018.000.kyplst"));
+	Write(versioned, "list");
+	Check(BaseList(emulator, title, version, {}) == QDir::cleanPath(versioned), "the list of the game's version first");
+	Check(BaseList(emulator, title, version, QStringLiteral("0")).isEmpty(), "lists off");
+	Write(QDir(emulator).filePath(QStringLiteral("my/own.kyplst")), "list");
+	Check(BaseList(emulator, title, version, QStringLiteral("my/own.kyplst")) ==
+	          QDir::cleanPath(QDir(emulator).filePath(QStringLiteral("my/own.kyplst"))),
+	      "a list KYTY_PIPELINE_LIST names, from the emulator's folder");
+	Check(BaseList(emulator, title, version, QStringLiteral("missing.kyplst")).isEmpty(), "a named list that is not there");
 	const auto va = VerifyArguments(partial, game, game + QStringLiteral("/other.elf"), journals);
 	Check(va == QStringList({QStringLiteral("verify"), QDir::toNativeSeparators(partial), QStringLiteral("--game"),
 	                         QDir::toNativeSeparators(game), QStringLiteral("--exe"),
@@ -111,6 +146,31 @@ int main(int argc, char** argv) {
 	Check(ParseWritten(QStringLiteral("wrote a: 10 bytes, 0 shaders, 0 permutations, 0 pipelines, 0 levels\n"), &written) &&
 	          written.shaders == 0,
 	      "an empty list");
+
+	// What the sessions added to the base list, and the file search's progress lines.
+	Written added;
+	Check(!ParseAdded(QStringLiteral("wrote a: 10 bytes, 1 shaders, 1 permutations, 1 pipelines, 0 levels\n"), &added),
+	      "no base list: no line");
+	Check(ParseAdded(QStringLiteral("  pipelines 857: 43 new\r\nnew since the base list: 2 shaders, 3 permutations, 43 pipelines\r\n"
+	                                "wrote a: 10 bytes, 1050 shaders, 1120 permutations, 1076 pipelines, 0 levels\r\n"),
+	                 &added) &&
+	          added.shaders == 2 && added.permutations == 3 && added.pipelines == 43,
+	      "the counts of the new line");
+	Scan scan;
+	Check(!ParseScan(QStringLiteral("scan: located 3 in d/material"), &scan), "a line about one file is not progress");
+	Check(!ParseScan(QStringLiteral("scan: located 2 of 2 (2 of 203 files, 0.3 GB read)"), &scan), "nor is the last line");
+	Check(ParseScan(QStringLiteral("scan: 150 of 200 files, 12.3 of 94.9 GB read, 640 of 869 codes located\r"), &scan) &&
+	          scan.files == 150 && scan.files_total == 200 && scan.located == 640 && scan.wanted == 869 && scan.read_gb > 12.29 &&
+	          scan.read_gb < 12.31 && scan.total_gb > 94.89 && scan.total_gb < 94.91,
+	      "a progress line");
+	Check(!ParseScan(QStringLiteral("scan: 12.3 of 94.9 GB read, 640 of 869 codes located"), &scan), "a line without the files");
+	// Three quarters of the files and 13% of the bytes: the mean of the two.
+	Check(ScanPermille(scan) == 439, "the part of the search done");
+	Check(ScanText(scan).contains(QStringLiteral("150 of 200 files, 12.3 of 94.9 GB")) && ScanText(scan).contains(QStringLiteral("869")),
+	      "the progress text");
+	Check(ScanPermille(Scan {}) == 0 && ScanPermille(Scan {7, 7, 5.0, 5.0, 1, 1}) == 999 &&
+	          ScanPermille(Scan {100000, 200000, 0.0, 88.0, 0, 9}) == 250,
+	      "the ends of the range, and many small files first");
 
 	// Keep: the checked list replaces an older one; the partial file never stays.
 	Write(partial, "new list");
