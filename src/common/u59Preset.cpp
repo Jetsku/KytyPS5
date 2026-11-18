@@ -12,21 +12,54 @@
 
 namespace Common::U59Preset {
 
+namespace {
+
+// Keeps the parser's first error message and drops every value. Most of the emulator (the Linux
+// build in full) compiles without exceptions, so the message is taken from the SAX interface
+// instead of a caught parse_error.
+class ErrorCollector final: public nlohmann::json::json_sax_t {
+public:
+	std::string message;
+
+	bool null() override { return true; }
+	bool boolean(bool /*value*/) override { return true; }
+	bool number_integer(number_integer_t /*value*/) override { return true; }
+	bool number_unsigned(number_unsigned_t /*value*/) override { return true; }
+	bool number_float(number_float_t /*value*/, const string_t& /*text*/) override { return true; }
+	bool string(string_t& /*value*/) override { return true; }
+	bool binary(binary_t& /*value*/) override { return true; }
+	bool start_object(std::size_t /*elements*/) override { return true; }
+	bool key(string_t& /*value*/) override { return true; }
+	bool end_object() override { return true; }
+	bool start_array(std::size_t /*elements*/) override { return true; }
+	bool end_array() override { return true; }
+	bool parse_error(std::size_t /*position*/, const std::string& /*last_token*/,
+	                 const nlohmann::json::exception& ex) override {
+		message = ex.what();
+		return false;
+	}
+};
+
+} // namespace
+
 bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& error) {
 	entries.clear();
 	// Hand-edited presets (issue #85: two keys added, then the whole file was not applied and the
 	// game ran on the code defaults): a trailing comma and // comments are accepted, and any other
 	// syntax error names its line and column.
-	nlohmann::json document;
-	try {
-		document = nlohmann::json::parse(text.begin(), text.end(), nullptr, true,
-		                                 /*ignore_comments=*/true, /*ignore_trailing_commas=*/true);
-	} catch (const nlohmann::json::parse_error& e) {
-		std::string_view what = e.what();
+	nlohmann::json document = nlohmann::json::parse(text.begin(), text.end(), nullptr, /*allow_exceptions=*/false,
+	                                                /*ignore_comments=*/true, /*ignore_trailing_commas=*/true);
+	if (document.is_discarded()) {
+		// A second pass with the same options only for the message ("parse error at line 3, column 3: ...").
+		ErrorCollector collector;
+		(void)nlohmann::json::sax_parse(text.begin(), text.end(), &collector, nlohmann::json::input_format_t::json,
+		                                /*strict=*/true, /*ignore_comments=*/true, /*ignore_trailing_commas=*/true);
+		std::string_view what = collector.message;
 		if (const auto at = what.find("] "); what.starts_with("[json.exception") && at != what.npos) {
 			what.remove_prefix(at + 2);
 		}
-		error = fmt::format("not valid JSON ({}); check for a missing comma or quote", what);
+		error = fmt::format("not valid JSON ({}); check for a missing comma or quote",
+		                    what.empty() ? std::string_view("syntax error") : what);
 		return false;
 	}
 	if (!document.is_object()) {
