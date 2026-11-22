@@ -193,6 +193,9 @@ private:
 	PadTriggerEffectParam  m_trigger_effect {};
 	// Every effect the game set, for scePadGetTriggerEffectState (m_trigger_effect only keeps sent ones).
 	PadTriggerEffectParam  m_state_effect {};
+	// The trigger bytes last handed to SDL for m_active_id, per trigger (0 left, 1 right).
+	std::array<std::array<uint8_t, 11>, 2> m_sent_trigger {};
+	std::array<bool, 2>                    m_sent_trigger_valid {};
 	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
 };
@@ -992,6 +995,7 @@ void GameController::SetDevices(int active_id) {
 	m_vibration_until    = 0;
 	m_trigger_effect     = {};
 	m_state_effect       = {};
+	m_sent_trigger_valid = {};
 }
 
 // KYTY_PAD_STATE_COALESCE=1 (default off): an input event that changes no button and no touch
@@ -1483,9 +1487,33 @@ bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
 		return true;
 	}
 
+	// Games set the same effect again and again (Astro Bot: every frame). SDL queues every
+	// DualSense output report and writes one per 10 ms; a request only merges into the newest
+	// pending one with the same enable bits, and rumble changes interleave, so repeats outran the
+	// writer, the queue grew for the whole session and each send walked it (about 30 fps after an
+	// hour, also in menus). Send only the triggers whose bytes changed.
+	const std::array<uint8_t*, 2> bytes = {effect.left_trigger, effect.right_trigger};
+	const std::array<uint8_t, 2>  bits  = {0x08, 0x04};
+	for (int i = 0; i < 2; i++) {
+		if ((effect.enable_bits & bits[i]) != 0 && m_sent_trigger_valid[i] &&
+		    std::memcmp(bytes[i], m_sent_trigger[i].data(), m_sent_trigger[i].size()) == 0) {
+			effect.enable_bits &= static_cast<uint8_t>(~bits[i]);
+			std::memset(bytes[i], 0, m_sent_trigger[i].size());
+		}
+	}
+	if (effect.enable_bits == 0) {
+		return true;
+	}
+
 	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
-	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
-		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5 &&
+	    SDL_SendGamepadEffect(pad, &effect, sizeof(effect))) {
+		for (int i = 0; i < 2; i++) {
+			if ((effect.enable_bits & bits[i]) != 0) {
+				std::memcpy(m_sent_trigger[i].data(), bytes[i], m_sent_trigger[i].size());
+				m_sent_trigger_valid[i] = true;
+			}
+		}
 	}
 	return true;
 }

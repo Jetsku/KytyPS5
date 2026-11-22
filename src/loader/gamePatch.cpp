@@ -11,6 +11,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -338,7 +339,8 @@ void ApplyBuiltin(Program* main_program) {
 	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
 		return;
 	}
-	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21567 01.018.000) sizes its
+	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21567 01.018.000; other versions
+	// where the table is found by its contents, such as 01.019.000) sizes its
 	// five draw threads' command buffers {7, 7, 4, 4, 6} MiB (table at 0x8491510, read by
 	// sub_4A38C0); running out is its "too many objects/batches in this scene" assert (Bug C). In
 	// speedrun_inflator the Draw Geometry thread's frame is mostly mesh-deformer dispatches with
@@ -356,17 +358,49 @@ void ApplyBuiltin(Program* main_program) {
 	std::string title_id;
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
-	    !SystemContentParamSfoGetString("APP_VER", &version) || title_id != "PPSA21567" ||
-	    version != "01.018.000") {
+	    !SystemContentParamSfoGetString("APP_VER", &version) || title_id != "PPSA21567") {
 		return;
 	}
 	static constexpr uint64_t kTable     = 0x8491510;
 	static constexpr uint32_t kSizes[5]  = {7, 7, 4, 4, 6};
-	const auto                address    = main_program->base_vaddr + kTable;
-	if (!IsInsideProgram(*main_program, address, sizeof(kSizes)) ||
+	auto                      address    = main_program->base_vaddr + kTable;
+	if (version != "01.018.000" || !IsInsideProgram(*main_program, address, sizeof(kSizes)) ||
 	    std::memcmp(reinterpret_cast<const void*>(address), kSizes, sizeof(kSizes)) != 0) {
-		::printf("Game patch: Astro Bot command buffer table not found (KYTY_ASTRO_CB_SCALE)\n");
-		return;
+		// Other versions (01.019.000) keep the table elsewhere: use it when the loaded segments hold
+		// these 20 bytes exactly once.
+		address = 0;
+		int         matches = 0;
+		const auto* pattern = reinterpret_cast<const uint8_t*>(kSizes);
+		const auto* ehdr    = main_program->elf->GetEhdr();
+		const auto* phdr    = main_program->elf->GetPhdr();
+		for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+			const auto& segment = phdr[index];
+			if ((segment.p_type != PT_LOAD && segment.p_type != PT_OS_RELRO) ||
+			    segment.p_filesz < sizeof(kSizes)) {
+				continue;
+			}
+			const auto* begin = reinterpret_cast<const uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			const auto* end   = begin + segment.p_filesz;
+			for (const auto* current = begin; current < end; current++) {
+				current = std::search(current, end, pattern, pattern + sizeof(kSizes));
+				if (current == end) {
+					break;
+				}
+				if (reinterpret_cast<uint64_t>(current) % alignof(uint32_t) == 0 &&
+				    reinterpret_cast<uint64_t>(current) != address) {
+					address = reinterpret_cast<uint64_t>(current);
+					matches++;
+				}
+			}
+		}
+		if (matches != 1) {
+			::printf("Game patch: Astro Bot %s command buffer table not found (%d matches; "
+			         "KYTY_ASTRO_CB_SCALE)\n",
+			         version.c_str(), matches);
+			return;
+		}
+		::printf("Game patch: Astro Bot %s command buffer table at +0x%" PRIx64 "\n", version.c_str(),
+		         address - main_program->base_vaddr);
 	}
 	uint32_t scaled[5] {};
 	for (int i = 0; i < 5; i++) {
