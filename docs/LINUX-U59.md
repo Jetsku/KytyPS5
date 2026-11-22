@@ -70,6 +70,34 @@ frame. The log shows the measured costs in a `Kyty platform:` line and
    `unavailable`, the kernel is too old or userfaultfd is blocked, and
    everything runs as without the flag.
 
+## Thread placement (KYTY_CPU_RESERVE, KYTY_VCACHE_PLACEMENT)
+
+The command-processor thread hands every draw to Vulkan in order and limits the frame rate in
+draw-heavy views. `KYTY_CPU_RESERVE` (a core of its own for it) and `KYTY_VCACHE_PLACEMENT` were
+Windows-only (CPU sets); on Linux the log said `no allowed processor in group 0` and every thread
+ran anywhere. Linux now has the same placement: the topology comes from sysfs (SMT siblings, L3
+groups, the amd_pstate prefcore or ACPI CPPC ranking) and threads get hard affinities. Linux has no
+process default CPU sets, so threads without a role get the general processors: the main thread's
+affinity before the other threads start, and a monitor pass once a second for threads started
+later (a thread inherits its creator's affinity). A thread found with an affinity this module did
+not set is left alone. The startup affinity (`taskset`) is the process mask.
+
+`KYTY_VCACHE_PLACEMENT=ccd` (new, Windows and Linux) applies the V-cache layout to CPUs with two L3
+groups of similar size (Ryzen 7900X/7950X/9900X/9950X): the CCD with the preferred core gets the
+emulator's threads, the other CCD the game's threads (`KYTY_VCACHE_GUEST` defaults to `cold` in
+this mode). Measured on a Ryzen 9 9900X + RX 7900 XT (CachyOS, kernel 7.3, non-PGO build), Astro
+Bot, a draw-heavy forward view in the Sky Garden, frames per second averaged over 15-20 s:
+
+| Placement | fps |
+| --- | --- |
+| none (before) | 42.7, 44.2, 42.8 |
+| CP, sequencer and recorder on cores of their own (`KYTY_CPU_RESERVE=stages`) | 47.9, 48.8, 49.8 |
+| emulator CCD / game CCD only | 50.4 |
+| both (`KYTY_CPU_RESERVE=stages` + `KYTY_VCACHE_PLACEMENT=ccd`) | 58.9, 56.1, 57.0, 55.7 |
+
+The CP was busy 97% of every second in all rows but the last (the GPU about 67%, waiting for work).
+A 382 s session with both switches averaged 59.1 fps (360 s at 55 fps or more).
+
 ## Portability changes
 
 - Enable exceptions for `src/common/profiler.cpp` on Linux only: loading

@@ -41,6 +41,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__linux__)
+#include <sched.h>
 #endif
 
 namespace {
@@ -375,9 +377,108 @@ void TestVCache() {
 		Check(Common::ParseVCacheMode("1", &valid) == VCacheMode::On && valid, "vcache 1");
 		Check(Common::ParseVCacheMode("on", &valid) == VCacheMode::On && valid, "vcache on");
 		Check(Common::ParseVCacheMode("2", &valid) == VCacheMode::Auto && !valid, "vcache unknown");
+		Check(Common::ParseVCacheMode("ccd", &valid) == VCacheMode::Ccd && valid, "vcache ccd");
 	}
 	std::puts("CpuPlacementTests: V-cache topologies ok");
 }
+
+// KYTY_VCACHE_PLACEMENT=ccd: Ryzen 9 9900X as Linux sysfs reports it: 12 cores, SMT siblings n and
+// n+12, CCD0 = logical 0-5,12-17 and CCD1 = 6-11,18-23 (32 MiB L3 each), preferred cores 1 and 3
+// (amd_pstate prefcore ranking 216) on CCD0.
+void TestCcdSplit() {
+	using Common::ComputeVCacheLayout;
+	using Common::DecideVCachePlacement;
+	using Common::DetectCcdSplit;
+	using Common::DetectVCache;
+	static constexpr uint8_t Rank[12] = {211, 216, 206, 216, 196, 201, 181, 191, 186, 176, 166, 171};
+	std::vector<CpuSetInfo> sets;
+	for (uint32_t lp = 0; lp < 24; lp++) {
+		CpuSetInfo set;
+		set.id               = lp;
+		set.logical          = static_cast<uint8_t>(lp);
+		set.core             = static_cast<uint8_t>(lp % 12);
+		set.cache            = static_cast<uint8_t>(lp % 12 < 6 ? 0 : 1);
+		set.scheduling_class = Rank[lp % 12];
+		set.allowed          = true;
+		sets.push_back(set);
+	}
+	const uint64_t ccd0   = 0x3F03F;  // 0-5,12-17
+	const uint64_t ccd1   = 0xFC0FC0; // 6-11,18-23
+	const auto     caches = std::vector<L3Cache> {L3(ccd0, 32), L3(ccd1, 32)};
+	Check(!DetectVCache(caches).dual, "9900X: not a V-cache CPU");
+	Check(!DecideVCachePlacement(VCacheMode::Auto, DetectVCache(caches), false, false).engage,
+	      "9900X, auto: no change");
+	const auto topology = DetectCcdSplit(caches, sets);
+	Check(topology.dual && topology.vcache_mask == ccd0 && topology.other_mask == ccd1,
+	      "9900X ccd: the CCD with the preferred core is hot");
+	Check(DecideVCachePlacement(VCacheMode::Ccd, topology, false, false).engage, "9900X ccd: applies");
+	const auto stages = ComputeVCacheLayout(sets, CpuReserveMode::Stages, -1, topology);
+	Check(stages.vcache && stages.reserved && (stages.cp_mask | stages.recorder_mask | stages.sequencer_mask |
+	                                           stages.general_mask) == ccd0 &&
+	          (stages.cp_mask == 0x8008 || stages.cp_mask == 0x2002) && Count(stages.general_mask) == 6 &&
+	          stages.cold_mask == ccd1,
+	      "9900X ccd stages: CP on a preferred core, three cores reserved on CCD0, game threads on CCD1");
+	// The preferred core on the second CCD: that CCD is hot.
+	auto swapped = sets;
+	for (auto& set: swapped) {
+		set.scheduling_class = static_cast<uint8_t>(set.cache == 1 ? 250 : 100);
+	}
+	Check(DetectCcdSplit(caches, swapped).vcache_mask == ccd1, "ccd: the hot CCD follows the ranking");
+	// Not allowed (taskset to CCD1): the preferred allowed processor decides.
+	auto pinned = sets;
+	for (auto& set: pinned) {
+		set.allowed = set.cache == 1;
+	}
+	Check(DetectCcdSplit(caches, pinned).vcache_mask == ccd1, "ccd: only allowed processors count");
+	Check(!DetectCcdSplit({L3(0xFFFFFF, 64)}, sets).dual, "ccd: one L3, no change");
+	Check(!DecideVCachePlacement(VCacheMode::Ccd, DetectCcdSplit({L3(0xFFFFFF, 64)}, sets), false, false)
+	           .engage,
+	      "ccd with one L3: no change");
+	std::puts("CpuPlacementTests: ccd split ok");
+}
+
+#if defined(__linux__)
+uint64_t AffinityOf(pid_t tid) {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(tid, sizeof(set), &set) != 0) {
+		return 0;
+	}
+	uint64_t mask = 0;
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		mask |= CPU_ISSET(cpu, &set) ? uint64_t {1} << cpu : 0;
+	}
+	return mask;
+}
+
+// Linux: the CP thread gets its reserved core, a thread without a role started from the CP gets
+// the general processors after the monitor's pass, a cold thread keeps the default.
+void TestLinuxLive() {
+	Common::InitCpuPlacement();
+	const auto layout = Common::CurrentCpuLayout();
+	if (!layout.reserved) {
+		std::printf("CpuPlacementTests: Linux live placement skipped (%s)\n", layout.description.c_str());
+		return;
+	}
+	Check(AffinityOf(0) == layout.general_mask, "Linux: the main thread runs on the general processors");
+	std::atomic<uint64_t> cp_mask {0};
+	std::atomic<uint64_t> child_before {0};
+	std::atomic<uint64_t> child_after {0};
+	std::thread([&] {
+		Common::PlaceCurrentThread(Common::ThreadRole::Cp);
+		cp_mask = AffinityOf(0);
+		std::thread([&] {
+			child_before = AffinityOf(0);
+			Common::MaintainCpuPlacement();
+			child_after = AffinityOf(0);
+		}).join();
+	}).join();
+	Check(cp_mask == layout.cp_mask, "Linux: the CP runs on its reserved core");
+	Check(child_before == layout.cp_mask, "Linux: a thread started by the CP inherits its core");
+	Check(child_after == layout.general_mask, "Linux: the monitor's pass moves it to the general processors");
+	std::printf("CpuPlacementTests: Linux live placement ok (%s)\n", layout.description.c_str());
+}
+#endif
 
 void TestAffinityAndModes() {
 	const auto layout = Common::ComputeCpuLayout(MachineTable(0xFFFF), CpuReserveMode::Cp, -1);
@@ -1240,12 +1341,15 @@ int main(int argc, char** argv) {
 
 	TestLayouts();
 	TestVCache();
+	TestCcdSplit();
 	TestAffinityAndModes();
 	Check(Common::GetCpuReserveMode() == mode, "KYTY_CPU_RESERVE");
 #if defined(_WIN32)
 	TestLive(mode);
+#elif defined(__linux__)
+	TestLinuxLive();
 #else
-	std::puts("CpuPlacementTests: live placement skipped (Windows only)");
+	std::puts("CpuPlacementTests: live placement skipped (Windows and Linux only)");
 #endif
 	std::puts("CpuPlacementTests: ok");
 	return 0;

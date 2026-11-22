@@ -142,7 +142,10 @@ struct VCacheTopology {
 	std::string description;
 };
 
-enum class VCacheMode : uint8_t { Auto, Off, On };
+// Ccd (KYTY_VCACHE_PLACEMENT=ccd): the same placement on a CPU with two or more L3 groups of
+// similar size (Ryzen 7900X, 7950X, 9900X, 9950X: no V-cache). The hot CCD is the L3 group holding
+// the preferred core (CPPC ranking), see DetectCcdSplit.
+enum class VCacheMode : uint8_t { Auto, Off, On, Ccd };
 
 struct VCacheDecision {
 	bool        engage = false;
@@ -188,6 +191,12 @@ struct ReserveRules {
                                          const ReserveRules& rules = {});
 // Pure (tested): the L3 groups as a V-cache topology (KYTY_VCACHE_PLACEMENT).
 [[nodiscard]] VCacheTopology DetectVCache(const std::vector<L3Cache>& caches);
+// Pure (tested): KYTY_VCACHE_PLACEMENT=ccd. Two or more L3 groups (any sizes): the hot side
+// (`vcache_mask`) is the group holding the allowed logical processor with the highest scheduling
+// class (CPPC preferred-core ranking; ties: the lower processor), every other group is cold.
+// `dual` false with fewer than two groups or no allowed processor.
+[[nodiscard]] VCacheTopology DetectCcdSplit(const std::vector<L3Cache>& caches,
+                                            const std::vector<CpuSetInfo>& sets);
 // Pure (tested): whether the V-cache placement applies. `external_rule`: an affinity or CPU-set
 // rule of another process was seen; `cpu_sets`: KYTY_CPU_SETS is set.
 [[nodiscard]] VCacheDecision DecideVCachePlacement(VCacheMode mode, const VCacheTopology& topology,
@@ -200,7 +209,7 @@ struct ReserveRules {
                                             int forced_cp_logical, const VCacheTopology& topology,
                                             uint32_t min_general = kMinGeneralProcessors,
                                             const ReserveRules& rules = {});
-// KYTY_VCACHE_PLACEMENT=auto|0|1 (also off|on); nullptr is auto. `valid` false: unknown text.
+// KYTY_VCACHE_PLACEMENT=auto|0|1|ccd (also off|on); nullptr is auto. `valid` false: unknown text.
 [[nodiscard]] VCacheMode ParseVCacheMode(const char* text, bool* valid = nullptr);
 [[nodiscard]] VCacheMode GetVCacheMode(); // evaluated once
 // Pure (tested): the hard affinity a thread with `affinity` should get so that it stays off the
@@ -268,7 +277,8 @@ void               SamplePlacement(ThreadRole role);
 [[nodiscard]] uint32_t ProcessAffinityProcessorCount();
 // The CPU set table as the placement reads it: `allowed` = in the process affinity mask, not
 // allocated to another process, and inside KYTY_CPU_SETS or another process's default CPU sets
-// (never this module's own). `affinity` receives the process mask. Empty off Windows.
+// (never this module's own). `affinity` receives the process mask. Empty off Windows (the Linux
+// placement reads its own table from sysfs; the core budget and the small-CPU rule stay off there).
 // KYTY_CORE_BUDGET's source (common/coreBudget.h).
 [[nodiscard]] std::vector<CpuSetInfo> ReadProcessCpuSets(uint64_t* affinity = nullptr);
 // The threads this module keeps handles of (PlaceCurrentThreadGuest: guest threads;
