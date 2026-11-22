@@ -24,6 +24,13 @@
 #include <windows.h>
 // After windows.h.
 #include <tlhelp32.h>
+#elif defined(__linux__)
+#include <dirent.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <fstream>
 #endif
 
 namespace Common {
@@ -374,11 +381,70 @@ VCacheTopology DetectVCache(const std::vector<L3Cache>& caches) {
 	return topology;
 }
 
+VCacheTopology DetectCcdSplit(const std::vector<L3Cache>& caches, const std::vector<CpuSetInfo>& sets) {
+	VCacheTopology               topology;
+	std::map<uint64_t, uint64_t> by_mask;
+	for (const auto& cache: caches) {
+		if (cache.group == 0 && cache.mask != 0) {
+			auto& bytes = by_mask[cache.mask];
+			bytes       = std::max(bytes, cache.bytes);
+		}
+	}
+	topology.groups = static_cast<uint32_t>(by_mask.size());
+	std::string sizes;
+	for (const auto& [mask, bytes]: by_mask) {
+		sizes += (sizes.empty() ? "" : ", ") + MiB(bytes) + " on logical " + MaskText(mask);
+	}
+	if (by_mask.size() < 2) {
+		topology.description = by_mask.empty() ? "no L3 cache reported" : "one L3 (" + sizes + ")";
+		return topology;
+	}
+	// The preferred allowed processor: highest scheduling class, then the lower index.
+	const CpuSetInfo* best = nullptr;
+	for (const auto& set: sets) {
+		if (set.group != 0 || set.logical >= 64 || !set.allowed) {
+			continue;
+		}
+		if (best == nullptr || set.scheduling_class > best->scheduling_class ||
+		    (set.scheduling_class == best->scheduling_class && set.logical < best->logical)) {
+			best = &set;
+		}
+	}
+	uint64_t hot = 0;
+	for (const auto& [mask, bytes]: by_mask) {
+		if (best != nullptr && ((mask >> best->logical) & 1u) != 0) {
+			hot                   = mask;
+			topology.vcache_bytes = bytes;
+		}
+	}
+	if (hot == 0) {
+		topology.description = "no allowed processor in an L3 group (" + sizes + ")";
+		return topology;
+	}
+	for (const auto& [mask, bytes]: by_mask) {
+		if (mask != hot) {
+			topology.other_mask |= mask;
+			topology.other_bytes = std::max(topology.other_bytes, bytes);
+		}
+	}
+	topology.dual        = true;
+	topology.vcache_mask = hot;
+	topology.description = "dual-CCD (L3 " + sizes + "; hot CCD: logical " + MaskText(hot) +
+	                       ", with the preferred core " + std::to_string(best->logical) +
+	                       ", preference " + std::to_string(best->scheduling_class) + ")";
+	return topology;
+}
+
 VCacheDecision DecideVCachePlacement(VCacheMode mode, const VCacheTopology& topology,
                                      bool external_rule, bool cpu_sets) {
 	VCacheDecision decision;
 	if (mode == VCacheMode::Off) {
 		decision.reason = "off (KYTY_VCACHE_PLACEMENT=0)";
+		return decision;
+	}
+	if (mode == VCacheMode::Ccd && !topology.dual) {
+		decision.reason = "KYTY_VCACHE_PLACEMENT=ccd needs two L3 groups: " + topology.description +
+		                  "; no change";
 		return decision;
 	}
 	if (!topology.dual) {
@@ -476,6 +542,9 @@ VCacheMode ParseVCacheMode(const char* text, bool* valid) {
 	if (std::strcmp(text, "1") == 0 || std::strcmp(text, "on") == 0) {
 		return VCacheMode::On;
 	}
+	if (std::strcmp(text, "ccd") == 0) {
+		return VCacheMode::Ccd;
+	}
 	if (valid != nullptr) {
 		*valid = false;
 	}
@@ -488,7 +557,7 @@ VCacheMode GetVCacheMode() {
 		bool        valid = true;
 		const auto  mode  = ParseVCacheMode(value, &valid);
 		if (!valid) {
-			std::printf("KYTY_VCACHE_PLACEMENT must be auto, 0 or 1 (got '%s'): auto\n", value);
+			std::printf("KYTY_VCACHE_PLACEMENT must be auto, 0, 1 or ccd (got '%s'): auto\n", value);
 			std::fflush(stdout);
 		}
 		return mode;
@@ -766,6 +835,161 @@ bool AffinityRestricted(uint64_t* process = nullptr) {
 	return process_mask != system_mask;
 }
 
+#elif defined(__linux__)
+
+// Linux: there are no CPU sets. A CPU set id is the logical processor number, the topology comes
+// from sysfs, and placements are hard affinities (sched_setaffinity). Only logical processors 0-63
+// are placed, as on Windows (group 0).
+
+pid_t CurrentTid() {
+	return static_cast<pid_t>(syscall(SYS_gettid));
+}
+
+std::string ReadSysfsLine(const std::string& path) {
+	std::ifstream file(path);
+	std::string   line;
+	if (!file || !std::getline(file, line)) {
+		return {};
+	}
+	while (!line.empty() && (line.back() == '\n' || line.back() == ' ' || line.back() == '\r')) {
+		line.pop_back();
+	}
+	return line;
+}
+
+uint64_t SysfsMask(const std::string& path) {
+	const auto text = ReadSysfsLine(path);
+	return text.empty() ? 0 : ParseLogicalMask(text.c_str());
+}
+
+std::string CpuDir(uint32_t cpu) {
+	return "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+}
+
+// Present and online (cpu0 often has no "online" file).
+bool CpuOnline(uint32_t cpu) {
+	const auto dir = CpuDir(cpu);
+	if (access((dir + "/topology/thread_siblings_list").c_str(), R_OK) != 0) {
+		return false;
+	}
+	const auto online = ReadSysfsLine(dir + "/online");
+	return online.empty() || online != "0";
+}
+
+uint64_t ThreadAffinity(pid_t tid) {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(tid, sizeof(set), &set) != 0) {
+		return 0;
+	}
+	uint64_t mask = 0;
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		if (CPU_ISSET(cpu, &set)) {
+			mask |= uint64_t {1} << cpu;
+		}
+	}
+	return mask;
+}
+
+bool SetThreadAffinity(pid_t tid, uint64_t mask) {
+	if (mask == 0) {
+		return false;
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		if (((mask >> cpu) & 1u) != 0) {
+			CPU_SET(cpu, &set);
+		}
+	}
+	return sched_setaffinity(tid, sizeof(set), &set) == 0;
+}
+
+// The logical processors as CPU sets: core = the lowest SMT sibling, cache = the L3 group (by its
+// lowest processor), scheduling class = the preferred-core ranking (amd_pstate prefcore or ACPI CPPC
+// highest_perf, scaled to 255), efficiency class = 1 for the largest cpu_capacity on hybrid CPUs.
+// `allowed`: in `affinity` (the process mask at startup) and inside KYTY_CPU_SETS when set.
+std::vector<CpuSetInfo> ReadCpuSets(uint64_t affinity) {
+	const auto              restriction = CpuSetsMask();
+	std::vector<CpuSetInfo> sets;
+	std::map<uint32_t, uint8_t> cache_index; // lowest processor of an L3 group -> index
+	std::vector<uint32_t>       ranking;
+	std::vector<uint32_t>       capacity;
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		if (!CpuOnline(cpu)) {
+			continue;
+		}
+		const auto dir      = CpuDir(cpu);
+		const auto siblings = SysfsMask(dir + "/topology/thread_siblings_list");
+		auto       l3       = SysfsMask(dir + "/cache/index3/shared_cpu_list");
+		if (l3 == 0) {
+			l3 = uint64_t {1} << cpu;
+		}
+		const auto l3_first = static_cast<uint32_t>(std::countr_zero(l3));
+		if (cache_index.find(l3_first) == cache_index.end()) {
+			const auto next         = static_cast<uint8_t>(cache_index.size());
+			cache_index[l3_first] = next;
+		}
+		CpuSetInfo set;
+		set.id      = cpu;
+		set.group   = 0;
+		set.logical = static_cast<uint8_t>(cpu);
+		set.core    = static_cast<uint8_t>(siblings != 0 ? std::countr_zero(siblings) : cpu);
+		set.cache   = cache_index[l3_first];
+		set.allowed = ((affinity >> cpu) & 1u) != 0 && (restriction == 0 || ((restriction >> cpu) & 1u) != 0);
+		auto rank   = ReadSysfsLine(dir + "/cpufreq/amd_pstate_prefcore_ranking");
+		if (rank.empty()) {
+			rank = ReadSysfsLine(dir + "/acpi_cppc/highest_perf");
+		}
+		ranking.push_back(rank.empty() ? 0u : static_cast<uint32_t>(std::strtoul(rank.c_str(), nullptr, 10)));
+		const auto cap = ReadSysfsLine(dir + "/cpu_capacity");
+		capacity.push_back(cap.empty() ? 0u : static_cast<uint32_t>(std::strtoul(cap.c_str(), nullptr, 10)));
+		sets.push_back(set);
+	}
+	const auto max_rank = ranking.empty() ? 0u : *std::max_element(ranking.begin(), ranking.end());
+	const auto max_cap  = capacity.empty() ? 0u : *std::max_element(capacity.begin(), capacity.end());
+	const auto min_cap  = capacity.empty() ? 0u : *std::min_element(capacity.begin(), capacity.end());
+	for (size_t i = 0; i < sets.size(); i++) {
+		sets[i].scheduling_class =
+		    max_rank != 0 ? static_cast<uint8_t>(std::min<uint64_t>(255, uint64_t {ranking[i]} * 255u / max_rank)) : 0;
+		sets[i].efficiency_class = max_cap != min_cap && capacity[i] == max_cap ? 1 : 0;
+	}
+	return sets;
+}
+
+// The L3 cache groups (sysfs cache/index3 of each online processor).
+std::vector<L3Cache> ReadL3Caches() {
+	std::vector<L3Cache> caches;
+	std::unordered_set<uint64_t> seen;
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		if (!CpuOnline(cpu)) {
+			continue;
+		}
+		const auto dir  = CpuDir(cpu) + "/cache/index3";
+		const auto mask = SysfsMask(dir + "/shared_cpu_list");
+		if (mask == 0 || ReadSysfsLine(dir + "/level") != "3" || !seen.insert(mask).second) {
+			continue;
+		}
+		auto       size  = ReadSysfsLine(dir + "/size");
+		uint64_t   bytes = std::strtoull(size.c_str(), nullptr, 10);
+		const char unit  = size.empty() ? '\0' : size.back();
+		bytes *= unit == 'K' ? 1024u : unit == 'M' ? 1024u * 1024u : 1u;
+		caches.push_back({0, mask, bytes});
+	}
+	return caches;
+}
+
+// Every online logical processor (0-63).
+uint64_t OnlineMask() {
+	uint64_t mask = 0;
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		if (CpuOnline(cpu)) {
+			mask |= uint64_t {1} << cpu;
+		}
+	}
+	return mask;
+}
+
 #endif
 
 struct State {
@@ -793,6 +1017,18 @@ struct State {
 	std::vector<ColdThread> cold;
 	// PlaceCurrentThreadGuest threads (guest pthreads and the guest main thread).
 	std::vector<ColdThread> guest;
+#elif defined(__linux__)
+	// Linux: the placed threads by thread id (0: none).
+	std::array<pid_t, static_cast<size_t>(ThreadRole::Count)> threads {};
+	pid_t              sequencer = 0;
+	std::vector<pid_t> cold;
+	std::vector<pid_t> guest;
+	uint64_t           process_mask = 0; // the affinity at startup (taskset, a launcher)
+	// The affinity every other thread gets (Windows: the process default CPU sets); 0: none.
+	uint64_t default_mask = 0;
+	// Masks this module gave threads: a thread found with one of them (or the startup mask) may be
+	// moved to the default; any other affinity is someone's hard pin and is left alone.
+	std::unordered_set<uint64_t> own_masks;
 #endif
 	// KYTY_VCACHE_PLACEMENT.
 	VCacheTopology                        topology;
@@ -854,6 +1090,59 @@ void ApplyThreadSets(HANDLE thread, const std::vector<uint32_t>& ids) {
 	(void)SetThreadSelectedCpuSets(thread, list.empty() ? nullptr : list.data(),
 	                               static_cast<ULONG>(list.size()));
 }
+#elif defined(__linux__)
+// State mutex held: `mask` for thread `tid`; 0: the default (the startup mask without one).
+void ApplyThreadMaskLocked(State& state, pid_t tid, uint64_t mask) {
+	if (tid == 0) {
+		return;
+	}
+	if (mask == 0) {
+		mask = state.default_mask != 0 ? state.default_mask : state.process_mask;
+	}
+	state.own_masks.insert(mask);
+	(void)SetThreadAffinity(tid, mask);
+}
+
+bool PlacedLocked(const State& state, pid_t tid) {
+	if (tid == state.sequencer ||
+	    std::find(state.threads.begin(), state.threads.end(), tid) != state.threads.end()) {
+		return true;
+	}
+	return std::find(state.cold.begin(), state.cold.end(), tid) != state.cold.end() ||
+	       std::find(state.guest.begin(), state.guest.end(), tid) != state.guest.end();
+}
+
+// State mutex held: every thread without a role gets the default affinity. Linux has no process
+// default CPU sets: a new thread inherits its creator's affinity (one started by the CP would share
+// the CP's core), so the monitor runs this once a second. A thread whose affinity is neither the
+// startup mask nor one this module set is pinned by someone else (a driver, an overlay) and keeps it.
+void ApplyDefaultToOthersLocked(State& state) {
+	const auto target = state.default_mask != 0 ? state.default_mask : state.process_mask;
+	if (target == 0) {
+		return;
+	}
+	state.own_masks.insert(target);
+	DIR* dir = opendir("/proc/self/task");
+	if (dir == nullptr) {
+		return;
+	}
+	while (const auto* entry = readdir(dir)) {
+		char*      end = nullptr;
+		const auto tid = static_cast<pid_t>(std::strtol(entry->d_name, &end, 10));
+		if (tid <= 0 || end == entry->d_name || *end != '\0' || PlacedLocked(state, tid)) {
+			continue;
+		}
+		const auto current = ThreadAffinity(tid);
+		if (current == 0 || current == target) {
+			continue;
+		}
+		if (current != state.process_mask && state.own_masks.count(current) == 0) {
+			continue;
+		}
+		(void)SetThreadAffinity(tid, target);
+	}
+	closedir(dir);
+}
 #endif
 
 #if defined(_WIN32)
@@ -885,7 +1174,7 @@ uint32_t VCacheSettleMs() {
 // yet, or 1 on a dual-CCD X3D.
 bool VCacheWatchedLocked(const State& state) {
 	const auto mode = GetVCacheMode();
-	return state.topology.dual && (mode == VCacheMode::On ||
+	return state.topology.dual && (mode == VCacheMode::On || mode == VCacheMode::Ccd ||
 	                               (mode == VCacheMode::Auto && !state.external_rule));
 }
 
@@ -920,7 +1209,7 @@ void LogVCacheLocked(State& state, const char* why, const std::string& text) {
 	state.vcache_logged = text;
 	const auto mode     = GetVCacheMode();
 	std::printf("Kyty V-cache placement (KYTY_VCACHE_PLACEMENT=%s, %s): %s\n",
-	            mode == VCacheMode::Auto ? "auto" : mode == VCacheMode::On ? "1" : "0", why,
+	            mode == VCacheMode::Auto ? "auto" : mode == VCacheMode::On ? "1" : mode == VCacheMode::Ccd ? "ccd" : "0", why,
 	            text.c_str());
 	std::fflush(stdout);
 }
@@ -941,6 +1230,11 @@ GuestPlacement GetGuestPlacement() {
 			return GuestPlacement::Hot;
 		}
 		if (value != nullptr && std::strcmp(value, "cold") == 0) {
+			return GuestPlacement::Cold;
+		}
+		if (value == nullptr && GetVCacheMode() == VCacheMode::Ccd) {
+			// Without V-cache neither CCD is faster: the game's threads get the other CCD to
+			// themselves (Astro Bot, Ryzen 9 9900X, Linux: 56-59 fps against 48-50 with all).
 			return GuestPlacement::Cold;
 		}
 		return GuestPlacement::All;
@@ -965,6 +1259,17 @@ std::vector<uint32_t> GuestIdsLocked(const State& state) {
 	ids.insert(ids.end(), state.layout.cold_ids.begin(), state.layout.cold_ids.end());
 	return ids;
 }
+#elif defined(__linux__)
+// State mutex held: the affinity of guest threads, 0 for the default.
+uint64_t GuestMaskLocked(const State& state) {
+	if (!state.layout.vcache || !GuestWide()) {
+		return 0;
+	}
+	if (GetGuestPlacement() == GuestPlacement::Cold) {
+		return state.layout.cold_mask;
+	}
+	return state.layout.general_mask | state.layout.cold_mask;
+}
 #endif
 
 // State mutex held: computes the layout for the current process mask and constraint and applies
@@ -976,6 +1281,9 @@ void ApplyLayoutLocked(State& state, const char* why, bool log = true, bool keep
 	uint64_t affinity = 0;
 #if defined(_WIN32)
 	state.sets = ReadCpuSets(affinity, state.external);
+#elif defined(__linux__)
+	affinity   = state.process_mask;
+	state.sets = ReadCpuSets(affinity);
 #else
 	state.sets.clear();
 #endif
@@ -1070,6 +1378,43 @@ void ApplyLayoutLocked(State& state, const char* why, bool log = true, bool keep
 		ApplyThreadSets(thread.handle, guest_ids);
 	}
 	state.vcache_applied = state.layout.vcache;
+#elif defined(__linux__)
+	if (!active && state.default_mask == 0 && !state.vcache_applied) {
+		return;
+	}
+	uint64_t wanted = 0;
+	if (state.layout.reserved || state.layout.vcache) {
+		wanted = state.layout.general_mask;
+	} else if (restriction != 0) {
+		for (const auto& set: state.sets) {
+			if (set.allowed) {
+				wanted |= uint64_t {1} << set.logical;
+			}
+		}
+		const auto text = "every thread on logical " + MaskText(wanted) + " (KYTY_CPU_SETS)";
+		state.layout.description =
+		    mode == CpuReserveMode::Off ? text : state.layout.description + "; " + text;
+	}
+	state.default_mask = wanted;
+	const bool reserved = state.layout.reserved;
+	// The calling thread (the main thread at startup) first: threads it starts inherit the default.
+	if (!PlacedLocked(state, CurrentTid())) {
+		ApplyThreadMaskLocked(state, CurrentTid(), 0);
+	}
+	ApplyThreadMaskLocked(state, state.threads[static_cast<size_t>(ThreadRole::Cp)],
+	                      reserved ? state.layout.cp_mask : 0);
+	ApplyThreadMaskLocked(state, state.threads[static_cast<size_t>(ThreadRole::Recorder)],
+	                      reserved ? state.layout.recorder_mask : 0);
+	ApplyThreadMaskLocked(state, state.sequencer, reserved ? state.layout.sequencer_mask : 0);
+	for (const auto tid: state.cold) {
+		ApplyThreadMaskLocked(state, tid, state.layout.vcache ? state.layout.cold_mask : 0);
+	}
+	const auto guest_mask = GuestMaskLocked(state);
+	for (const auto tid: state.guest) {
+		ApplyThreadMaskLocked(state, tid, guest_mask);
+	}
+	ApplyDefaultToOthersLocked(state);
+	state.vcache_applied = state.layout.vcache;
 #else
 	state.layout.reserved = false;
 	state.layout.vcache   = false;
@@ -1117,6 +1462,23 @@ void StartMonitor() {
 			}
 		}
 	}).detach();
+#elif defined(__linux__)
+	const bool maintain = [] {
+		auto&           state = GetState();
+		std::lock_guard lock(state.mutex);
+		return state.default_mask != 0 || state.layout.reserved || state.layout.vcache;
+	}();
+	if (!maintain) {
+		return;
+	}
+	std::thread([] {
+		Profiler::SetThreadName("CPU placement monitor");
+		PlaceCurrentThreadCold();
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+			MaintainCpuPlacement();
+		}
+	}).detach();
 #endif
 }
 
@@ -1137,6 +1499,24 @@ void InitCpuPlacement() {
 		state.topology = DetectVCache(ReadL3Caches());
 		// KYTY_VCACHE_PLACEMENT=auto stays off when another process's rule is already in effect.
 		state.external_rule = !state.external.empty() || AffinityRestricted();
+		if (GetVCacheMode() == VCacheMode::Ccd && !state.topology.dual) {
+			uint64_t affinity = 0;
+			state.topology    = DetectCcdSplit(ReadL3Caches(), ReadCpuSets(affinity, state.external));
+		}
+#elif defined(__linux__)
+		// The main thread's affinity before any placement is the process mask (taskset, a launcher).
+		state.process_mask = ThreadAffinity(0);
+		if (state.process_mask == 0) {
+			state.process_mask = OnlineMask();
+		}
+		const auto caches = ReadL3Caches();
+		state.topology    = GetVCacheMode() == VCacheMode::Ccd
+		                        ? DetectCcdSplit(caches, ReadCpuSets(state.process_mask))
+		                        : DetectVCache(caches);
+		if (GetVCacheMode() == VCacheMode::Ccd && !state.topology.dual) {
+			state.topology = DetectVCache(caches);
+		}
+		state.external_rule = (state.process_mask & OnlineMask()) != OnlineMask();
 #endif
 		state.started = std::chrono::steady_clock::now();
 		state.settled = VCacheSettleMs() == 0;
@@ -1226,6 +1606,27 @@ void MaintainCpuPlacement() {
 		std::fflush(stdout);
 	}
 	ApplyLayoutLocked(state, "re-assert", log);
+#elif defined(__linux__)
+	auto&           state = GetState();
+	std::lock_guard lock(state.mutex);
+	if (!state.initialized) {
+		return;
+	}
+	if (VCacheWatchedLocked(state) && GetVCacheMode() == VCacheMode::Auto && !state.settled &&
+	    std::chrono::steady_clock::now() - state.started >= std::chrono::milliseconds(VCacheSettleMs())) {
+		state.settled = true;
+		ApplyLayoutLocked(state, "no external rule after the settle time");
+		return;
+	}
+	if (g_rules_changed.exchange(false)) {
+		ApplyLayoutLocked(state, CurrentReserveRules().scaled ? "KYTY_CPU_RESERVE_SCALE on"
+		                                                      : "KYTY_CPU_RESERVE_SCALE off");
+		return;
+	}
+	// Threads started since the last pass (drivers, workers) get the default affinity.
+	if (state.default_mask != 0) {
+		ApplyDefaultToOthersLocked(state);
+	}
 #endif
 }
 
@@ -1255,6 +1656,18 @@ void PlaceCurrentThread(ThreadRole role) {
 		ApplyThreadSets(GetCurrentThread(),
 		                role == ThreadRole::Cp ? state.layout.cp_ids : state.layout.recorder_ids);
 	}
+#elif defined(__linux__)
+	if (role != ThreadRole::Cp && role != ThreadRole::Recorder) {
+		return;
+	}
+	auto&           state = GetState();
+	std::lock_guard lock(state.mutex);
+	const auto      tid = CurrentTid();
+	state.threads[static_cast<size_t>(role)] = tid;
+	if (state.layout.reserved) {
+		ApplyThreadMaskLocked(state, tid,
+		                      role == ThreadRole::Cp ? state.layout.cp_mask : state.layout.recorder_mask);
+	}
 #else
 	(void)role;
 #endif
@@ -1276,6 +1689,13 @@ void PlaceCurrentThreadSequencer() {
 	}
 	if (state.layout.reserved && !state.layout.sequencer_ids.empty()) {
 		ApplyThreadSets(GetCurrentThread(), state.layout.sequencer_ids);
+	}
+#elif defined(__linux__)
+	auto&           state = GetState();
+	std::lock_guard lock(state.mutex);
+	state.sequencer = CurrentTid();
+	if (state.layout.reserved && state.layout.sequencer_mask != 0) {
+		ApplyThreadMaskLocked(state, state.sequencer, state.layout.sequencer_mask);
 	}
 #endif
 }
@@ -1322,10 +1742,41 @@ struct ColdRegistration {
 };
 
 } // namespace
+#elif defined(__linux__)
+namespace {
+
+struct ColdRegistration {
+	explicit ColdRegistration(bool guest_thread = false): guest(guest_thread) {
+		InitCpuPlacement();
+		auto&           state = GetState();
+		std::lock_guard lock(state.mutex);
+		(guest ? state.guest : state.cold).push_back(tid);
+		if (guest) {
+			if (const auto mask = GuestMaskLocked(state); mask != 0) {
+				ApplyThreadMaskLocked(state, tid, mask);
+			}
+		} else if (state.layout.vcache) {
+			ApplyThreadMaskLocked(state, tid, state.layout.cold_mask);
+		}
+	}
+	~ColdRegistration() {
+		auto&           state = GetState();
+		std::lock_guard lock(state.mutex);
+		auto&           list = guest ? state.guest : state.cold;
+		list.erase(std::remove(list.begin(), list.end(), tid), list.end());
+	}
+	ColdRegistration(const ColdRegistration&)            = delete;
+	ColdRegistration& operator=(const ColdRegistration&) = delete;
+
+	bool  guest = false;
+	pid_t tid   = CurrentTid();
+};
+
+} // namespace
 #endif
 
 void PlaceCurrentThreadCold() {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	thread_local ColdRegistration registration;
 	(void)registration;
 #endif
@@ -1338,7 +1789,7 @@ void LowerCurrentThreadPriority() {
 }
 
 void PlaceCurrentThreadGuest() {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	thread_local ColdRegistration registration(true);
 	(void)registration;
 #endif
@@ -1471,6 +1922,9 @@ uint32_t CurrentLogicalProcessor() {
 	PROCESSOR_NUMBER number {};
 	GetCurrentProcessorNumberEx(&number);
 	return static_cast<uint32_t>(number.Group) * 64u + number.Number;
+#elif defined(__linux__)
+	const int cpu = sched_getcpu();
+	return cpu >= 0 ? static_cast<uint32_t>(cpu) : UINT32_MAX;
 #else
 	return UINT32_MAX;
 #endif
